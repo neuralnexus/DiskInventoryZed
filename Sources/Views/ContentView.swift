@@ -56,11 +56,12 @@ struct ContentView: View {
                             }
                         }
                         .animation(.easeInOut(duration: 0.25), value: viewModel.currentNode)
+                        .overlay(alignment: .bottomLeading) {
+                            StatusBarView()
+                        }
                     } else {
                         EmptyStateView()
                     }
-                    
-                    StatusBarView()
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 
@@ -316,43 +317,49 @@ struct QuickScanButton: View {
 
 struct StatusBarView: View {
     @EnvironmentObject var viewModel: AppViewModel
+    @State private var isExpanded = false
     
     var body: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 8) {
             if let node = viewModel.currentNode {
                 HStack(spacing: 4) {
-                    Text("Size:")
-                        .foregroundStyle(.secondary)
                     Text(node.formattedSize)
-                        .fontWeight(.medium)
-                }
-                
-                Divider()
-                
-                HStack(spacing: 4) {
-                    Text("Items:")
-                        .foregroundStyle(.secondary)
-                    Text("\(node.children.count)")
-                        .fontWeight(.medium)
-                }
-                
-                if viewModel.scanDuration > 0 {
-                    Divider()
+                        .font(.system(size: 10, weight: .medium))
                     
-                    HStack(spacing: 4) {
-                        Text("Scan time:")
-                            .foregroundStyle(.secondary)
-                        Text(String(format: "%.2fs", viewModel.scanDuration))
-                            .fontWeight(.medium)
-                    }
+                    Text("·")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    
+                    Text("\(node.children.count) items")
+                        .font(.system(size: 10))
+                }
+                
+                if viewModel.scanDuration > 0 && isExpanded {
+                    Text("·")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    
+                    Text(String(format: "%.2fs", viewModel.scanDuration))
+                        .font(.system(size: 10))
                 }
             }
             
-            Spacer()
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                Image(systemName: isExpanded ? "chevron.down" : "chevron.up")
+                    .font(.system(size: 8))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
         }
-        .font(.system(size: 11))
-        .padding(.horizontal, 12)
-        .padding(.vertical, 4)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 2)
         .background(.ultraThinMaterial)
+        .cornerRadius(4)
+        .shadow(radius: 1)
+        .padding(8)
     }
 }
