@@ -1,9 +1,8 @@
+<img width="125" height="125" alt="16a92001-236b-448c-a6a1-bf9102c57574" src="https://github.com/user-attachments/assets/40f4d702-5e0d-47da-986a-377849ac6fbd" />
+
 # Disk Inventory Zed
 
 A modern, fast, native successor to the classic macOS utility **Disk Inventory X**.
-
-<img width="125" height="125" alt="16a92001-236b-448c-a6a1-bf9102c57574" src="https://github.com/user-attachments/assets/40f4d702-5e0d-47da-986a-377849ac6fbd" />
-
 
 ## Overview
 
