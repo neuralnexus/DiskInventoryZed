@@ -1,0 +1,8 @@
+.build/
+DiskInventoryZed.app/
+.DS_Store
+*.swp
+*.xcworkspace
+xcuserdata/
+DerivedData/
+*.moved-aside
