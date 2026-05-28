@@ -11,6 +11,8 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     
     steps:
       - name: Checkout
@@ -135,6 +137,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     
     steps:
       - name: Download artifacts
