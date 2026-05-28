@@ -24,6 +24,17 @@ struct ContentView: View {
     @State private var showFilePicker = false
     @State private var quickLookURL: URL?
     
+    private func showSavePanel() {
+        let savePanel = NSSavePanel()
+        savePanel.allowedContentTypes = [.json]
+        savePanel.nameFieldStringValue = "DiskInventoryScan.json"
+        savePanel.begin { response in
+            if response == .OK, let url = savePanel.url {
+                viewModel.exportScanData(to: url)
+            }
+        }
+    }
+    
     var body: some View {
         NavigationSplitView {
             SidebarView()
@@ -35,11 +46,16 @@ struct ContentView: View {
                     if viewModel.isScanning {
                         ScanningView()
                     } else if let node = viewModel.currentNode {
-                        if viewModel.viewMode == .treemap {
-                            TreemapView(node: node)
-                        } else {
-                            FileListView(node: node)
+                        Group {
+                            if viewModel.viewMode == .treemap {
+                                TreemapView(node: node)
+                            } else if viewModel.viewMode == .sunburst {
+                                SunburstChartView(node: node)
+                            } else {
+                                FileListView(node: node)
+                            }
                         }
+                        .animation(.easeInOut(duration: 0.25), value: viewModel.currentNode)
                     } else {
                         EmptyStateView()
                     }
@@ -61,6 +77,15 @@ struct ContentView: View {
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 HStack(spacing: 8) {
+                    if viewModel.rootNode != nil && !viewModel.isScanning {
+                        Button(action: {
+                            showSavePanel()
+                        }) {
+                            Label("Export JSON", systemImage: "square.and.arrow.up")
+                        }
+                        .help("Export scan results to a JSON file")
+                    }
+                    
                     Button(action: {
                         if let selected = viewModel.selectedNode ?? viewModel.currentNode {
                             quickLookURL = selected.url
@@ -144,6 +169,16 @@ struct ToolbarView: View {
             }
             .pickerStyle(.segmented)
             .fixedSize()
+            
+            Picker("Min Size", selection: $viewModel.sizeThreshold) {
+                Text("All Sizes").tag(Int64(0))
+                Text("> 1 MB").tag(Int64(1_000_000))
+                Text("> 10 MB").tag(Int64(10_000_000))
+                Text("> 100 MB").tag(Int64(100_000_000))
+                Text("> 1 GB").tag(Int64(1_000_000_000))
+            }
+            .pickerStyle(.menu)
+            .frame(width: 110)
             
             Picker("Sort", selection: $viewModel.sortOrder) {
                 ForEach(AppViewModel.SortOrder.allCases, id: \.self) { order in

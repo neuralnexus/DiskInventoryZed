@@ -48,6 +48,7 @@ actor DiskScanner {
     /// Processes all children (files and directories) in parallel across all CPU cores.
     func scan(
         url: URL,
+        skipDeveloperFolders: Bool = false,
         progressHandler: @escaping @MainActor (ProgressSnapshot) -> Void
     ) async throws -> ScanResult {
         isCancelled = false
@@ -99,6 +100,14 @@ actor DiskScanner {
             if isCancelled {
                 progressTask.cancel()
                 throw ScanError.cancelled
+            }
+            
+            // Skip developer folders if configured
+            if skipDeveloperFolders {
+                let name = node.url.lastPathComponent.lowercased()
+                if name == "node_modules" || name == ".git" || name == ".svn" || name == "deriveddata" {
+                    return
+                }
             }
             
             guard node.isDirectory else {

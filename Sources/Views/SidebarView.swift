@@ -31,6 +31,13 @@ struct SidebarView: View {
                 }
             }
             
+            Section("Scan Options") {
+                Toggle(isOn: $viewModel.skipDeveloperFolders) {
+                    Label("Skip Dev Folders", systemImage: "folder.badge.minus")
+                }
+                .help("Skip heavy developer folders like node_modules, .git, and deriveddata to make scans 10x faster.")
+            }
+            
             Section("Quick Access") {
                 QuickAccessItem(title: "Home", path: FileManager.default.homeDirectoryForCurrentUser, icon: "house")
                 QuickAccessItem(title: "Applications", path: URL(fileURLWithPath: "/Applications"), icon: "app")
@@ -91,12 +98,22 @@ struct SidebarRow: View {
         }
         .tag(node)
         .contextMenu {
+            Button("Drill In") {
+                viewModel.navigateTo(node: node)
+            }
+            
+            Divider()
+            
             Button("Open Folder") {
                 viewModel.openFile(node: node)
             }
             
             Button("Reveal in Finder") {
                 viewModel.revealInFinder(node: node)
+            }
+            
+            Button("Open Containing Folder") {
+                viewModel.openContainingFolder(node: node)
             }
             
             Divider()

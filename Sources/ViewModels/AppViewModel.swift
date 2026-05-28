@@ -44,14 +44,18 @@ class AppViewModel: ObservableObject {
     @Published var searchQuery = ""
     @Published var extensionStats: [ExtensionStat] = []
     @Published var selectedExtension: String? = nil
+    @Published var sizeThreshold: Int64 = 0
+    @Published var skipDeveloperFolders = true
     
     enum ViewMode: String, CaseIterable {
         case treemap = "Treemap"
+        case sunburst = "Sunburst"
         case list = "List"
         
         var icon: String {
             switch self {
             case .treemap: return "square.grid.2x2"
+            case .sunburst: return "circle.dashed"
             case .list: return "list.bullet"
             }
         }
@@ -98,15 +102,17 @@ class AppViewModel: ObservableObject {
             filtered = results
         }
         
+        let sizeFiltered = sizeThreshold > 0 ? filtered.filter { $0.size >= sizeThreshold } : filtered
+        
         switch sortOrder {
         case .sizeDescending:
-            return filtered.sorted { $0.size > $1.size }
+            return sizeFiltered.sorted { $0.size > $1.size }
         case .sizeAscending:
-            return filtered.sorted { $0.size < $1.size }
+            return sizeFiltered.sorted { $0.size < $1.size }
         case .nameAscending:
-            return filtered.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+            return sizeFiltered.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
         case .nameDescending:
-            return filtered.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedDescending }
+            return sizeFiltered.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedDescending }
         }
     }
     
@@ -137,7 +143,7 @@ class AppViewModel: ObservableObject {
             self.scanner = scanner
             
             do {
-                let result = try await scanner.scan(url: url) { [weak self] snapshot in
+                let result = try await scanner.scan(url: url, skipDeveloperFolders: self.skipDeveloperFolders) { [weak self] snapshot in
                     guard let self = self else { return }
                     self.totalFiles = snapshot.files
                     self.totalDirectories = snapshot.directories
@@ -198,7 +204,12 @@ class AppViewModel: ObservableObject {
     func revealInFinder(node: FileNode) {
         NSWorkspace.shared.selectFile(node.url.path, inFileViewerRootedAtPath: "")
     }
-    
+
+    func openContainingFolder(node: FileNode) {
+        let parentURL = node.url.deletingLastPathComponent()
+        NSWorkspace.shared.open(parentURL)
+    }
+
     func openFile(node: FileNode) {
         NSWorkspace.shared.open(node.url)
     }
@@ -217,6 +228,41 @@ class AppViewModel: ObservableObject {
             calculateExtensionStats()
         } catch {
             errorMessage = "Failed to move to trash: \(error.localizedDescription)"
+            showError = true
+        }
+    }
+    
+    func exportScanData(to url: URL) {
+        guard let root = rootNode else { return }
+        
+        struct ExportNode: Codable {
+            let name: String
+            let path: String
+            let size: Int64
+            let isDirectory: Bool
+            let children: [ExportNode]?
+        }
+        
+        func buildExportNode(_ node: FileNode) -> ExportNode {
+            let childrenDirs = node.isDirectory ? node.children.map { buildExportNode($0) } : nil
+            return ExportNode(
+                name: node.displayName,
+                path: node.path,
+                size: node.size,
+                isDirectory: node.isDirectory,
+                children: childrenDirs
+            )
+        }
+        
+        let exportRoot = buildExportNode(root)
+        
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .prettyPrinted
+            let data = try encoder.encode(exportRoot)
+            try data.write(to: url)
+        } catch {
+            errorMessage = "Failed to export data: \(error.localizedDescription)"
             showError = true
         }
     }
