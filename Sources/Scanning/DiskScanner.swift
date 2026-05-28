@@ -49,6 +49,9 @@ actor DiskScanner {
     func scan(
         url: URL,
         skipDeveloperFolders: Bool = false,
+        showHiddenFiles: Bool = false,
+        showPackageContents: Bool = true,
+        followSymlinks: Bool = false,
         progressHandler: @escaping @MainActor (ProgressSnapshot) -> Void
     ) async throws -> ScanResult {
         isCancelled = false
@@ -121,10 +124,11 @@ actor DiskScanner {
             
             await progress.incrementDirectories()
             
+            let directoryOptions: FileManager.DirectoryEnumerationOptions = showHiddenFiles ? [] : [.skipsHiddenFiles]
             let contents = try? fileManager.contentsOfDirectory(
                 at: node.url,
                 includingPropertiesForKeys: Array(resourceKeys),
-                options: [.skipsHiddenFiles]
+                options: directoryOptions
             )
             
             var childNodes: [FileNode] = []
@@ -140,13 +144,26 @@ actor DiskScanner {
                 let isDir = values?.isDirectory ?? false
                 let isSymlink = values?.isSymbolicLink ?? false
                 let isHidden = values?.isHidden ?? false
+                let isPackage = values?.isPackage ?? false
                 
-                if isHidden { continue }
+                if !showHiddenFiles && isHidden { continue }
+                
+                // Determine if this is a directory:
+                // - If it's a symlink and followSymlinks is false, treat as file
+                // - If it's a package (like .app) and showPackageContents is false, treat as file
+                let isDirectory: Bool
+                if isSymlink && !followSymlinks {
+                    isDirectory = false
+                } else if isPackage && !showPackageContents {
+                    isDirectory = false
+                } else {
+                    isDirectory = isDir
+                }
                 
                 let childNode = FileNode(
                     url: childURL,
                     name: childURL.lastPathComponent,
-                    isDirectory: isDir && !isSymlink, // Treat symlinks as files to prevent infinite loops
+                    isDirectory: isDirectory,
                     modificationDate: values?.contentModificationDate,
                     creationDate: values?.creationDate,
                     extension: childURL.pathExtension.isEmpty ? nil : childURL.pathExtension

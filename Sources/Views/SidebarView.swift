@@ -36,6 +36,21 @@ struct SidebarView: View {
                     Label("Skip Dev Folders", systemImage: "folder.badge.minus")
                 }
                 .help("Skip heavy developer folders like node_modules, .git, and deriveddata to make scans 10x faster.")
+                
+                Toggle(isOn: $viewModel.showHiddenFiles) {
+                    Label("Show Hidden Files", systemImage: "eye")
+                }
+                .help("Show hidden files and folders (files starting with a dot).")
+                
+                Toggle(isOn: $viewModel.showPackageContents) {
+                    Label("Show Package Contents", systemImage: "shippingbox")
+                }
+                .help("Show contents of app bundles (.app) and other packages. When off, packages are treated as single files.")
+                
+                Toggle(isOn: $viewModel.followSymlinks) {
+                    Label("Follow Symlinks", systemImage: "arrow.branch")
+                }
+                .help("Follow symbolic links instead of treating them as files. Be careful — this can cause infinite loops with circular links.")
             }
             
             Section("Quick Access") {

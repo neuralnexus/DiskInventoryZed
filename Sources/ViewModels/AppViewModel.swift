@@ -52,6 +52,21 @@ struct UserSettings {
         get { defaults.object(forKey: "sizeThreshold") as? Int64 ?? 0 }
         set { defaults.set(newValue, forKey: "sizeThreshold") }
     }
+    
+    static var showHiddenFiles: Bool {
+        get { defaults.object(forKey: "showHiddenFiles") as? Bool ?? false }
+        set { defaults.set(newValue, forKey: "showHiddenFiles") }
+    }
+    
+    static var showPackageContents: Bool {
+        get { defaults.object(forKey: "showPackageContents") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "showPackageContents") }
+    }
+    
+    static var followSymlinks: Bool {
+        get { defaults.object(forKey: "followSymlinks") as? Bool ?? false }
+        set { defaults.set(newValue, forKey: "followSymlinks") }
+    }
 }
 
 struct ExtensionStat: Identifiable, Hashable, Sendable {
@@ -81,6 +96,9 @@ class AppViewModel: ObservableObject {
     @Published var selectedExtension: String? = nil
     @Published var sizeThreshold: Int64 = UserSettings.sizeThreshold
     @Published var skipDeveloperFolders = UserSettings.skipDeveloperFolders
+    @Published var showHiddenFiles = UserSettings.showHiddenFiles
+    @Published var showPackageContents = UserSettings.showPackageContents
+    @Published var followSymlinks = UserSettings.followSymlinks
     
     // Navigation history for undo/redo
     private var navigationStack: [FileNode] = []
@@ -189,7 +207,13 @@ class AppViewModel: ObservableObject {
             self.scanner = scanner
             
             do {
-                let result = try await scanner.scan(url: url, skipDeveloperFolders: self.skipDeveloperFolders) { [weak self] snapshot in
+                let result = try await scanner.scan(
+                    url: url,
+                    skipDeveloperFolders: self.skipDeveloperFolders,
+                    showHiddenFiles: self.showHiddenFiles,
+                    showPackageContents: self.showPackageContents,
+                    followSymlinks: self.followSymlinks
+                ) { [weak self] snapshot in
                     guard let self = self else { return }
                     self.totalFiles = snapshot.files
                     self.totalDirectories = snapshot.directories
@@ -378,6 +402,9 @@ class AppViewModel: ObservableObject {
         UserSettings.defaultSortOrder = sortOrder
         UserSettings.skipDeveloperFolders = skipDeveloperFolders
         UserSettings.sizeThreshold = sizeThreshold
+        UserSettings.showHiddenFiles = showHiddenFiles
+        UserSettings.showPackageContents = showPackageContents
+        UserSettings.followSymlinks = followSymlinks
     }
     
     func restoreLastScan() {
