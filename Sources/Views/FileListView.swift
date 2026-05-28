@@ -45,6 +45,10 @@ struct FileListView: View {
                     viewModel.revealInFinder(node: first)
                 }
                 
+                Button("Open Containing Folder") {
+                    viewModel.openContainingFolder(node: first)
+                }
+                
                 if !first.isDirectory {
                     Button("Move to Trash") {
                         viewModel.moveToTrash(node: first)
@@ -126,6 +130,10 @@ struct FileListRow: View {
             
             Button("Reveal in Finder") {
                 viewModel.revealInFinder(node: node)
+            }
+            
+            Button("Open Containing Folder") {
+                viewModel.openContainingFolder(node: node)
             }
             
             if !node.isDirectory {

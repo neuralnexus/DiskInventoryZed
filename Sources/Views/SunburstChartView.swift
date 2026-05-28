@@ -101,6 +101,42 @@ struct SunburstChartView: View {
                     }
                     return NSItemProvider()
                 }
+                .contextMenu {
+                    if let hovered = hoveredSlice {
+                        Text(hovered.node.displayName)
+                            .font(.headline)
+                        
+                        Divider()
+                        
+                        Button("Open") {
+                            viewModel.openFile(node: hovered.node)
+                        }
+                        
+                        Button("Reveal in Finder") {
+                            viewModel.revealInFinder(node: hovered.node)
+                        }
+                        
+                        Button("Open Containing Folder") {
+                            viewModel.openContainingFolder(node: hovered.node)
+                        }
+                        
+                        if !hovered.node.isDirectory {
+                            Button("Move to Trash") {
+                                viewModel.moveToTrash(node: hovered.node)
+                            }
+                        }
+                        
+                        if hovered.node.isDirectory {
+                            Divider()
+                            
+                            Button("Scan This Folder") {
+                                viewModel.scan(url: hovered.node.url)
+                            }
+                        }
+                    } else {
+                        Text("No item under mouse pointer")
+                    }
+                }
                 .onHover { isHovering in
                     if !isHovering {
                         hoveredSlice = nil

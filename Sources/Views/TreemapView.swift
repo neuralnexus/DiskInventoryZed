@@ -93,6 +93,10 @@ struct TreemapView: View {
                             viewModel.revealInFinder(node: hovered.node)
                         }
                         
+                        Button("Open Containing Folder") {
+                            viewModel.openContainingFolder(node: hovered.node)
+                        }
+                        
                         if !hovered.node.isDirectory {
                             Button("Move to Trash") {
                                 viewModel.moveToTrash(node: hovered.node)
