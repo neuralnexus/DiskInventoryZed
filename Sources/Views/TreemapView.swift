@@ -78,39 +78,6 @@ struct TreemapView: View {
                     }
                     return NSItemProvider()
                 }
-                .contextMenu {
-                    if let hovered = hoveredRect {
-                        Text(hovered.node.displayName)
-                            .font(.headline)
-                        
-                        Divider()
-                        
-                        Button("Open") {
-                            viewModel.openFile(node: hovered.node)
-                        }
-                        
-                        Button("Reveal in Finder") {
-                            viewModel.revealInFinder(node: hovered.node)
-                        }
-                        
-                        Button("Open Containing Folder") {
-                            viewModel.openContainingFolder(node: hovered.node)
-                        }
-                        
-                        if !hovered.node.isDirectory {
-                            Button("Move to Trash") {
-                                viewModel.moveToTrash(node: hovered.node)
-                            }
-                        }
-                    } else {
-                        Text("No item under mouse pointer")
-                    }
-                }
-                .onHover { isHovering in
-                    if !isHovering {
-                        hoveredRect = nil
-                    }
-                }
                 .overlay(
                     GeometryReader { geo in
                         Color.clear
@@ -126,6 +93,34 @@ struct TreemapView: View {
                                     }
                                 case .ended:
                                     hoveredRect = nil
+                                }
+                            }
+                            .contextMenu {
+                                if let hovered = hoveredRect {
+                                    Text(hovered.node.displayName)
+                                        .font(.headline)
+                                    
+                                    Divider()
+                                    
+                                    Button("Open") {
+                                        viewModel.openFile(node: hovered.node)
+                                    }
+                                    
+                                    Button("Reveal in Finder") {
+                                        viewModel.revealInFinder(node: hovered.node)
+                                    }
+                                    
+                                    Button("Open Containing Folder") {
+                                        viewModel.openContainingFolder(node: hovered.node)
+                                    }
+                                    
+                                    if !hovered.node.isDirectory {
+                                        Button("Move to Trash") {
+                                            viewModel.moveToTrash(node: hovered.node)
+                                        }
+                                    }
+                                } else {
+                                    Text("No item under mouse pointer")
                                 }
                             }
                     }
