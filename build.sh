@@ -36,6 +36,12 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 # Copy binary
 cp "$BINARY_PATH" "$APP_BUNDLE/Contents/MacOS/"
 
+# Copy app icon if it exists
+if [ -f "images/AppIcon.icns" ]; then
+    cp "images/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/"
+    echo -e "${GREEN}App icon copied to bundle${NC}"
+fi
+
 # Create Info.plist
 cat > "$APP_BUNDLE/Contents/Info.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -66,6 +72,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << EOF
     <string>Copyright © 2026 Matt Ivan. Licensed under GPL-3.0.</string>
     <key>LSUIElement</key>
     <false/>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
 </dict>
 </plist>
 EOF
