@@ -48,9 +48,54 @@ struct DiskInventoryZedApp: App {
                 }
                 .pickerStyle(.inline)
             }
-        }
-        .defaultSize(width: 1200, height: 800)
-        .commands {
+            
+            CommandGroup(replacing: .textEditing) {
+                Button("Navigate Back") {
+                    viewModel.navigateBack()
+                }
+                .keyboardShortcut("[", modifiers: .command)
+                .disabled(!viewModel.canNavigateBack)
+                
+                Button("Navigate Forward") {
+                    viewModel.navigateForward()
+                }
+                .keyboardShortcut("]", modifiers: .command)
+                .disabled(!viewModel.canNavigateForward)
+                
+                Button("Navigate Up") {
+                    viewModel.navigateUp()
+                }
+                .keyboardShortcut(.upArrow, modifiers: [.command])
+                .disabled(viewModel.currentNode?.parent == nil)
+                
+                Divider()
+                
+                Button("Open") {
+                    if let selected = viewModel.selectedNode {
+                        viewModel.openFile(node: selected)
+                    } else if let current = viewModel.currentNode {
+                        viewModel.openFile(node: current)
+                    }
+                }
+                .keyboardShortcut("o", modifiers: .command)
+                
+                Button("Reveal in Finder") {
+                    if let selected = viewModel.selectedNode {
+                        viewModel.revealInFinder(node: selected)
+                    } else if let current = viewModel.currentNode {
+                        viewModel.revealInFinder(node: current)
+                    }
+                }
+                .keyboardShortcut("r", modifiers: .command)
+                
+                Button("Move to Trash") {
+                    if let selected = viewModel.selectedNode {
+                        viewModel.moveToTrash(node: selected)
+                    }
+                }
+                .keyboardShortcut(.delete, modifiers: .command)
+            }
+            
             CommandGroup(replacing: .appInfo) {
                 Button("About Disk Inventory Zed") {
                     let credits: NSMutableAttributedString = {
@@ -79,5 +124,6 @@ struct DiskInventoryZedApp: App {
                 }
             }
         }
+        .defaultSize(width: 1200, height: 800)
     }
 }

@@ -19,6 +19,41 @@
 import Foundation
 import SwiftUI
 
+struct UserSettings {
+    private static let defaults = UserDefaults.standard
+    
+    static var lastScanPath: String? {
+        get { defaults.string(forKey: "lastScanPath") }
+        set { defaults.set(newValue, forKey: "lastScanPath") }
+    }
+    
+    static var defaultViewMode: AppViewModel.ViewMode {
+        get {
+            let rawValue = defaults.string(forKey: "defaultViewMode") ?? "treemap"
+            return AppViewModel.ViewMode(rawValue: rawValue) ?? .treemap
+        }
+        set { defaults.set(newValue.rawValue, forKey: "defaultViewMode") }
+    }
+    
+    static var defaultSortOrder: AppViewModel.SortOrder {
+        get {
+            let rawValue = defaults.string(forKey: "defaultSortOrder") ?? "sizeDescending"
+            return AppViewModel.SortOrder(rawValue: rawValue) ?? .sizeDescending
+        }
+        set { defaults.set(newValue.rawValue, forKey: "defaultSortOrder") }
+    }
+    
+    static var skipDeveloperFolders: Bool {
+        get { defaults.object(forKey: "skipDeveloperFolders") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "skipDeveloperFolders") }
+    }
+    
+    static var sizeThreshold: Int64 {
+        get { defaults.object(forKey: "sizeThreshold") as? Int64 ?? 0 }
+        set { defaults.set(newValue, forKey: "sizeThreshold") }
+    }
+}
+
 struct ExtensionStat: Identifiable, Hashable, Sendable {
     var id: String { ext }
     let ext: String
@@ -39,13 +74,20 @@ class AppViewModel: ObservableObject {
     @Published var scanDuration: TimeInterval = 0
     @Published var errorMessage: String?
     @Published var showError = false
-    @Published var viewMode: ViewMode = .treemap
-    @Published var sortOrder: SortOrder = .sizeDescending
+    @Published var viewMode: ViewMode = UserSettings.defaultViewMode
+    @Published var sortOrder: SortOrder = UserSettings.defaultSortOrder
     @Published var searchQuery = ""
     @Published var extensionStats: [ExtensionStat] = []
     @Published var selectedExtension: String? = nil
-    @Published var sizeThreshold: Int64 = 0
-    @Published var skipDeveloperFolders = true
+    @Published var sizeThreshold: Int64 = UserSettings.sizeThreshold
+    @Published var skipDeveloperFolders = UserSettings.skipDeveloperFolders
+    
+    // Navigation history for undo/redo
+    private var navigationStack: [FileNode] = []
+    private var navigationIndex: Int = -1
+    
+    var canNavigateBack: Bool { navigationIndex > 0 }
+    var canNavigateForward: Bool { navigationIndex < navigationStack.count - 1 }
     
     enum ViewMode: String, CaseIterable {
         case treemap = "Treemap"
@@ -137,6 +179,10 @@ class AppViewModel: ObservableObject {
         rootNode = nil
         currentNode = nil
         selectedNode = nil
+        navigationStack = []
+        navigationIndex = -1
+        
+        UserSettings.lastScanPath = url.path
         
         Task {
             let scanner = DiskScanner()
@@ -182,6 +228,14 @@ class AppViewModel: ObservableObject {
     
     func navigateTo(node: FileNode) {
         if node.isDirectory {
+            // Remove any forward history if we're branching off
+            if navigationIndex < navigationStack.count - 1 {
+                navigationStack.removeSubrange((navigationIndex + 1)...)
+            }
+            // Push new node
+            navigationStack.append(node)
+            navigationIndex = navigationStack.count - 1
+            
             currentNode = node
             selectedNode = nil
         } else {
@@ -189,16 +243,30 @@ class AppViewModel: ObservableObject {
         }
     }
     
+    func navigateBack() {
+        guard canNavigateBack else { return }
+        navigationIndex -= 1
+        currentNode = navigationStack[navigationIndex]
+        selectedNode = nil
+    }
+    
+    func navigateForward() {
+        guard canNavigateForward else { return }
+        navigationIndex += 1
+        currentNode = navigationStack[navigationIndex]
+        selectedNode = nil
+    }
+    
     func navigateUp() {
         if let parent = currentNode?.parent {
-            currentNode = parent
-            selectedNode = nil
+            navigateTo(node: parent)
         }
     }
     
     func navigateToRoot() {
-        currentNode = rootNode
-        selectedNode = nil
+        if let root = rootNode {
+            navigateTo(node: root)
+        }
     }
     
     func revealInFinder(node: FileNode) {
@@ -302,6 +370,22 @@ class AppViewModel: ObservableObject {
             }.value
             
             self.extensionStats = stats
+        }
+    }
+    
+    func saveSettings() {
+        UserSettings.defaultViewMode = viewMode
+        UserSettings.defaultSortOrder = sortOrder
+        UserSettings.skipDeveloperFolders = skipDeveloperFolders
+        UserSettings.sizeThreshold = sizeThreshold
+    }
+    
+    func restoreLastScan() {
+        if let path = UserSettings.lastScanPath {
+            let url = URL(fileURLWithPath: path)
+            if FileManager.default.fileExists(atPath: path) {
+                scan(url: url)
+            }
         }
     }
 }

@@ -29,8 +29,14 @@ final class FileNode: Identifiable, Hashable, @unchecked Sendable {
     let `extension`: String?
     
     var size: Int64 = 0
-    var children: [FileNode] = []
+    var children: [FileNode] = [] {
+        didSet {
+            _directoryChildren = nil
+        }
+    }
     weak var parent: FileNode?
+    
+    private var _directoryChildren: [FileNode]? = nil
     
     var formattedSize: String {
         ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
@@ -41,8 +47,11 @@ final class FileNode: Identifiable, Hashable, @unchecked Sendable {
     }
     
     var directoryChildren: [FileNode]? {
+        if let cached = _directoryChildren { return cached }
         let dirs = children.filter { $0.isDirectory }
-        return dirs.isEmpty ? nil : dirs
+        let result = dirs.isEmpty ? nil : dirs
+        _directoryChildren = result
+        return result
     }
     
     var displayName: String {

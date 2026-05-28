@@ -30,6 +30,9 @@ struct FileListView: View {
                 .onTapGesture {
                     viewModel.navigateTo(node: child)
                 }
+                .onDrag {
+                    NSItemProvider(object: child.url as NSURL)
+                }
         }
         .listStyle(.plain)
         .contextMenuForSelection(of: FileNode.self) { items in

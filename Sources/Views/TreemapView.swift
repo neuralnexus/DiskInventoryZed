@@ -72,6 +72,12 @@ struct TreemapView: View {
                         viewModel.navigateTo(node: rect.node)
                     }
                 }
+                .onDrag {
+                    if let hovered = hoveredRect {
+                        return NSItemProvider(object: hovered.node.url as NSURL)
+                    }
+                    return NSItemProvider()
+                }
                 .contextMenu {
                     if let hovered = hoveredRect {
                         Text(hovered.node.displayName)

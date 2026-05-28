@@ -224,13 +224,23 @@ private actor ProgressTracker {
     private var files = 0
     private var directories = 0
     private var currentNode: FileNode?
+    private var pendingFiles = 0
+    private var pendingDirectories = 0
     
     func incrementFiles() {
-        files += 1
+        pendingFiles += 1
+        if pendingFiles >= 100 {
+            files += pendingFiles
+            pendingFiles = 0
+        }
     }
     
     func incrementDirectories() {
-        directories += 1
+        pendingDirectories += 1
+        if pendingDirectories >= 10 {
+            directories += pendingDirectories
+            pendingDirectories = 0
+        }
     }
     
     func updateCurrentNode(_ node: FileNode) {
@@ -244,6 +254,6 @@ private actor ProgressTracker {
     }
     
     func getSnapshot() -> Snapshot {
-        Snapshot(files: files, directories: directories, currentNode: currentNode)
+        Snapshot(files: files + pendingFiles, directories: directories + pendingDirectories, currentNode: currentNode)
     }
 }

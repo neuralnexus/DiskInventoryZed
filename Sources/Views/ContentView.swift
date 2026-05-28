@@ -104,8 +104,20 @@ struct ContentView: View {
             }
             
             ToolbarItemGroup(placement: .navigation) {
+                Button(action: { viewModel.navigateBack() }) {
+                    Label("Back", systemImage: "arrow.left")
+                }
+                .disabled(!viewModel.canNavigateBack)
+                
+                Button(action: { viewModel.navigateForward() }) {
+                    Label("Forward", systemImage: "arrow.right")
+                }
+                .disabled(!viewModel.canNavigateForward)
+                
+                Divider()
+                
                 Button(action: { viewModel.navigateUp() }) {
-                    Label("Back", systemImage: "arrow.up")
+                    Label("Up", systemImage: "arrow.up")
                 }
                 .disabled(viewModel.currentNode?.parent == nil)
                 

@@ -69,6 +69,24 @@ struct SunburstChartView: View {
                         // Draw thin border for distinct slices
                         let strokePath = buildArcPath(center: center, slice: slice)
                         localContext.stroke(strokePath, with: .color(.black.opacity(0.15)), lineWidth: 0.5)
+                        
+                        // Draw text label if slice is large enough
+                        let midAngle = (slice.startAngle + slice.endAngle) / 2.0
+                        let midRadius = (slice.innerRadius + slice.outerRadius) / 2.0
+                        let midRad = midAngle * .pi / 180.0
+                        let labelX = center.x + CGFloat(cos(midRad) * midRadius)
+                        let labelY = center.y + CGFloat(sin(midRad) * midRadius)
+                        
+                        let angularSpan = slice.endAngle - slice.startAngle
+                        let radialSpan = slice.outerRadius - slice.innerRadius
+                        let arcLength = angularSpan * .pi / 180.0 * midRadius
+                        
+                        if arcLength > 40 && radialSpan > 20 {
+                            let text = Text(slice.node.displayName)
+                                .font(.system(size: 8, weight: .medium))
+                                .foregroundColor(.white)
+                            localContext.draw(text, at: CGPoint(x: labelX, y: labelY), anchor: .center)
+                        }
                     }
                 }
                 .contentShape(Rectangle())
@@ -76,6 +94,12 @@ struct SunburstChartView: View {
                     if let clicked = hitTest(location: location, center: center, slices: slices) {
                         viewModel.navigateTo(node: clicked.node)
                     }
+                }
+                .onDrag {
+                    if let hovered = hoveredSlice {
+                        return NSItemProvider(object: hovered.node.url as NSURL)
+                    }
+                    return NSItemProvider()
                 }
                 .onHover { isHovering in
                     if !isHovering {
