@@ -25,11 +25,37 @@ struct RightSidebarView: View {
         VStack(spacing: 0) {
             // Extension Legend Section
             VStack(alignment: .leading, spacing: 8) {
-                Text("File Types")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(.secondary)
+                HStack {
+                    Text("File Types")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.secondary)
+                    
+                    Spacer()
+                    
+                    if viewModel.selectedExtension != nil {
+                        Button("Clear") {
+                            viewModel.selectedExtension = nil
+                        }
+                        .font(.system(size: 11))
+                        .buttonStyle(.plain)
+                        .foregroundColor(.accentColor)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 12)
+                
+                if viewModel.selectedExtension != nil {
+                    HStack {
+                            Image(systemName: "line.3.horizontal.decrease.circle.fill")
+                                .foregroundColor(.accentColor)
+                        Text("Filtered by: \(viewModel.selectedExtension!.uppercased())")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
                     .padding(.horizontal, 12)
-                    .padding(.top, 12)
+                    .padding(.vertical, 4)
+                }
                 
                 if viewModel.extensionStats.isEmpty {
                     Text("No file type statistics available")
@@ -39,14 +65,16 @@ struct RightSidebarView: View {
                         .padding(.vertical, 8)
                 } else {
                     List(viewModel.extensionStats.prefix(30)) { stat in
-                        ExtensionRow(stat: stat, isSelected: viewModel.selectedExtension == stat.ext)
-                            .onTapGesture {
-                                if viewModel.selectedExtension == stat.ext {
-                                    viewModel.selectedExtension = nil
-                                } else {
-                                    viewModel.selectedExtension = stat.ext
-                                }
+                        Button {
+                            if viewModel.selectedExtension == stat.ext {
+                                viewModel.selectedExtension = nil
+                            } else {
+                                viewModel.selectedExtension = stat.ext
                             }
+                        } label: {
+                            ExtensionRow(stat: stat, isSelected: viewModel.selectedExtension == stat.ext)
+                        }
+                        .buttonStyle(.plain)
                     }
                     .listStyle(.plain)
                 }
