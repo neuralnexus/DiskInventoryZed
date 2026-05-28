@@ -25,7 +25,7 @@ struct TreemapView: View {
     @EnvironmentObject var viewModel: AppViewModel
     @State private var hoveredRect: TreemapRect?
     @State private var tooltipPosition: CGPoint = .zero
-    @State private var rightClickPosition: CGPoint = .zero
+    @State private var lastHoverPosition: CGPoint = .zero
     
     var body: some View {
         GeometryReader { geometry in
@@ -35,7 +35,7 @@ struct TreemapView: View {
                     rect: CGRect(origin: .zero, size: geometry.size)
                 )
                 
-                let clickedRect = rects.first(where: { $0.rect.contains(rightClickPosition) })
+                let clickedRect = rects.first(where: { $0.rect.contains(lastHoverPosition) })
                 
                 Canvas { context, size in
                     for treemapRect in rects {
@@ -88,6 +88,7 @@ struct TreemapView: View {
                             .onContinuousHover { phase in
                                 switch phase {
                                 case .active(let location):
+                                    lastHoverPosition = location
                                     if let rect = rects.first(where: { $0.rect.contains(location) }) {
                                         hoveredRect = rect
                                         tooltipPosition = location
@@ -99,7 +100,7 @@ struct TreemapView: View {
                                 }
                             }
                             .contextMenu {
-                                let target = hoveredRect ?? clickedRect
+                                let target = clickedRect
                                 if let hovered = target {
                                     Text(hovered.node.displayName)
                                         .font(.headline)

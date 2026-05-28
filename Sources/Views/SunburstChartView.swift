@@ -23,13 +23,13 @@ struct SunburstChartView: View {
     @EnvironmentObject var viewModel: AppViewModel
     @State private var hoveredSlice: SunburstSlice?
     @State private var tooltipPosition: CGPoint = .zero
-    @State private var rightClickPosition: CGPoint = .zero
+    @State private var lastHoverPosition: CGPoint = .zero
     
     var body: some View {
         GeometryReader { geometry in
             let center = CGPoint(x: geometry.size.width / 2, y: geometry.size.height / 2)
             let slices = calculateSlices(node: node, center: center)
-            let clickedSlice = hitTest(location: rightClickPosition, center: center, slices: slices)
+            let clickedSlice = hitTest(location: lastHoverPosition, center: center, slices: slices)
             
             ZStack {
                 Canvas { context, size in
@@ -109,6 +109,7 @@ struct SunburstChartView: View {
                         .onContinuousHover { phase in
                             switch phase {
                             case .active(let location):
+                                lastHoverPosition = location
                                 if let hit = hitTest(location: location, center: center, slices: slices) {
                                     hoveredSlice = hit
                                     tooltipPosition = location
@@ -120,7 +121,7 @@ struct SunburstChartView: View {
                             }
                         }
                         .contextMenu {
-                            let target = hoveredSlice ?? clickedSlice
+                            let target = clickedSlice
                             if let hovered = target {
                                 Text(hovered.node.displayName)
                                     .font(.headline)

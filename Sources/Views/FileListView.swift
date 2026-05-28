@@ -35,35 +35,6 @@ struct FileListView: View {
                 }
         }
         .listStyle(.plain)
-        .contextMenuForSelection(of: FileNode.self) { items in
-            if let first = items.first {
-                Button("Open File / Folder") {
-                    viewModel.openFile(node: first)
-                }
-                
-                Button("Reveal in Finder") {
-                    viewModel.revealInFinder(node: first)
-                }
-                
-                Button("Open Containing Folder") {
-                    viewModel.openContainingFolder(node: first)
-                }
-                
-                if !first.isDirectory {
-                    Button("Move to Trash") {
-                        viewModel.moveToTrash(node: first)
-                    }
-                }
-                
-                Divider()
-                
-                if first.isDirectory {
-                    Button("Scan This Folder") {
-                        viewModel.scan(url: first.url)
-                    }
-                }
-            }
-        }
     }
     
     private var selectedNodeBinding: Binding<FileNode?> {
