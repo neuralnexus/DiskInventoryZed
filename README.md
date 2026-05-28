@@ -46,6 +46,27 @@ This will create `DiskInventoryZed.app` in the current directory, built as a uni
 2. Select your target (Intel or Universal)
 3. Build and run
 
+## First Launch
+
+Since Disk Inventory Zed is not distributed through the Mac App Store or notarized by Apple, macOS Gatekeeper may show a security warning when you first try to open it:
+
+> **"Apple could not verify 'DiskInventoryZed' is free of malware that may harm your Mac or compromise your privacy."**
+
+**To open the app:**
+
+1. **Right-click** (or Control-click) the `DiskInventoryZed.app`
+2. Select **"Open"** from the context menu
+3. Click **"Open"** in the dialog that appears
+
+**Alternative method:**
+
+1. Go to **System Settings > Privacy & Security**
+2. Scroll down to the **Security** section
+3. Click **"Open Anyway"** next to DiskInventoryZed
+4. Click **"Open"** in the confirmation dialog
+
+*Note: You only need to do this once. After the first launch, the app will open normally.*
+
 ## Usage
 
 1. Launch the app
