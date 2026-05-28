@@ -2,9 +2,15 @@
 
 A modern, fast, native successor to the classic macOS utility **Disk Inventory X**.
 
+<img width="1254" height="1254" alt="16a92001-236b-448c-a6a1-bf9102c57574" src="https://github.com/user-attachments/assets/40f4d702-5e0d-47da-986a-377849ac6fbd" />
+
+
 ## Overview
 
 Disk Inventory Zed is a native macOS application that visualizes disk usage with beautiful, interactive treemaps and detailed file listings. Built with SwiftUI and modern macOS APIs, it supports both Intel and Apple Silicon Macs.
+
+<img width="1510" height="912" alt="Screenshot 2026-05-28 at 12 38 48 PM" src="https://github.com/user-attachments/assets/ab03ce74-0768-4226-ac5c-2bf87c44e8be" />
+
 
 ## Features
 
