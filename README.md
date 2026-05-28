@@ -52,13 +52,28 @@ Since Disk Inventory Zed is not distributed through the Mac App Store or notariz
 
 > **"Apple could not verify 'DiskInventoryZed' is free of malware that may harm your Mac or compromise your privacy."**
 
-**To open the app:**
+### Downloading the DMG
+
+The DMG installer includes:
+- **DiskInventoryZed.app** — the main application
+- **First-Run-Helper.app** — click this to open Security & Privacy settings automatically
+- **README.txt** — detailed first-launch instructions
+
+### Quick Method: Right-click to Open
 
 1. **Right-click** (or Control-click) the `DiskInventoryZed.app`
 2. Select **"Open"** from the context menu
 3. Click **"Open"** in the dialog that appears
 
-**Alternative method:**
+### Using the First-Run-Helper
+
+1. Double-click **"First-Run-Helper.app"** in the DMG
+2. Click **"Open Security Settings"** in the dialog
+3. System Settings will open to the Security pane
+4. Click **"Open Anyway"** next to DiskInventoryZed
+5. Click **"Open"** in the confirmation dialog
+
+### Manual Method
 
 1. Go to **System Settings > Privacy & Security**
 2. Scroll down to the **Security** section

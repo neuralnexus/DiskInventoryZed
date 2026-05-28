@@ -110,25 +110,7 @@ jobs:
       
       - name: Create DMG
         run: |
-          APP_NAME="DiskInventoryZed"
-          DMG_NAME="DiskInventoryZed"
-          VERSION="1.0"
-          
-          # Create a temporary directory for the DMG contents
-          mkdir -p "dmg-temp"
-          cp -R "$APP_NAME.app" "dmg-temp/"
-          
-          # Create a symlink to Applications folder
-          ln -s /Applications "dmg-temp/Applications"
-          
-          # Create DMG
-          hdiutil create -volname "Disk Inventory Zed" \
-            -srcfolder "dmg-temp" \
-            -ov -format UDZO \
-            "${DMG_NAME}-${VERSION}.dmg"
-          
-          # Verify DMG
-          ls -lh "${DMG_NAME}-${VERSION}.dmg"
+          ./scripts/create-dmg.sh
       
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
