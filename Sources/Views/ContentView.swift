@@ -109,11 +109,13 @@ struct ContentView: View {
                     Label("Back", systemImage: "arrow.left")
                 }
                 .disabled(!viewModel.canNavigateBack)
+                .help("Go back (⌘[)")
                 
                 Button(action: { viewModel.navigateForward() }) {
                     Label("Forward", systemImage: "arrow.right")
                 }
                 .disabled(!viewModel.canNavigateForward)
+                .help("Go forward (⌘])")
                 
                 Divider()
                 
@@ -121,11 +123,13 @@ struct ContentView: View {
                     Label("Up", systemImage: "arrow.up")
                 }
                 .disabled(viewModel.currentNode?.parent == nil)
+                .help("Go to parent folder (⌘↑)")
                 
                 Button(action: { viewModel.navigateToRoot() }) {
                     Label("Root", systemImage: "arrow.up.to.line")
                 }
                 .disabled(viewModel.currentNode == viewModel.rootNode)
+                .help("Go to root folder")
             }
         }
         .fileImporter(

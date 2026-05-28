@@ -35,6 +35,21 @@ func showAboutWindow() {
     aboutWindow.makeKeyAndOrderFront(nil)
 }
 
+func showHelpWindow() {
+    let helpWindow = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 600, height: 700),
+        styleMask: [.titled, .closable, .resizable],
+        backing: .buffered,
+        defer: false
+    )
+    helpWindow.title = "Disk Inventory Zed Help"
+    helpWindow.center()
+    
+    let helpView = HelpView()
+    helpWindow.contentView = NSHostingView(rootView: helpView)
+    helpWindow.makeKeyAndOrderFront(nil)
+}
+
 struct AboutView: View {
     var body: some View {
         VStack(spacing: 16) {
@@ -75,6 +90,186 @@ struct AboutView: View {
             Spacer()
         }
         .frame(width: 420, height: 320)
+    }
+}
+
+struct HelpView: View {
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                // Header
+                HStack {
+                    Spacer()
+                    VStack(spacing: 8) {
+                        Image(systemName: "externaldrive.badge.checkmark")
+                            .font(.system(size: 48))
+                            .foregroundColor(.accentColor)
+                        
+                        Text("Disk Inventory Zed")
+                            .font(.system(size: 18, weight: .bold))
+                        
+                        Text("Quick Reference Guide")
+                            .font(.system(size: 13))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                .padding(.top, 16)
+                
+                Divider()
+                
+                // Keyboard Shortcuts
+                HelpSection(title: "Keyboard Shortcuts", icon: "keyboard") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HelpShortcut(key: "⌘ [", description: "Navigate back")
+                        HelpShortcut(key: "⌘ ]", description: "Navigate forward")
+                        HelpShortcut(key: "⌘ ↑", description: "Navigate up to parent folder")
+                        HelpShortcut(key: "⌘ O", description: "Open selected file/folder")
+                        HelpShortcut(key: "⌘ R", description: "Reveal in Finder")
+                        HelpShortcut(key: "⌘ Delete", description: "Move to trash")
+                        HelpShortcut(key: "⌘ 1", description: "Treemap view")
+                        HelpShortcut(key: "⌘ 2", description: "List view")
+                        HelpShortcut(key: "⌘ 3", description: "Sunburst view")
+                        HelpShortcut(key: "⌘ ?", description: "Show this help")
+                    }
+                }
+                
+                // Views
+                HelpSection(title: "View Modes", icon: "eye") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HelpItem(title: "Treemap", description: "Rectangular visualization where each file/folder is a rectangle sized proportionally to its disk usage. Click to drill down, right-click for options.")
+                        HelpItem(title: "Sunburst", description: "Radial chart with concentric rings. Each ring represents a folder level. Click a slice to drill in, right-click for options.")
+                        HelpItem(title: "List", description: "Traditional file browser view with sortable columns. Click to navigate, right-click for options.")
+                    }
+                }
+                
+                // Navigation
+                HelpSection(title: "Navigation", icon: "arrow.left.arrow.right") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HelpItem(title: "Breadcrumb", description: "Click any folder in the path bar at the top to jump directly to that folder.")
+                        HelpItem(title: "Back/Forward", description: "Use the toolbar buttons or ⌘[ / ⌘] to navigate through your browsing history.")
+                        HelpItem(title: "Drill In", description: "Click any folder in the treemap, sunburst, or list to focus on that folder.")
+                        HelpItem(title: "Sidebar", description: "The left sidebar shows the folder tree. Click to navigate, right-click for options.")
+                    }
+                }
+                
+                // File Operations
+                HelpSection(title: "File Operations", icon: "doc") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HelpItem(title: "Open", description: "Opens the file with its default application.")
+                        HelpItem(title: "Reveal in Finder", description: "Opens Finder and selects the file.")
+                        HelpItem(title: "Open Containing Folder", description: "Opens the parent folder in Finder.")
+                        HelpItem(title: "Move to Trash", description: "Moves the selected file to trash and refreshes the view.")
+                        HelpItem(title: "Quick Look", description: "Press the Preview button in the toolbar or select a file and press Space to preview.")
+                        HelpItem(title: "Drag and Drop", description: "Drag files from the treemap, sunburst, or list directly to Finder or other apps.")
+                    }
+                }
+                
+                // Scan Options
+                HelpSection(title: "Scan Options", icon: "slider.horizontal.3") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HelpItem(title: "Skip Dev Folders", description: "Skip node_modules, .git, .svn, and DerivedData folders to make scans faster.")
+                        HelpItem(title: "Show Hidden Files", description: "Include hidden files (starting with .) in the scan results.")
+                        HelpItem(title: "Show Package Contents", description: "When on, .app bundles and packages are treated as folders. When off, they're single files.")
+                        HelpItem(title: "Follow Symlinks", description: "Follow symbolic links to their targets. Default is off to prevent infinite loops.")
+                    }
+                }
+                
+                // Filters
+                HelpSection(title: "Filters & Search", icon: "magnifyingglass") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HelpItem(title: "Search", description: "Use the search bar to find files by name across the entire scanned tree.")
+                        HelpItem(title: "Size Filter", description: "Show only files larger than 1MB, 10MB, 100MB, or 1GB.")
+                        HelpItem(title: "File Type Filter", description: "Click a file type in the right sidebar to highlight only files of that type.")
+                        HelpItem(title: "Sort", description: "Sort by size (largest first), size (smallest first), or name (A-Z or Z-A).")
+                    }
+                }
+                
+                // Export
+                HelpSection(title: "Export", icon: "square.and.arrow.up") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HelpItem(title: "Export JSON", description: "Export the entire scan tree to a JSON file for further analysis or backup.")
+                    }
+                }
+                
+                // Tips
+                HelpSection(title: "Tips", icon: "lightbulb") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HelpItem(title: "Large Files", description: "Use size filters to quickly find the biggest files taking up space.")
+                        HelpItem(title: "Dev Folders", description: "If scanning a code project, enable 'Skip Dev Folders' to ignore node_modules and .git.")
+                        HelpItem(title: "Hover", description: "Hover over any item in treemap or sunburst to see a tooltip with details.")
+                        HelpItem(title: "History", description: "The back/forward buttons track your navigation history, so you can easily return to previous folders.")
+                    }
+                }
+                
+                Spacer(minLength: 20)
+            }
+            .padding(.horizontal, 24)
+            .padding(.bottom, 16)
+        }
+        .frame(minWidth: 600, minHeight: 500)
+    }
+}
+
+struct HelpSection<Content: View>: View {
+    let title: String
+    let icon: String
+    @ViewBuilder let content: Content
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundColor(.accentColor)
+                
+                Text(title)
+                    .font(.system(size: 16, weight: .bold))
+            }
+            
+            content
+                .padding(.leading, 24)
+        }
+    }
+}
+
+struct HelpItem: View {
+    let title: String
+    let description: String
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+            
+            Text(description)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+struct HelpShortcut: View {
+    let key: String
+    let description: String
+    
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(key)
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .background(Color.secondary.opacity(0.15))
+                .cornerRadius(4)
+                .frame(minWidth: 80, alignment: .leading)
+            
+            Text(description)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            
+            Spacer()
+        }
     }
 }
 
@@ -158,6 +353,13 @@ struct DiskInventoryZedApp: App {
                 Button("About Disk Inventory Zed") {
                     showAboutWindow()
                 }
+            }
+            
+            CommandGroup(replacing: .help) {
+                Button("Disk Inventory Zed Help") {
+                    showHelpWindow()
+                }
+                .keyboardShortcut("?", modifiers: .command)
             }
         }
         .defaultSize(width: 1200, height: 800)
