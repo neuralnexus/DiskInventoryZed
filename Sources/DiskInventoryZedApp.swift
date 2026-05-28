@@ -20,6 +20,64 @@
 
 import SwiftUI
 
+func showAboutWindow() {
+    let aboutWindow = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 420, height: 320),
+        styleMask: [.titled, .closable],
+        backing: .buffered,
+        defer: false
+    )
+    aboutWindow.title = "About Disk Inventory Zed"
+    aboutWindow.center()
+    
+    let aboutView = AboutView()
+    aboutWindow.contentView = NSHostingView(rootView: aboutView)
+    aboutWindow.makeKeyAndOrderFront(nil)
+}
+
+struct AboutView: View {
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "externaldrive.badge.checkmark")
+                .font(.system(size: 64))
+                .foregroundColor(.accentColor)
+                .padding(.top, 24)
+            
+            Text("Disk Inventory Zed")
+                .font(.system(size: 20, weight: .bold))
+            
+            Text("Version 1.0")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            
+            Divider()
+                .padding(.horizontal, 40)
+            
+            VStack(spacing: 8) {
+                HStack(spacing: 4) {
+                    Text("Made by ")
+                        .font(.system(size: 13))
+                    
+                    Link("Matt Ivan", destination: URL(string: "https://mattivan.com?ref=diskinventoryzed")!)
+                        .font(.system(size: 13, weight: .semibold))
+                }
+                
+                Text("Inspired by Disk Inventory X & KDirStat")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                
+                Text("GPL-3.0 License")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            
+            Spacer()
+        }
+        .frame(width: 420, height: 320)
+    }
+}
+
 @main
 struct DiskInventoryZedApp: App {
     @StateObject private var viewModel = AppViewModel()
@@ -98,29 +156,7 @@ struct DiskInventoryZedApp: App {
             
             CommandGroup(replacing: .appInfo) {
                 Button("About Disk Inventory Zed") {
-                    let credits: NSMutableAttributedString = {
-                        let str = NSMutableAttributedString(
-                            string: "Made by Matt Ivan\nmattivan.com\n\nInspired by Disk Inventory X & KDirStat"
-                        )
-                        str.addAttributes([
-                            .font: NSFont.systemFont(ofSize: 11),
-                            .foregroundColor: NSColor.secondaryLabelColor
-                        ], range: NSRange(location: 0, length: str.length))
-                        
-                        let linkRange = (str.string as NSString).range(of: "mattivan.com")
-                        if linkRange.location != NSNotFound {
-                            str.addAttribute(.link, value: "https://mattivan.com", range: linkRange)
-                        }
-                        return str
-                    }()
-                    
-                    NSApplication.shared.orderFrontStandardAboutPanel(
-                        options: [
-                            .applicationName: "Disk Inventory Zed",
-                            .applicationVersion: "1.0",
-                            .credits: credits
-                        ]
-                    )
+                    showAboutWindow()
                 }
             }
         }
