@@ -70,12 +70,19 @@ struct ExtensionStat: Identifiable, Hashable {
 
 struct DuplicateCandidate: Identifiable, Hashable, Sendable {
     let id: String
-    let displayName: String
     let fileSize: Int64
     let files: [FileNode]
 
+    var displayName: String {
+        let names = Set(files.map { $0.displayName.lowercased() })
+        if names.count == 1, let name = files.first?.displayName {
+            return name
+        }
+        return "\(files.count) same-sized files"
+    }
+
     var potentialSavings: Int64 {
-        Int64(max(0, files.count - 1)) * fileSize
+        files.dropFirst().reduce(Int64(0)) { $0 + $1.allocatedSize }
     }
 }
 
@@ -102,6 +109,9 @@ final class AppViewModel: ObservableObject {
     @Published var searchQuery = "" {
         didSet { scheduleSearch() }
     }
+    @Published var searchScope: SearchScope = .entireScan {
+        didSet { scheduleSearch() }
+    }
     @Published private(set) var searchResults: [FileNode] = []
     @Published private(set) var extensionStats: [ExtensionStat] = []
     @Published var selectedExtension: String?
@@ -123,7 +133,14 @@ final class AppViewModel: ObservableObject {
     @Published private(set) var largestFiles: [FileNode] = []
     @Published private(set) var oldLargeFiles: [FileNode] = []
     @Published private(set) var duplicateCandidates: [DuplicateCandidate] = []
+    @Published private(set) var verifiedDuplicates: [VerifiedDuplicateGroup] = []
+    @Published private(set) var duplicateVerificationProgress: DuplicateVerificationProgress?
+    @Published private(set) var duplicateVerificationUnreadablePaths: [String] = []
+    @Published private(set) var didVerifyDuplicates = false
     @Published private(set) var isAnalyzing = false
+    @Published private(set) var pendingTrashNode: FileNode?
+    @Published private(set) var scanComparison: ScanComparison?
+    @Published private(set) var isComparingSnapshot = false
 
     private var navigationStack: [FileNode] = []
     private var navigationIndex = -1
@@ -131,6 +148,8 @@ final class AppViewModel: ObservableObject {
     private var scanTask: Task<Void, Never>?
     private var analysisTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
+    private var duplicateVerificationTask: Task<Void, Never>?
+    private var comparisonTask: Task<Void, Never>?
     private var searchIndex: [SearchIndexEntry] = []
 
     var canNavigateBack: Bool { navigationIndex > 0 }
@@ -164,6 +183,11 @@ final class AppViewModel: ObservableObject {
             case .nameDescending: return "textformat.abc.dottedunderline"
             }
         }
+    }
+
+    enum SearchScope: String, CaseIterable {
+        case entireScan = "Entire Scan"
+        case currentFolder = "Current Folder"
     }
 
     var filteredChildren: [FileNode] {
@@ -208,6 +232,8 @@ final class AppViewModel: ObservableObject {
         scanTask?.cancel()
         analysisTask?.cancel()
         searchTask?.cancel()
+        duplicateVerificationTask?.cancel()
+        comparisonTask?.cancel()
 
         let scanID = UUID()
         activeScanID = scanID
@@ -225,8 +251,15 @@ final class AppViewModel: ObservableObject {
         largestFiles = []
         oldLargeFiles = []
         duplicateCandidates = []
+        verifiedDuplicates = []
+        duplicateVerificationProgress = nil
+        duplicateVerificationUnreadablePaths = []
+        didVerifyDuplicates = false
         isAnalyzing = false
         searchIndex = []
+        pendingTrashNode = nil
+        scanComparison = nil
+        isComparingSnapshot = false
 
         UserSettings.lastScanPath = url.path
         let options = ScanOptions(
@@ -360,13 +393,50 @@ final class AppViewModel: ObservableObject {
     }
 
     func moveToTrash(node: FileNode) {
+        guard let rootNode else { return }
+        guard node.id != rootNode.id else {
+            presentError("The root of the current scan cannot be moved to Trash.")
+            return
+        }
+
+        let protectedPaths: Set<String> = [
+            "/",
+            "/Applications",
+            "/Library",
+            "/System",
+            "/Users",
+            FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+        ]
+        guard !protectedPaths.contains(node.url.standardizedFileURL.path) else {
+            presentError("Disk Inventory Zed will not move this protected location to Trash.")
+            return
+        }
+        guard FileManager.default.fileExists(atPath: node.path) else {
+            presentError("The item no longer exists. Rescan the location to refresh the view.")
+            return
+        }
+
+        pendingTrashNode = node
+    }
+
+    func cancelMoveToTrash() {
+        pendingTrashNode = nil
+    }
+
+    func confirmMoveToTrash() {
+        guard let node = pendingTrashNode else { return }
+        pendingTrashNode = nil
+
         do {
             try FileManager.default.trashItem(at: node.url, resultingItemURL: nil)
             guard let rootNode else { return }
 
+            let removedCounts = node.descendantCounts()
             let currentID = currentNode?.id
             let updatedRoot = rootNode.removingDescendant(withID: node.id)
             self.rootNode = updatedRoot
+            totalFiles = max(0, totalFiles - removedCounts.files)
+            totalDirectories = max(0, totalDirectories - removedCounts.directories)
 
             let nextCurrent = currentID.flatMap { updatedRoot.findChild(withID: $0) } ?? updatedRoot
             currentNode = nextCurrent
@@ -379,9 +449,94 @@ final class AppViewModel: ObservableObject {
                 startAnalysis(for: updatedRoot, scanID: scanID)
             }
         } catch {
-            errorMessage = "Failed to move to Trash: \(error.localizedDescription)"
-            showError = true
+            presentError("Failed to move to Trash: \(error.localizedDescription)")
         }
+    }
+
+    func verifyDuplicateCandidates() {
+        duplicateVerificationTask?.cancel()
+        guard !duplicateCandidates.isEmpty else {
+            verifiedDuplicates = []
+            duplicateVerificationUnreadablePaths = []
+            duplicateVerificationProgress = nil
+            didVerifyDuplicates = true
+            return
+        }
+
+        let candidates = duplicateCandidates
+        let rootID = rootNode?.id
+        didVerifyDuplicates = false
+        verifiedDuplicates = []
+        duplicateVerificationUnreadablePaths = []
+        duplicateVerificationProgress = DuplicateVerificationProgress(
+            phase: .sampling,
+            completedFiles: 0,
+            totalFiles: candidates.reduce(0) { $0 + $1.files.count },
+            currentPath: ""
+        )
+
+        duplicateVerificationTask = Task { [weak self] in
+            do {
+                let result = try await DuplicateVerifier.verify(candidates: candidates) { [weak self] progress in
+                    guard let self, self.rootNode?.id == rootID else { return }
+                    self.duplicateVerificationProgress = progress
+                }
+                try Task.checkCancellation()
+                guard let self, self.rootNode?.id == rootID else { return }
+                self.verifiedDuplicates = result.groups
+                self.duplicateVerificationUnreadablePaths = result.unreadablePaths
+                self.duplicateVerificationProgress = nil
+                self.didVerifyDuplicates = true
+            } catch is CancellationError {
+                guard let self else { return }
+                self.duplicateVerificationProgress = nil
+            } catch {
+                guard let self else { return }
+                self.duplicateVerificationProgress = nil
+                self.presentError("Duplicate verification failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func cancelDuplicateVerification() {
+        duplicateVerificationTask?.cancel()
+        duplicateVerificationTask = nil
+        duplicateVerificationProgress = nil
+    }
+
+    func compareWithSnapshot(at url: URL) {
+        comparisonTask?.cancel()
+        guard let rootNode else { return }
+        isComparingSnapshot = true
+        scanComparison = nil
+
+        comparisonTask = Task { [weak self] in
+            do {
+                let comparison = try await Task.detached(priority: .userInitiated) {
+                    let snapshot = try ScanExporter.importSnapshot(from: url)
+                    return try ScanSnapshotComparator.compare(current: rootNode, with: snapshot)
+                }.value
+
+                try Task.checkCancellation()
+                guard let self, self.rootNode === rootNode else { return }
+                self.scanComparison = comparison
+                self.isComparingSnapshot = false
+            } catch is CancellationError {
+                guard let self else { return }
+                self.isComparingSnapshot = false
+            } catch {
+                guard let self else { return }
+                self.isComparingSnapshot = false
+                self.presentError("Failed to compare snapshot: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func clearComparison() {
+        comparisonTask?.cancel()
+        comparisonTask = nil
+        scanComparison = nil
+        isComparingSnapshot = false
     }
 
     func exportScanData(to url: URL) {
@@ -467,7 +622,7 @@ final class AppViewModel: ObservableObject {
         }
 
         let index = searchIndex
-        let scopePath = currentNode?.path ?? ""
+        let scopePath = searchScope == .currentFolder ? (currentNode?.path ?? "") : ""
         searchTask = Task { [weak self] in
             do {
                 try await Task.sleep(nanoseconds: 150_000_000)
@@ -542,9 +697,10 @@ final class AppViewModel: ObservableObject {
             aggregate.fileCount += 1
             extensions[ext] = aggregate
 
-            if node.logicalSize >= 10_000_000,
+            if node.kind == .file,
+               node.logicalSize >= 10_000_000,
                !node.isHardLinkDuplicate {
-                let key = "\(node.logicalSize)|\(node.displayName.lowercased())"
+                let key = String(node.logicalSize)
                 duplicateGroups[key, default: []].append(node)
             }
         }
@@ -562,13 +718,12 @@ final class AppViewModel: ObservableObject {
             guard matches.count > 1, let first = matches.first else { return nil }
             return DuplicateCandidate(
                 id: key,
-                displayName: first.displayName,
                 fileSize: first.logicalSize,
                 files: matches.sorted { $0.path < $1.path }
             )
         }
         .sorted { $0.potentialSavings > $1.potentialSavings }
-        .prefix(50)
+        .prefix(500)
 
         return ScanAnalysis(
             extensions: extensions.values.sorted { $0.totalSize > $1.totalSize },
@@ -577,6 +732,11 @@ final class AppViewModel: ObservableObject {
             duplicateCandidates: Array(candidates),
             searchIndex: searchIndex
         )
+    }
+
+    private func presentError(_ message: String) {
+        errorMessage = message
+        showError = true
     }
 }
 

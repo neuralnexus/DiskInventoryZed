@@ -303,37 +303,57 @@ final class DiskScanner: Sendable {
     }
 
     private static func buildTree(id: String, records: [String: NodeRecord]) -> FileNode? {
-        guard let record = records[id] else { return nil }
+        guard records[id] != nil else { return nil }
 
-        let scannedChildren = record.childIDs.compactMap { buildTree(id: $0, records: records) }
-        let sortedChildren = scannedChildren.sorted {
-            if $0.allocatedSize == $1.allocatedSize {
-                return $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
+        var stack: [(id: String, childrenVisited: Bool)] = [(id, false)]
+        var builtNodes: [String: FileNode] = [:]
+        builtNodes.reserveCapacity(records.count)
+
+        while let item = stack.popLast() {
+            guard let record = records[item.id] else { continue }
+
+            if !item.childrenVisited {
+                stack.append((item.id, true))
+                for childID in record.childIDs.reversed() where builtNodes[childID] == nil {
+                    stack.append((childID, false))
+                }
+                continue
             }
-            return $0.allocatedSize > $1.allocatedSize
+
+            let sortedChildren = record.childIDs.compactMap { builtNodes[$0] }.sorted {
+                if $0.allocatedSize == $1.allocatedSize {
+                    return $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
+                }
+                return $0.allocatedSize > $1.allocatedSize
+            }
+
+            let aggregateLogicalSize = sortedChildren.reduce(Int64(0)) { $0 + $1.logicalSize }
+            let aggregateAllocatedSize = sortedChildren.reduce(Int64(0)) { $0 + $1.allocatedSize }
+            let aggregateFileCount = sortedChildren.reduce(0) { $0 + $1.totalFileCount }
+            let aggregateDirectoryCount = sortedChildren.reduce(0) { $0 + $1.totalDirectoryCount }
+            let isContainer = record.kind == .directory || record.kind == .package
+
+            builtNodes[item.id] = FileNode(
+                id: record.id,
+                url: record.url,
+                name: record.name,
+                kind: record.kind,
+                isPackage: record.isPackage,
+                isSymbolicLink: record.isSymbolicLink,
+                modificationDate: record.modificationDate,
+                creationDate: record.creationDate,
+                extension: record.extension,
+                logicalSize: isContainer ? aggregateLogicalSize : record.logicalSize,
+                allocatedSize: isContainer ? aggregateAllocatedSize : record.allocatedSize,
+                children: record.exposesChildren ? sortedChildren : [],
+                errorDescription: record.errorDescription,
+                isHardLinkDuplicate: record.isHardLinkDuplicate,
+                totalFileCount: isContainer ? aggregateFileCount : 1,
+                totalDirectoryCount: isContainer ? 1 + aggregateDirectoryCount : 0
+            )
         }
 
-        let aggregateLogicalSize = sortedChildren.reduce(Int64(0)) { $0 + $1.logicalSize }
-        let aggregateAllocatedSize = sortedChildren.reduce(Int64(0)) { $0 + $1.allocatedSize }
-        let isContainer = record.kind == .directory || record.kind == .package
-        let visibleChildren = record.exposesChildren ? sortedChildren : []
-
-        return FileNode(
-            id: record.id,
-            url: record.url,
-            name: record.name,
-            kind: record.kind,
-            isPackage: record.isPackage,
-            isSymbolicLink: record.isSymbolicLink,
-            modificationDate: record.modificationDate,
-            creationDate: record.creationDate,
-            extension: record.extension,
-            logicalSize: isContainer ? aggregateLogicalSize : record.logicalSize,
-            allocatedSize: isContainer ? aggregateAllocatedSize : record.allocatedSize,
-            children: visibleChildren,
-            errorDescription: record.errorDescription,
-            isHardLinkDuplicate: record.isHardLinkDuplicate
-        )
+        return builtNodes[id]
     }
 
     private static let developerFolderNames: Set<String> = [

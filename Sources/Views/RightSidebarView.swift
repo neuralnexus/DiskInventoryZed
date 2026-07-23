@@ -14,6 +14,7 @@ struct RightSidebarView: View {
         case types = "Types"
         case largest = "Largest"
         case review = "Review"
+        case changes = "Changes"
 
         var id: Self { self }
     }
@@ -40,6 +41,8 @@ struct RightSidebarView: View {
                     largestFiles
                 case .review:
                     reviewCandidates
+                case .changes:
+                    comparisonView
                 }
             }
             .frame(maxHeight: .infinity)
@@ -208,7 +211,7 @@ struct RightSidebarView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Label("Possible duplicates", systemImage: "doc.on.doc")
                         .font(.system(size: 11, weight: .semibold))
-                    Text("Same name and byte size. Verify contents before deleting.")
+                    Text("Same byte size. Full contents must be verified before cleanup.")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
 
@@ -217,15 +220,165 @@ struct RightSidebarView: View {
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                             .padding(.vertical, 6)
+                    } else if let progress = viewModel.duplicateVerificationProgress {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ProgressView(
+                                value: Double(progress.completedFiles),
+                                total: Double(max(1, progress.totalFiles))
+                            )
+                            Text(progress.phase.rawValue)
+                                .font(.system(size: 10, weight: .medium))
+                            Text(progress.currentPath)
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Button("Cancel Verification") {
+                                viewModel.cancelDuplicateVerification()
+                            }
+                            .controlSize(.small)
+                        }
+                        .padding(.vertical, 5)
+                    } else if viewModel.didVerifyDuplicates {
+                        if viewModel.verifiedDuplicates.isEmpty {
+                            Label("No content-identical duplicates found", systemImage: "checkmark.shield")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .padding(.vertical, 5)
+                        } else {
+                            ForEach(viewModel.verifiedDuplicates.prefix(30)) { group in
+                                VerifiedDuplicateGroupView(group: group)
+                            }
+                        }
+
+                        if !viewModel.duplicateVerificationUnreadablePaths.isEmpty {
+                            Text("\(viewModel.duplicateVerificationUnreadablePaths.count) candidates changed or could not be read.")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.orange)
+                        }
+
+                        Button("Verify Again") {
+                            viewModel.verifyDuplicateCandidates()
+                        }
+                        .controlSize(.small)
                     } else {
-                        ForEach(viewModel.duplicateCandidates.prefix(20)) { candidate in
+                        ForEach(viewModel.duplicateCandidates.prefix(12)) { candidate in
                             DuplicateCandidateView(candidate: candidate)
                         }
+                        Button {
+                            viewModel.verifyDuplicateCandidates()
+                        } label: {
+                            Label("Verify Contents with SHA-256", systemImage: "checkmark.shield")
+                        }
+                        .controlSize(.small)
+                        .help("Reads candidate files and confirms exact content matches. No files are changed.")
                     }
                 }
             }
             .padding(12)
         }
+    }
+
+    private var comparisonView: some View {
+        Group {
+            if viewModel.isComparingSnapshot {
+                VStack(spacing: 8) {
+                    ProgressView()
+                    Text("Comparing snapshot…")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let comparison = viewModel.scanComparison {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Since \(comparison.baselineDate.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.system(size: 11, weight: .semibold))
+                                Text(signedByteCount(comparison.totalDelta))
+                                    .font(.system(size: 18, weight: .bold))
+                                    .foregroundStyle(comparison.totalDelta > 0 ? .orange : .green)
+                            }
+                            Spacer()
+                            Button("Clear") {
+                                viewModel.clearComparison()
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 10))
+                        }
+
+                        HStack {
+                            SummaryMetric(title: "Added", value: comparison.addedCount.formatted())
+                            Spacer()
+                            SummaryMetric(title: "Removed", value: comparison.removedCount.formatted())
+                            Spacer()
+                            SummaryMetric(title: "Resized", value: comparison.changedCount.formatted())
+                        }
+
+                        comparisonSection(
+                            title: "Largest growth",
+                            icon: "arrow.up.right",
+                            changes: comparison.largestGrowth
+                        )
+                        Divider()
+                        comparisonSection(
+                            title: "Largest reductions",
+                            icon: "arrow.down.right",
+                            changes: comparison.largestShrinkage
+                        )
+                    }
+                    .padding(12)
+                }
+            } else {
+                VStack(spacing: 9) {
+                    Image(systemName: "clock.arrow.2.circlepath")
+                        .font(.title2)
+                    Text("Compare this scan with an earlier snapshot")
+                        .font(.system(size: 11, weight: .semibold))
+                        .multilineTextAlignment(.center)
+                    Text("Use Export → Export Snapshot after a scan. Later, scan the same location and choose Compare with Snapshot.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 260)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func comparisonSection(
+        title: String,
+        icon: String,
+        changes: [ScanChange]
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label(title, systemImage: icon)
+                .font(.system(size: 11, weight: .semibold))
+            if changes.isEmpty {
+                Text("No changes")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(changes.prefix(25)) { change in
+                    ScanChangeRow(change: change) {
+                        if let node = change.currentNode {
+                            viewModel.focus(node: node)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func signedByteCount(_ value: Int64) -> String {
+        if value == 0 { return "No net change" }
+        let sign = value > 0 ? "+" : "−"
+        let magnitude = value == Int64.min ? Int64.max : Swift.abs(value)
+        return sign + ByteFormatter.string(from: magnitude)
     }
 
     private var analysisPlaceholder: some View {
@@ -487,6 +640,88 @@ private struct DuplicateCandidateView: View {
                 Spacer()
             }
         }
+    }
+}
+
+private struct VerifiedDuplicateGroupView: View {
+    @EnvironmentObject var viewModel: AppViewModel
+    let group: VerifiedDuplicateGroup
+
+    var body: some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("SHA-256 \(group.digest.prefix(16))…")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+
+                ForEach(group.files) { node in
+                    NodeInsightRow(node: node) {
+                        viewModel.focus(node: node)
+                    }
+                }
+            }
+            .padding(.top, 5)
+        } label: {
+            VStack(alignment: .leading, spacing: 1) {
+                Label(
+                    "\(group.files.count) verified identical files",
+                    systemImage: "checkmark.shield.fill"
+                )
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.green)
+                Text("Up to \(ByteFormatter.string(from: group.potentialSavings)) reclaimable")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+private struct ScanChangeRow: View {
+    let change: ScanChange
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Image(systemName: icon)
+                    .foregroundStyle(change.delta >= 0 ? .orange : .green)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(change.displayName)
+                        .lineLimit(1)
+                    Text(change.path)
+                        .font(.system(size: 8))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer()
+                Text(deltaLabel)
+                    .font(.system(size: 9, weight: .semibold))
+                    .monospacedDigit()
+            }
+            .font(.system(size: 10))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(change.currentNode == nil)
+        .help(change.currentNode == nil ? "This item is no longer present." : change.path)
+    }
+
+    private var icon: String {
+        switch change.kind {
+        case .added: return "plus.circle"
+        case .removed: return "minus.circle"
+        case .grew: return "arrow.up.right"
+        case .shrank: return "arrow.down.right"
+        }
+    }
+
+    private var deltaLabel: String {
+        let sign = change.delta >= 0 ? "+" : "−"
+        let magnitude = change.delta == Int64.min ? Int64.max : Swift.abs(change.delta)
+        return sign + ByteFormatter.string(from: magnitude)
     }
 }
 

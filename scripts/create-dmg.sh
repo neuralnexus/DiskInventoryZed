@@ -1,40 +1,47 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-APP_NAME="DiskInventoryZed"
-DMG_NAME="DiskInventoryZed"
-VERSION="1.0"
-OUTPUT_DMG="${DMG_NAME}-${VERSION}.dmg"
+readonly APP_NAME="DiskInventoryZed"
+readonly DMG_NAME="DiskInventoryZed"
+readonly VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+readonly OUTPUT_DMG="${DMG_NAME}-${VERSION}.dmg"
+readonly WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/DiskInventoryZed-dmg.XXXXXX")"
+readonly DMG_CONTENTS="${WORK_DIR}/contents"
+readonly WRITABLE_DMG="${WORK_DIR}/writable.dmg"
+MOUNT_DIR=""
+
+cleanup() {
+    if [ -n "$MOUNT_DIR" ] && mount | grep -Fq "on $MOUNT_DIR "; then
+        hdiutil detach "$MOUNT_DIR" -force >/dev/null 2>&1 || true
+    fi
+    rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT
 
 echo "Creating DMG for Disk Inventory Zed..."
 
-# Clean up any existing files
 rm -f "${OUTPUT_DMG}"
-rm -rf "tmp-dmg"
-
-# Create temporary directory for DMG contents
-mkdir -p "tmp-dmg"
+mkdir -p "$DMG_CONTENTS"
 
 # Copy the app
-cp -R "${APP_NAME}.app" "tmp-dmg/"
+cp -R "${APP_NAME}.app" "$DMG_CONTENTS/"
 
 # Create Applications symlink
-ln -s /Applications "tmp-dmg/Applications"
+ln -s /Applications "$DMG_CONTENTS/Applications"
 
 # Create First-Run-Helper app from AppleScript
 if [ -f "scripts/First-Run-Helper.applescript" ]; then
     echo "Creating First-Run-Helper app..."
-    osacompile -o "tmp-dmg/First-Run-Helper.app" "scripts/First-Run-Helper.applescript"
+    osacompile -o "$DMG_CONTENTS/First-Run-Helper.app" "scripts/First-Run-Helper.applescript"
 fi
 
 # Create a README with instructions
-cat > "tmp-dmg/README.txt" << 'EOF'
+cat > "$DMG_CONTENTS/README.txt" << 'EOF'
 Disk Inventory Zed - First Launch Instructions
 ===============================================
 
-Since this app is not distributed through the Mac App Store or notarized 
-by Apple, macOS Gatekeeper may show a security warning when you first 
-try to open it.
+If this build was not notarized by Apple, macOS Gatekeeper may show a
+security warning when you first try to open it.
 
 METHOD 1: Right-click to Open (Quickest)
 -----------------------------------------
@@ -73,14 +80,14 @@ Enjoy using Disk Inventory Zed!
 EOF
 
 # Calculate DMG size
-APP_SIZE=$(du -sh "tmp-dmg" | cut -f1)
+APP_SIZE=$(du -sh "$DMG_CONTENTS" | cut -f1)
 echo "App size: ${APP_SIZE}"
 
 # Create temporary DMG (larger than needed, will be compressed)
-hdiutil create -srcfolder "tmp-dmg" -volname "Disk Inventory Zed" -fs HFS+ -format UDRW -size "100m" "tmp-dmg-temp.dmg"
+hdiutil create -srcfolder "$DMG_CONTENTS" -volname "Disk Inventory Zed" -fs HFS+ -format UDRW -size "100m" "$WRITABLE_DMG"
 
 # Mount the DMG and get mount point
-MOUNT_OUTPUT=$(hdiutil attach "tmp-dmg-temp.dmg" -nobrowse -noverify)
+MOUNT_OUTPUT=$(hdiutil attach "$WRITABLE_DMG" -nobrowse -noverify)
 MOUNT_DIR=$(echo "$MOUNT_OUTPUT" | grep -E "Apple_HFS|Apple_APFS" | perl -pe 's/.*(?:Apple_HFS|Apple_APFS)\s+(.*)$/\1/' | head -1)
 
 if [ -z "$MOUNT_DIR" ] || [ ! -d "$MOUNT_DIR" ]; then
@@ -150,14 +157,11 @@ APPLESCRIPT
 
 # Unmount the DMG
 hdiutil detach "${MOUNT_DIR}"
+MOUNT_DIR=""
 
 # Convert to compressed read-only DMG
 echo "Compressing DMG..."
-hdiutil convert "tmp-dmg-temp.dmg" -format UDZO -o "${OUTPUT_DMG}"
-
-# Clean up
-rm -f "tmp-dmg-temp.dmg"
-rm -rf "tmp-dmg"
+hdiutil convert "$WRITABLE_DMG" -format UDZO -o "${OUTPUT_DMG}"
 
 # Verify the DMG
 echo "DMG created: ${OUTPUT_DMG}"

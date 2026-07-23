@@ -63,4 +63,63 @@ final class FileNodeTests: XCTestCase {
 
         XCTAssertEqual(root.directoryChildren?.map(\.id), [directory.id])
     }
+
+    func testVeryDeepTreesCanBeSearchedAndUpdatedWithoutRecursion() {
+        let depth = 5_000
+        var node = FileNode(
+            url: URL(fileURLWithPath: "/tmp/deep/leaf.bin"),
+            name: "leaf.bin",
+            kind: .file,
+            logicalSize: 1,
+            allocatedSize: 4_096
+        )
+        let leafID = node.id
+
+        for index in (0..<depth).reversed() {
+            node = FileNode(
+                id: "/tmp/deep/\(index)",
+                url: URL(fileURLWithPath: "/tmp/deep/\(index)"),
+                name: String(index),
+                kind: .directory,
+                logicalSize: node.logicalSize,
+                allocatedSize: node.allocatedSize,
+                children: [node]
+            )
+        }
+
+        XCTAssertEqual(node.path(to: leafID)?.count, depth + 1)
+        XCTAssertNotNil(node.findChild(withID: leafID))
+
+        let updated = node.removingDescendant(withID: leafID)
+        XCTAssertNil(updated.findChild(withID: leafID))
+        XCTAssertEqual(updated.allocatedSize, 0)
+    }
+
+    func testHiddenPackageCountsSurviveImmutableTreeUpdates() {
+        let package = FileNode(
+            url: URL(fileURLWithPath: "/tmp/App.app"),
+            name: "App.app",
+            kind: .package,
+            isPackage: true,
+            logicalSize: 1_000,
+            allocatedSize: 2_000,
+            totalFileCount: 12,
+            totalDirectoryCount: 4
+        )
+        let root = FileNode(
+            url: URL(fileURLWithPath: "/tmp"),
+            name: "tmp",
+            kind: .directory,
+            logicalSize: package.logicalSize,
+            allocatedSize: package.allocatedSize,
+            children: [package]
+        )
+
+        XCTAssertEqual(root.descendantCounts().files, 12)
+        XCTAssertEqual(root.descendantCounts().directories, 5)
+
+        let updated = root.removingDescendant(withID: package.id)
+        XCTAssertEqual(updated.descendantCounts().files, 0)
+        XCTAssertEqual(updated.descendantCounts().directories, 1)
+    }
 }

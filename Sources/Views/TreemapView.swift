@@ -136,10 +136,8 @@ struct TreemapView: View {
                                         viewModel.openContainingFolder(node: hovered.node)
                                     }
                                     
-                                    if !hovered.node.isDirectory {
-                                        Button("Move to Trash") {
-                                            viewModel.moveToTrash(node: hovered.node)
-                                        }
+                                    Button("Move to Trash") {
+                                        viewModel.moveToTrash(node: hovered.node)
                                     }
                                 } else {
                                     Text("No item under mouse pointer")
@@ -240,12 +238,16 @@ struct TreemapView: View {
         while itemIndex < items.count && remainingRect.width > 0 && remainingRect.height > 0 {
             var row: [WeightedNode] = []
             let shortSide = min(remainingRect.width, remainingRect.height)
+            var rowMetrics = SquarifyRowMetrics()
 
             while itemIndex < items.count {
                 let next = items[itemIndex]
-                let candidate = row + [next]
-                if row.isEmpty || worstRatio(candidate, shortSide: shortSide) <= worstRatio(row, shortSide: shortSide) {
+                let candidateMetrics = rowMetrics.adding(next.area)
+                if row.isEmpty ||
+                   candidateMetrics.worstRatio(shortSide: shortSide) <=
+                    rowMetrics.worstRatio(shortSide: shortSide) {
                     row.append(next)
+                    rowMetrics = candidateMetrics
                     itemIndex += 1
                 } else {
                     break
@@ -258,21 +260,6 @@ struct TreemapView: View {
         }
 
         return layouts
-    }
-
-    private func worstRatio(_ row: [WeightedNode], shortSide: CGFloat) -> CGFloat {
-        guard !row.isEmpty, shortSide > 0 else { return .infinity }
-        let areas = row.map(\.area)
-        guard let minimum = areas.min(), let maximum = areas.max(), minimum > 0 else {
-            return .infinity
-        }
-        let sum = areas.reduce(0, +)
-        let sideSquared = shortSide * shortSide
-        let sumSquared = sum * sum
-        return max(
-            sideSquared * maximum / sumSquared,
-            sumSquared / (sideSquared * minimum)
-        )
     }
 
     private func layout(row: [WeightedNode], in rect: CGRect) -> (layouts: [NodeLayout], remainder: CGRect) {
@@ -341,6 +328,30 @@ struct TreemapRect: Identifiable {
 private struct WeightedNode {
     let node: FileNode
     let area: CGFloat
+}
+
+private struct SquarifyRowMetrics {
+    var sum: CGFloat = 0
+    var minimum: CGFloat = .infinity
+    var maximum: CGFloat = 0
+
+    func adding(_ area: CGFloat) -> SquarifyRowMetrics {
+        SquarifyRowMetrics(
+            sum: sum + area,
+            minimum: min(minimum, area),
+            maximum: max(maximum, area)
+        )
+    }
+
+    func worstRatio(shortSide: CGFloat) -> CGFloat {
+        guard sum > 0, minimum > 0, shortSide > 0 else { return .infinity }
+        let sideSquared = shortSide * shortSide
+        let sumSquared = sum * sum
+        return max(
+            sideSquared * maximum / sumSquared,
+            sumSquared / (sideSquared * minimum)
+        )
+    }
 }
 
 private struct NodeLayout {

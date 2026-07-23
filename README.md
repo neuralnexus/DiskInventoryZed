@@ -18,22 +18,25 @@ Disk Inventory Zed is a native macOS application that visualizes disk usage with
 - **Crash-Safe Scan Snapshots** — Bounded workers build an immutable tree before SwiftUI sees it
 - **Three Visualizations** — Treemap, hierarchical sunburst, and detailed list views
 - **Smart Sorting** — Sort by name or size (ascending/descending)
-- **File Actions** — Reveal in Finder, move to trash
+- **Safe Cleanup** — Reveal in Finder or move confirmed files and folders to macOS Trash; protected scan roots are blocked
 - **Quick Access** — Scan Home, Applications, Documents, Downloads, or any custom folder
 - **Mounted Volume Overview** — Scan internal, external, and network volumes with free-space context
 - **Breadcrumb Navigation** — Easy traversal up and down the directory tree
 - **Dark Mode** — Native support for macOS dark mode
 - **File Type Colors** — Files colored by extension type for quick visual identification
-- **Storage Intelligence** — Largest files, old large files, and conservative duplicate candidates
+- **Storage Intelligence** — Largest files, old large files, and same-size duplicate discovery
+- **Verified Duplicates** — Cancellable sample-first and full-file SHA-256 verification, including copies with different names
+- **Scan Comparison** — Compare a current scan with a versioned snapshot to find additions, removals, growth, and reclaimed space
 - **Accurate Storage Accounting** — Shows logical and allocated sizes and avoids hard-link double counting
 - **Scan Health** — Reports unreadable paths, skipped folders, packages, symlinks, and revisited targets
 - **Global Search** — Debounced indexed search by file name or path without blocking the interface
 - **Portable Exports** — Versioned JSON and streaming CSV with reliability metadata
+- **Deep-Tree Safety** — Iterative tree building, navigation, and cleanup updates avoid recursion overflow
 
 ## Requirements
 
 - macOS 13.0 (Ventura) or later
-- Intel or Apple Silicon (M1/M2/M3/M4 or later)
+- Intel or Apple Silicon
 - Xcode 15.0+ (for building from source)
 
 ## Building
@@ -60,7 +63,9 @@ This will create `DiskInventoryZed.app` in the current directory, built as a uni
 
 ## First Launch
 
-Since Disk Inventory Zed is not distributed through the Mac App Store or notarized by Apple, macOS Gatekeeper may show a security warning when you first try to open it:
+Developer builds are ad-hoc signed, so macOS Gatekeeper may show a security warning when you first
+try to open one. Tagged releases can be Developer ID signed and notarized when the repository's
+Apple signing credentials are configured:
 
 > **"Apple could not verify 'DiskInventoryZed' is free of malware that may harm your Mac or compromise your privacy."**
 
@@ -107,8 +112,11 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 
 - **Types** aggregates storage by extension.
 - **Largest** finds the largest files anywhere in the scanned tree.
-- **Review** highlights old large files and files with the same name and byte size. Duplicate
-  candidates are intentionally labeled as possibilities; verify their contents before deleting.
+- **Review** highlights old large files and files with the same byte size. Duplicate
+  candidates are intentionally labeled as possibilities until the app verifies their full SHA-256
+  content digests. Matching names are not required.
+- **Changes** compares a current scan with an earlier snapshot of the same location and separates
+  growth, reductions, additions, and removals.
 - **Selection** distinguishes logical size from space allocated on disk, which matters for sparse
   files, clones, and hard links.
 
@@ -117,7 +125,9 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 - **SwiftUI** — Modern declarative UI framework
 - **Swift Concurrency** — A bounded actor-backed work queue with cooperative cancellation
 - **Immutable Snapshots** — Background workers never mutate data already published to SwiftUI
+- **Iterative Tree Operations** — Deep paths do not consume one call-stack frame per directory
 - **Cycle Protection** — Symlink targets and previously visited directories are not traversed twice
+- **Two-Stage Duplicate Verification** — First/last-byte samples minimize I/O before full SHA-256 hashing
 - **Squarified Treemap** — Industry-standard algorithm for optimal rectangle aspect ratios
 - **MVVM Pattern** — Clean separation between views and business logic
 

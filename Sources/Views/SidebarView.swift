@@ -181,6 +181,10 @@ struct SidebarRow: View {
             Button("Open Containing Folder") {
                 viewModel.openContainingFolder(node: node)
             }
+
+            Button("Move to Trash") {
+                viewModel.moveToTrash(node: node)
+            }
             
             Divider()
             

@@ -32,6 +32,8 @@ final class FileNode: Identifiable, Hashable, @unchecked Sendable {
     let children: [FileNode]
     let errorDescription: String?
     let isHardLinkDuplicate: Bool
+    let totalFileCount: Int
+    let totalDirectoryCount: Int
 
     var size: Int64 { allocatedSize }
     var isDirectory: Bool { kind == .directory }
@@ -73,7 +75,9 @@ final class FileNode: Identifiable, Hashable, @unchecked Sendable {
         allocatedSize: Int64,
         children: [FileNode] = [],
         errorDescription: String? = nil,
-        isHardLinkDuplicate: Bool = false
+        isHardLinkDuplicate: Bool = false,
+        totalFileCount: Int? = nil,
+        totalDirectoryCount: Int? = nil
     ) {
         self.id = id ?? url.standardizedFileURL.path
         self.url = url
@@ -89,6 +93,16 @@ final class FileNode: Identifiable, Hashable, @unchecked Sendable {
         self.children = children
         self.errorDescription = errorDescription
         self.isHardLinkDuplicate = isHardLinkDuplicate
+        self.totalFileCount = totalFileCount ?? (
+            kind == .directory
+                ? children.reduce(0) { $0 + $1.totalFileCount }
+                : 1
+        )
+        self.totalDirectoryCount = totalDirectoryCount ?? (
+            kind == .directory
+                ? 1 + children.reduce(0) { $0 + $1.totalDirectoryCount }
+                : 0
+        )
     }
 
     static func == (lhs: FileNode, rhs: FileNode) -> Bool {
@@ -100,11 +114,10 @@ final class FileNode: Identifiable, Hashable, @unchecked Sendable {
     }
 
     func findChild(withID targetID: String) -> FileNode? {
-        if id == targetID { return self }
-        for child in children {
-            if let match = child.findChild(withID: targetID) {
-                return match
-            }
+        var stack = [self]
+        while let node = stack.popLast() {
+            if node.id == targetID { return node }
+            stack.append(contentsOf: node.children.reversed())
         }
         return nil
     }
@@ -114,10 +127,26 @@ final class FileNode: Identifiable, Hashable, @unchecked Sendable {
     }
 
     func path(to targetID: String) -> [FileNode]? {
-        if id == targetID { return [self] }
-        for child in children {
-            if let childPath = child.path(to: targetID) {
-                return [self] + childPath
+        var stack = [self]
+        var nodesByID: [String: FileNode] = [id: self]
+        var parentByID: [String: String] = [:]
+
+        while let node = stack.popLast() {
+            if node.id == targetID {
+                var result: [FileNode] = []
+                var cursor: String? = targetID
+                while let currentID = cursor,
+                      let currentNode = nodesByID[currentID] {
+                    result.append(currentNode)
+                    cursor = parentByID[currentID]
+                }
+                return Array(result.reversed())
+            }
+
+            for child in node.children.reversed() {
+                nodesByID[child.id] = child
+                parentByID[child.id] = node.id
+                stack.append(child)
             }
         }
         return nil
@@ -126,19 +155,29 @@ final class FileNode: Identifiable, Hashable, @unchecked Sendable {
     /// Returns a new immutable tree with the requested item removed.
     /// Only ancestors of the removed item are rebuilt.
     func removingDescendant(withID targetID: String) -> FileNode {
-        let updatedChildren = children.compactMap { child -> FileNode? in
-            if child.id == targetID { return nil }
-            if child.children.isEmpty { return child }
-            return child.removingDescendant(withID: targetID)
-        }
-
-        guard updatedChildren.count != children.count ||
-              zip(updatedChildren, children).contains(where: { pair in
-                  pair.0.id != pair.1.id || pair.0 !== pair.1
-              }) else {
+        guard targetID != id,
+              let targetPath = path(to: targetID),
+              targetPath.count > 1 else {
             return self
         }
 
+        var replacement: FileNode?
+        for ancestor in targetPath.dropLast().reversed() {
+            let childToReplaceID = replacement?.id ?? targetID
+            let updatedChildren = ancestor.children.compactMap { child -> FileNode? in
+                guard child.id == childToReplaceID else { return child }
+                return replacement
+            }
+            replacement = ancestor.replacingChildren(updatedChildren)
+        }
+        return replacement ?? self
+    }
+
+    func descendantCounts() -> (files: Int, directories: Int) {
+        (totalFileCount, totalDirectoryCount)
+    }
+
+    private func replacingChildren(_ updatedChildren: [FileNode]) -> FileNode {
         let newLogicalSize = updatedChildren.reduce(Int64(0)) { $0 + $1.logicalSize }
         let newAllocatedSize = updatedChildren.reduce(Int64(0)) { $0 + $1.allocatedSize }
 
@@ -156,7 +195,9 @@ final class FileNode: Identifiable, Hashable, @unchecked Sendable {
             allocatedSize: isDirectory ? newAllocatedSize : allocatedSize,
             children: updatedChildren,
             errorDescription: errorDescription,
-            isHardLinkDuplicate: isHardLinkDuplicate
+            isHardLinkDuplicate: isHardLinkDuplicate,
+            totalFileCount: updatedChildren.reduce(0) { $0 + $1.totalFileCount },
+            totalDirectoryCount: 1 + updatedChildren.reduce(0) { $0 + $1.totalDirectoryCount }
         )
     }
 }

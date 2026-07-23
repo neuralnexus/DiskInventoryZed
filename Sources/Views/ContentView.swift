@@ -51,6 +51,19 @@ struct ContentView: View {
             }
         }
     }
+
+    private func showSnapshotComparisonPanel() {
+        let openPanel = NSOpenPanel()
+        openPanel.allowedContentTypes = [.json]
+        openPanel.allowsMultipleSelection = false
+        openPanel.canChooseDirectories = false
+        openPanel.message = "Choose a Disk Inventory Zed JSON snapshot from an earlier scan."
+        openPanel.begin { response in
+            if response == .OK, let url = openPanel.url {
+                viewModel.compareWithSnapshot(at: url)
+            }
+        }
+    }
     
     var body: some View {
         NavigationSplitView {
@@ -97,16 +110,22 @@ struct ContentView: View {
                 HStack(spacing: 8) {
                     if viewModel.rootNode != nil && !viewModel.isScanning {
                         Menu {
-                            Button("Export JSON…") {
+                            Button("Export Snapshot (JSON)…") {
                                 showSavePanel(format: .json)
                             }
                             Button("Export CSV…") {
                                 showSavePanel(format: .csv)
                             }
+
+                            Divider()
+
+                            Button("Compare with Snapshot…") {
+                                showSnapshotComparisonPanel()
+                            }
                         } label: {
                             Label("Export", systemImage: "square.and.arrow.up")
                         }
-                        .help("Export the complete scan as JSON or CSV")
+                        .help("Export scan data or compare it with an earlier snapshot")
 
                         Button {
                             viewModel.rescan()
@@ -181,6 +200,25 @@ struct ContentView: View {
         } message: {
             Text(viewModel.errorMessage ?? "Unknown error")
         }
+        .alert(
+            "Move Item to Trash?",
+            isPresented: Binding(
+                get: { viewModel.pendingTrashNode != nil },
+                set: { isPresented in
+                    if !isPresented { viewModel.cancelMoveToTrash() }
+                }
+            ),
+            presenting: viewModel.pendingTrashNode
+        ) { _ in
+            Button("Move to Trash", role: .destructive) {
+                viewModel.confirmMoveToTrash()
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.cancelMoveToTrash()
+            }
+        } message: { node in
+            Text("“\(node.displayName)” uses \(node.formattedSize) on disk. This moves it to the macOS Trash; it is not permanently erased.")
+        }
     }
 }
 
@@ -189,24 +227,37 @@ struct ToolbarView: View {
     
     var body: some View {
         HStack(spacing: 12) {
-            HStack(spacing: 4) {
-                ForEach(viewModel.breadcrumb) { node in
-                    if node.id != viewModel.breadcrumb.first?.id {
-                        Image(systemName: "chevron.right")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(viewModel.breadcrumb) { node in
+                        if node.id != viewModel.breadcrumb.first?.id {
+                            Image(systemName: "chevron.right")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Button(node.displayName) {
+                            viewModel.navigateTo(node: node)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(node.id == viewModel.currentNode?.id ? .primary : .secondary)
+                        .font(.system(size: 12, weight: node.id == viewModel.currentNode?.id ? .semibold : .regular))
                     }
-                    
-                    Button(node.displayName) {
-                        viewModel.navigateTo(node: node)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(node.id == viewModel.currentNode?.id ? .primary : .secondary)
-                    .font(.system(size: 12, weight: node.id == viewModel.currentNode?.id ? .semibold : .regular))
                 }
             }
+            .frame(minWidth: 120)
             
             Spacer()
+
+            if !viewModel.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Picker("Search Scope", selection: $viewModel.searchScope) {
+                    ForEach(AppViewModel.SearchScope.allCases, id: \.self) { scope in
+                        Text(scope.rawValue)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(width: 125)
+            }
             
             Picker("View", selection: $viewModel.viewMode) {
                 ForEach(AppViewModel.ViewMode.allCases, id: \.self) { mode in

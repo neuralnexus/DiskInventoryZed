@@ -140,10 +140,8 @@ struct SunburstChartView: View {
                                     viewModel.openContainingFolder(node: hovered.node)
                                 }
                                 
-                                if !hovered.node.isDirectory {
-                                    Button("Move to Trash") {
-                                        viewModel.moveToTrash(node: hovered.node)
-                                    }
+                                Button("Move to Trash") {
+                                    viewModel.moveToTrash(node: hovered.node)
                                 }
                                 
                                 if hovered.node.isDirectory {
