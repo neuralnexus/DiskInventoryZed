@@ -95,6 +95,9 @@ final class AppViewModel: ObservableObject {
     @Published private(set) var isScanning = false
     @Published private(set) var totalFiles = 0
     @Published private(set) var totalDirectories = 0
+    @Published private(set) var scanProgressFiles = 0
+    @Published private(set) var scanProgressDirectories = 0
+    @Published private(set) var scanProgressUnreadableItems = 0
     @Published private(set) var scanDuration: TimeInterval = 0
     @Published private(set) var scanStatusPath = ""
     @Published private(set) var scanDiagnostics = ScanDiagnostics.empty
@@ -238,30 +241,17 @@ final class AppViewModel: ObservableObject {
         let scanID = UUID()
         activeScanID = scanID
         isScanning = true
-        totalFiles = 0
-        totalDirectories = 0
-        scanDuration = 0
+        scanProgressFiles = 0
+        scanProgressDirectories = 0
+        scanProgressUnreadableItems = 0
         scanStatusPath = url.path
-        scanDiagnostics = .empty
         errorMessage = nil
         showError = false
-        selectedNode = nil
-        searchResults = []
-        extensionStats = []
-        largestFiles = []
-        oldLargeFiles = []
-        duplicateCandidates = []
-        verifiedDuplicates = []
         duplicateVerificationProgress = nil
-        duplicateVerificationUnreadablePaths = []
-        didVerifyDuplicates = false
         isAnalyzing = false
-        searchIndex = []
         pendingTrashNode = nil
-        scanComparison = nil
         isComparingSnapshot = false
 
-        UserSettings.lastScanPath = url.path
         let options = ScanOptions(
             skipDeveloperFolders: skipDeveloperFolders,
             showHiddenFiles: showHiddenFiles,
@@ -276,17 +266,19 @@ final class AppViewModel: ObservableObject {
             do {
                 let result = try await scanner.scan(url: url, options: options) { [weak self] snapshot in
                     guard let self, self.activeScanID == scanID else { return }
-                    self.totalFiles = snapshot.files
-                    self.totalDirectories = snapshot.directories
+                    self.scanProgressFiles = snapshot.files
+                    self.scanProgressDirectories = snapshot.directories
+                    self.scanProgressUnreadableItems = snapshot.unreadableItems
                     self.scanStatusPath = snapshot.currentPath
-                    self.scanDiagnostics.unreadableItems = snapshot.unreadableItems
                 }
 
                 try Task.checkCancellation()
                 guard self.activeScanID == scanID else { return }
 
+                UserSettings.lastScanPath = url.path
                 self.rootNode = result.root
                 self.currentNode = result.root
+                self.selectedNode = nil
                 self.breadcrumb = [result.root]
                 self.navigationStack = [result.root]
                 self.navigationIndex = 0
@@ -296,14 +288,30 @@ final class AppViewModel: ObservableObject {
                 self.scanDiagnostics = result.diagnostics
                 self.scanStatusPath = result.root.path
                 self.isScanning = false
+                self.scanProgressFiles = 0
+                self.scanProgressDirectories = 0
+                self.scanProgressUnreadableItems = 0
+                self.searchResults = []
+                self.extensionStats = []
+                self.largestFiles = []
+                self.oldLargeFiles = []
+                self.duplicateCandidates = []
+                self.verifiedDuplicates = []
+                self.duplicateVerificationProgress = nil
+                self.duplicateVerificationUnreadablePaths = []
+                self.didVerifyDuplicates = false
+                self.searchIndex = []
+                self.scanComparison = nil
                 self.startAnalysis(for: result.root, scanID: scanID)
             } catch is CancellationError {
                 if self.activeScanID == scanID {
                     self.isScanning = false
+                    self.resetScanProgress()
                 }
             } catch {
                 guard self.activeScanID == scanID else { return }
                 self.isScanning = false
+                self.resetScanProgress()
                 self.errorMessage = error.localizedDescription
                 self.showError = true
             }
@@ -315,7 +323,7 @@ final class AppViewModel: ObservableObject {
         scanTask?.cancel()
         scanTask = nil
         isScanning = false
-        scanStatusPath = ""
+        resetScanProgress()
     }
 
     func rescan() {
@@ -723,6 +731,13 @@ final class AppViewModel: ObservableObject {
     private func presentError(_ message: String) {
         errorMessage = message
         showError = true
+    }
+
+    private func resetScanProgress() {
+        scanProgressFiles = 0
+        scanProgressDirectories = 0
+        scanProgressUnreadableItems = 0
+        scanStatusPath = rootNode?.path ?? ""
     }
 
     private func cleanupSafetyError(for node: FileNode) -> String? {

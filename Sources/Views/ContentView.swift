@@ -304,9 +304,15 @@ struct ScanningView: View {
                 .fontWeight(.semibold)
             
             VStack(spacing: 4) {
-                Text("\(viewModel.totalFiles) files, \(viewModel.totalDirectories) directories")
+                Text("\(viewModel.scanProgressFiles) files, \(viewModel.scanProgressDirectories) directories")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+
+                if viewModel.scanProgressUnreadableItems > 0 {
+                    Text("\(viewModel.scanProgressUnreadableItems) items could not be read")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.orange)
+                }
 
                 if !viewModel.scanStatusPath.isEmpty {
                     Text(viewModel.scanStatusPath)
