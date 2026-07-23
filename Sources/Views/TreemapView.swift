@@ -170,26 +170,30 @@ struct TreemapView: View {
                 return
             }
 
-            let children = parent.children.filter {
-                $0.size > 0 &&
-                (viewModel.sizeThreshold == 0 || $0.size >= viewModel.sizeThreshold)
+            let availableRectangles = maximumRectangles - result.count
+            guard availableRectangles > 0 else { return }
+
+            var children: [FileNode] = []
+            children.reserveCapacity(min(parent.children.count, availableRectangles))
+            var eligibleTotalSize: Int64 = 0
+            for child in parent.children where
+                child.size > 0 &&
+                (viewModel.sizeThreshold == 0 || child.size >= viewModel.sizeThreshold) {
+                let (sum, overflow) = eligibleTotalSize.addingReportingOverflow(child.size)
+                eligibleTotalSize = overflow ? Int64.max : sum
+                if children.count < availableRectangles {
+                    children.append(child)
+                }
             }
             guard !children.isEmpty else {
                 return
             }
-            guard children.count <= maximumRectangles - result.count else {
-                if result.isEmpty {
-                    result.append(TreemapRect(
-                        node: parent,
-                        rect: parentRect,
-                        color: FileTypeColors.color(for: parent),
-                        depth: depth
-                    ))
-                }
-                return
-            }
 
-            for layout in squarify(children: children, in: parentRect) {
+            for layout in squarify(
+                children: children,
+                in: parentRect,
+                totalSize: eligibleTotalSize
+            ) {
                 guard layout.rect.width >= 0.5,
                       layout.rect.height >= 0.5 else {
                     continue
@@ -224,9 +228,12 @@ struct TreemapView: View {
         return result
     }
 
-    private func squarify(children: [FileNode], in rect: CGRect) -> [NodeLayout] {
+    private func squarify(
+        children: [FileNode],
+        in rect: CGRect,
+        totalSize: Int64
+    ) -> [NodeLayout] {
         let sorted = children.filter { $0.size > 0 }.sorted { $0.size > $1.size }
-        let totalSize = sorted.reduce(Int64(0)) { $0 + $1.size }
         guard totalSize > 0, rect.width > 0, rect.height > 0 else { return [] }
 
         let scale = (rect.width * rect.height) / CGFloat(totalSize)
