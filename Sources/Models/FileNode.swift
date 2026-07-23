@@ -79,8 +79,8 @@ final class FileNode: Identifiable, Hashable, @unchecked Sendable {
         self.url = url
         self.name = name
         self.kind = kind
-        self.isPackage = isPackage ?? kind == .package
-        self.isSymbolicLink = isSymbolicLink ?? kind == .symbolicLink
+        self.isPackage = isPackage ?? (kind == .package)
+        self.isSymbolicLink = isSymbolicLink ?? (kind == .symbolicLink)
         self.modificationDate = modificationDate
         self.creationDate = creationDate
         self.extension = `extension`

@@ -111,7 +111,7 @@ final class DiskScanner: Sendable {
         let queue = ScanWorkQueue(
             root: WorkItem(
                 record: rootRecord,
-                canonicalDirectoryPath: canonicalDirectoryPath(for: rootURL)
+                canonicalDirectoryPath: Self.canonicalDirectoryPath(for: rootURL)
             )
         )
 
