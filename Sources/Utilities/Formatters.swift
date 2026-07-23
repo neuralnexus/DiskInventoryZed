@@ -74,15 +74,24 @@ enum FileTypeColors {
             Color(red: 0.75, green: 0.25, blue: 0.55),
             Color(red: 0.55, green: 0.25, blue: 0.85),
         ]
-        return colors[abs(node.id.hashValue) % colors.count]
+        // Swift's randomized Hashable seed makes colors jump between launches, and
+        // abs(Int.min) can trap. A small stable hash avoids both problems.
+        let index = Int(stableHash(for: node.path) % UInt64(colors.count))
+        return colors[index]
     }
     
     private static func hashColor(for string: String) -> Color {
-        var hash: UInt64 = 0
-        for char in string.unicodeScalars {
-            hash = UInt64(char.value) &+ ((hash &<< 5) &- hash)
-        }
+        let hash = stableHash(for: string)
         let hue = Double(hash % 360) / 360.0
         return Color(hue: hue, saturation: 0.6, brightness: 0.85)
+    }
+
+    private static func stableHash(for string: String) -> UInt64 {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in string.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return hash
     }
 }

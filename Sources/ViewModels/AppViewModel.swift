@@ -1,117 +1,146 @@
 // Disk Inventory Zed — a modern, fast, native disk usage visualizer
-// https://github.com/yourusername/DiskInventoryZed
 //
 // Copyright (C) 2026 Matt Ivan
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// Licensed under GPL-3.0-or-later.
 
+import AppKit
 import Foundation
 import SwiftUI
 
 struct UserSettings {
     private static let defaults = UserDefaults.standard
-    
+
     static var lastScanPath: String? {
         get { defaults.string(forKey: "lastScanPath") }
         set { defaults.set(newValue, forKey: "lastScanPath") }
     }
-    
+
     static var defaultViewMode: AppViewModel.ViewMode {
         get {
-            let rawValue = defaults.string(forKey: "defaultViewMode") ?? "treemap"
+            let rawValue = defaults.string(forKey: "defaultViewMode") ?? AppViewModel.ViewMode.treemap.rawValue
             return AppViewModel.ViewMode(rawValue: rawValue) ?? .treemap
         }
         set { defaults.set(newValue.rawValue, forKey: "defaultViewMode") }
     }
-    
+
     static var defaultSortOrder: AppViewModel.SortOrder {
         get {
-            let rawValue = defaults.string(forKey: "defaultSortOrder") ?? "sizeDescending"
+            let rawValue = defaults.string(forKey: "defaultSortOrder") ?? AppViewModel.SortOrder.sizeDescending.rawValue
             return AppViewModel.SortOrder(rawValue: rawValue) ?? .sizeDescending
         }
         set { defaults.set(newValue.rawValue, forKey: "defaultSortOrder") }
     }
-    
+
     static var skipDeveloperFolders: Bool {
-        get { defaults.object(forKey: "skipDeveloperFolders") as? Bool ?? true }
+        get { defaults.object(forKey: "skipDeveloperFolders") as? Bool ?? false }
         set { defaults.set(newValue, forKey: "skipDeveloperFolders") }
     }
-    
+
     static var sizeThreshold: Int64 {
         get { defaults.object(forKey: "sizeThreshold") as? Int64 ?? 0 }
         set { defaults.set(newValue, forKey: "sizeThreshold") }
     }
-    
+
     static var showHiddenFiles: Bool {
         get { defaults.object(forKey: "showHiddenFiles") as? Bool ?? false }
         set { defaults.set(newValue, forKey: "showHiddenFiles") }
     }
-    
+
     static var showPackageContents: Bool {
         get { defaults.object(forKey: "showPackageContents") as? Bool ?? true }
         set { defaults.set(newValue, forKey: "showPackageContents") }
     }
-    
+
     static var followSymlinks: Bool {
         get { defaults.object(forKey: "followSymlinks") as? Bool ?? false }
         set { defaults.set(newValue, forKey: "followSymlinks") }
     }
 }
 
-struct ExtensionStat: Identifiable, Hashable, Sendable {
+struct ExtensionStat: Identifiable, Hashable {
     var id: String { ext }
     let ext: String
     let totalSize: Int64
     let fileCount: Int
-    let color: Color
+
+    var color: Color {
+        FileTypeColors.color(forExtension: ext)
+    }
+}
+
+struct DuplicateCandidate: Identifiable, Hashable, Sendable {
+    let id: String
+    let displayName: String
+    let fileSize: Int64
+    let files: [FileNode]
+
+    var potentialSavings: Int64 {
+        Int64(max(0, files.count - 1)) * fileSize
+    }
 }
 
 @MainActor
-class AppViewModel: ObservableObject {
-    @Published var rootNode: FileNode?
-    @Published var currentNode: FileNode?
+final class AppViewModel: ObservableObject {
+    @Published private(set) var rootNode: FileNode?
+    @Published private(set) var currentNode: FileNode?
     @Published var selectedNode: FileNode?
-    @Published var isScanning = false
-    @Published var scanProgress: Double = 0
-    @Published var totalFiles = 0
-    @Published var totalDirectories = 0
-    @Published var scanDuration: TimeInterval = 0
+    @Published private(set) var breadcrumb: [FileNode] = []
+    @Published private(set) var isScanning = false
+    @Published private(set) var totalFiles = 0
+    @Published private(set) var totalDirectories = 0
+    @Published private(set) var scanDuration: TimeInterval = 0
+    @Published private(set) var scanStatusPath = ""
+    @Published private(set) var scanDiagnostics = ScanDiagnostics.empty
     @Published var errorMessage: String?
     @Published var showError = false
-    @Published var viewMode: ViewMode = UserSettings.defaultViewMode
-    @Published var sortOrder: SortOrder = UserSettings.defaultSortOrder
-    @Published var searchQuery = ""
-    @Published var extensionStats: [ExtensionStat] = []
-    @Published var selectedExtension: String? = nil
-    @Published var sizeThreshold: Int64 = UserSettings.sizeThreshold
-    @Published var skipDeveloperFolders = UserSettings.skipDeveloperFolders
-    @Published var showHiddenFiles = UserSettings.showHiddenFiles
-    @Published var showPackageContents = UserSettings.showPackageContents
-    @Published var followSymlinks = UserSettings.followSymlinks
-    
-    // Navigation history for undo/redo
+    @Published var viewMode: ViewMode = UserSettings.defaultViewMode {
+        didSet { UserSettings.defaultViewMode = viewMode }
+    }
+    @Published var sortOrder: SortOrder = UserSettings.defaultSortOrder {
+        didSet { UserSettings.defaultSortOrder = sortOrder }
+    }
+    @Published var searchQuery = "" {
+        didSet { scheduleSearch() }
+    }
+    @Published private(set) var searchResults: [FileNode] = []
+    @Published private(set) var extensionStats: [ExtensionStat] = []
+    @Published var selectedExtension: String?
+    @Published var sizeThreshold: Int64 = UserSettings.sizeThreshold {
+        didSet { UserSettings.sizeThreshold = sizeThreshold }
+    }
+    @Published var skipDeveloperFolders = UserSettings.skipDeveloperFolders {
+        didSet { UserSettings.skipDeveloperFolders = skipDeveloperFolders }
+    }
+    @Published var showHiddenFiles = UserSettings.showHiddenFiles {
+        didSet { UserSettings.showHiddenFiles = showHiddenFiles }
+    }
+    @Published var showPackageContents = UserSettings.showPackageContents {
+        didSet { UserSettings.showPackageContents = showPackageContents }
+    }
+    @Published var followSymlinks = UserSettings.followSymlinks {
+        didSet { UserSettings.followSymlinks = followSymlinks }
+    }
+    @Published private(set) var largestFiles: [FileNode] = []
+    @Published private(set) var oldLargeFiles: [FileNode] = []
+    @Published private(set) var duplicateCandidates: [DuplicateCandidate] = []
+    @Published private(set) var isAnalyzing = false
+
     private var navigationStack: [FileNode] = []
-    private var navigationIndex: Int = -1
-    
+    private var navigationIndex = -1
+    private var activeScanID: UUID?
+    private var scanTask: Task<Void, Never>?
+    private var analysisTask: Task<Void, Never>?
+    private var searchTask: Task<Void, Never>?
+    private var searchIndex: [SearchIndexEntry] = []
+
     var canNavigateBack: Bool { navigationIndex > 0 }
-    var canNavigateForward: Bool { navigationIndex < navigationStack.count - 1 }
-    
+    var canNavigateForward: Bool { navigationIndex >= 0 && navigationIndex < navigationStack.count - 1 }
+
     enum ViewMode: String, CaseIterable {
         case treemap = "Treemap"
         case sunburst = "Sunburst"
         case list = "List"
-        
+
         var icon: String {
             switch self {
             case .treemap: return "square.grid.2x2"
@@ -120,13 +149,13 @@ class AppViewModel: ObservableObject {
             }
         }
     }
-    
+
     enum SortOrder: String, CaseIterable {
         case sizeDescending = "Size (Large First)"
         case sizeAscending = "Size (Small First)"
         case nameAscending = "Name (A-Z)"
         case nameDescending = "Name (Z-A)"
-        
+
         var icon: String {
             switch self {
             case .sizeDescending: return "arrow.down"
@@ -136,283 +165,438 @@ class AppViewModel: ObservableObject {
             }
         }
     }
-    
-    private var scanner: DiskScanner?
-    
+
     var filteredChildren: [FileNode] {
         guard let node = currentNode else { return [] }
-        let baseChildren = node.children
-        
-        let filtered: [FileNode]
-        if searchQuery.isEmpty {
-            filtered = baseChildren
-        } else {
-            var results: [FileNode] = []
-            func search(_ n: FileNode) {
-                if n.displayName.localizedCaseInsensitiveContains(searchQuery) {
-                    results.append(n)
-                }
-                for child in n.children {
-                    search(child)
-                }
+        let candidates = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? node.children
+            : searchResults
+
+        let filtered = candidates.filter { candidate in
+            if sizeThreshold > 0 && candidate.size < sizeThreshold { return false }
+            if let selectedExtension {
+                return candidate.extension?.lowercased() == selectedExtension.lowercased()
             }
-            for child in baseChildren {
-                search(child)
-            }
-            filtered = results
+            return true
         }
-        
-        let sizeFiltered = sizeThreshold > 0 ? filtered.filter { $0.size >= sizeThreshold } : filtered
-        
+
         switch sortOrder {
         case .sizeDescending:
-            return sizeFiltered.sorted { $0.size > $1.size }
+            return filtered.sorted {
+                $0.size == $1.size
+                    ? $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
+                    : $0.size > $1.size
+            }
         case .sizeAscending:
-            return sizeFiltered.sorted { $0.size < $1.size }
+            return filtered.sorted {
+                $0.size == $1.size
+                    ? $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
+                    : $0.size < $1.size
+            }
         case .nameAscending:
-            return sizeFiltered.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+            return filtered.sorted {
+                $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
+            }
         case .nameDescending:
-            return sizeFiltered.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedDescending }
+            return filtered.sorted {
+                $0.displayName.localizedStandardCompare($1.displayName) == .orderedDescending
+            }
         }
     }
-    
-    var breadcrumb: [FileNode] {
-        var path: [FileNode] = []
-        var node: FileNode? = currentNode
-        while let n = node {
-            path.insert(n, at: 0)
-            node = n.parent
-        }
-        return path
-    }
-    
+
     func scan(url: URL) {
+        scanTask?.cancel()
+        analysisTask?.cancel()
+        searchTask?.cancel()
+
+        let scanID = UUID()
+        activeScanID = scanID
         isScanning = true
-        scanProgress = 0
         totalFiles = 0
         totalDirectories = 0
         scanDuration = 0
+        scanStatusPath = url.path
+        scanDiagnostics = .empty
         errorMessage = nil
         showError = false
-        rootNode = nil
-        currentNode = nil
         selectedNode = nil
-        navigationStack = []
-        navigationIndex = -1
-        
+        searchResults = []
+        extensionStats = []
+        largestFiles = []
+        oldLargeFiles = []
+        duplicateCandidates = []
+        isAnalyzing = false
+        searchIndex = []
+
         UserSettings.lastScanPath = url.path
-        
-        Task {
+        let options = ScanOptions(
+            skipDeveloperFolders: skipDeveloperFolders,
+            showHiddenFiles: showHiddenFiles,
+            showPackageContents: showPackageContents,
+            followSymlinks: followSymlinks
+        )
+
+        scanTask = Task { [weak self] in
+            guard let self else { return }
             let scanner = DiskScanner()
-            self.scanner = scanner
-            
+
             do {
-                let result = try await scanner.scan(
-                    url: url,
-                    skipDeveloperFolders: self.skipDeveloperFolders,
-                    showHiddenFiles: self.showHiddenFiles,
-                    showPackageContents: self.showPackageContents,
-                    followSymlinks: self.followSymlinks
-                ) { [weak self] snapshot in
-                    guard let self = self else { return }
+                let result = try await scanner.scan(url: url, options: options) { [weak self] snapshot in
+                    guard let self, self.activeScanID == scanID else { return }
                     self.totalFiles = snapshot.files
                     self.totalDirectories = snapshot.directories
-                    // Show the root node as soon as we have progress
-                    if self.rootNode == nil {
-                        self.rootNode = snapshot.currentNode.root()
-                        self.currentNode = self.rootNode
-                    }
+                    self.scanStatusPath = snapshot.currentPath
+                    self.scanDiagnostics.unreadableItems = snapshot.unreadableItems
                 }
-                
-                 self.rootNode = result.root
+
+                try Task.checkCancellation()
+                guard self.activeScanID == scanID else { return }
+
+                self.rootNode = result.root
                 self.currentNode = result.root
+                self.breadcrumb = [result.root]
+                self.navigationStack = [result.root]
+                self.navigationIndex = 0
                 self.totalFiles = result.totalFiles
                 self.totalDirectories = result.totalDirectories
                 self.scanDuration = result.duration
-                self.calculateExtensionStats()
+                self.scanDiagnostics = result.diagnostics
+                self.scanStatusPath = result.root.path
                 self.isScanning = false
-                
-            } catch {
-                self.isScanning = false
-                if let scanError = error as? DiskScanner.ScanError, scanError == .cancelled {
-                    return
+                self.startAnalysis(for: result.root, scanID: scanID)
+            } catch is CancellationError {
+                if self.activeScanID == scanID {
+                    self.isScanning = false
                 }
+            } catch {
+                guard self.activeScanID == scanID else { return }
+                self.isScanning = false
                 self.errorMessage = error.localizedDescription
                 self.showError = true
             }
         }
     }
-    
+
     func cancelScan() {
-        Task {
-            await scanner?.cancel()
-        }
+        activeScanID = nil
+        scanTask?.cancel()
+        scanTask = nil
         isScanning = false
+        scanStatusPath = ""
     }
-    
+
+    func rescan() {
+        if let rootNode {
+            scan(url: rootNode.url)
+        }
+    }
+
     func navigateTo(node: FileNode) {
-        if node.isDirectory {
-            // Remove any forward history if we're branching off
-            if navigationIndex < navigationStack.count - 1 {
-                navigationStack.removeSubrange((navigationIndex + 1)...)
-            }
-            // Push new node
+        guard node.isDirectory else {
+            selectedNode = node
+            return
+        }
+
+        if navigationIndex < navigationStack.count - 1 {
+            navigationStack.removeSubrange((navigationIndex + 1)...)
+        }
+        if navigationStack.last?.id != node.id {
             navigationStack.append(node)
             navigationIndex = navigationStack.count - 1
-            
-            currentNode = node
-            selectedNode = nil
-        } else {
-            selectedNode = node
         }
+        setCurrentNode(node)
     }
-    
+
     func navigateBack() {
         guard canNavigateBack else { return }
         navigationIndex -= 1
-        currentNode = navigationStack[navigationIndex]
-        selectedNode = nil
+        setCurrentNode(navigationStack[navigationIndex])
     }
-    
+
     func navigateForward() {
         guard canNavigateForward else { return }
         navigationIndex += 1
-        currentNode = navigationStack[navigationIndex]
-        selectedNode = nil
+        setCurrentNode(navigationStack[navigationIndex])
     }
-    
+
     func navigateUp() {
-        if let parent = currentNode?.parent {
-            navigateTo(node: parent)
-        }
+        guard breadcrumb.count > 1 else { return }
+        navigateTo(node: breadcrumb[breadcrumb.count - 2])
     }
-    
+
     func navigateToRoot() {
-        if let root = rootNode {
-            navigateTo(node: root)
+        if let rootNode {
+            navigateTo(node: rootNode)
         }
     }
-    
+
+    func focus(node: FileNode) {
+        guard let rootNode,
+              let path = rootNode.path(to: node.id) else {
+            selectedNode = node
+            return
+        }
+
+        if node.isDirectory {
+            navigateTo(node: node)
+            return
+        }
+
+        let parent = path.dropLast().last ?? rootNode
+        navigateTo(node: parent)
+        selectedNode = node
+    }
+
     func revealInFinder(node: FileNode) {
         NSWorkspace.shared.selectFile(node.url.path, inFileViewerRootedAtPath: "")
     }
 
     func openContainingFolder(node: FileNode) {
-        let parentURL = node.url.deletingLastPathComponent()
-        NSWorkspace.shared.open(parentURL)
+        NSWorkspace.shared.open(node.url.deletingLastPathComponent())
     }
 
     func openFile(node: FileNode) {
         NSWorkspace.shared.open(node.url)
     }
-    
+
     func moveToTrash(node: FileNode) {
         do {
             try FileManager.default.trashItem(at: node.url, resultingItemURL: nil)
-            if let parent = node.parent {
-                parent.children.removeAll { $0.id == node.id }
-                parent.size = parent.children.reduce(0) { $0 + $1.size }
-                if parent.children.isEmpty {
-                    parent.size = 0
-                }
-                objectWillChange.send()
+            guard let rootNode else { return }
+
+            let currentID = currentNode?.id
+            let updatedRoot = rootNode.removingDescendant(withID: node.id)
+            self.rootNode = updatedRoot
+
+            let nextCurrent = currentID.flatMap { updatedRoot.findChild(withID: $0) } ?? updatedRoot
+            currentNode = nextCurrent
+            breadcrumb = updatedRoot.path(to: nextCurrent.id) ?? [updatedRoot]
+            selectedNode = nil
+            navigationStack = breadcrumb
+            navigationIndex = navigationStack.count - 1
+
+            if let scanID = activeScanID {
+                startAnalysis(for: updatedRoot, scanID: scanID)
             }
-            calculateExtensionStats()
         } catch {
-            errorMessage = "Failed to move to trash: \(error.localizedDescription)"
+            errorMessage = "Failed to move to Trash: \(error.localizedDescription)"
             showError = true
         }
     }
-    
+
     func exportScanData(to url: URL) {
-        guard let root = rootNode else { return }
-        
-        struct ExportNode: Codable {
-            let name: String
-            let path: String
-            let size: Int64
-            let isDirectory: Bool
-            let children: [ExportNode]?
-        }
-        
-        func buildExportNode(_ node: FileNode) -> ExportNode {
-            let childrenDirs = node.isDirectory ? node.children.map { buildExportNode($0) } : nil
-            return ExportNode(
-                name: node.displayName,
-                path: node.path,
-                size: node.size,
-                isDirectory: node.isDirectory,
-                children: childrenDirs
-            )
-        }
-        
-        let exportRoot = buildExportNode(root)
-        
-        do {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = .prettyPrinted
-            let data = try encoder.encode(exportRoot)
-            try data.write(to: url)
-        } catch {
-            errorMessage = "Failed to export data: \(error.localizedDescription)"
-            showError = true
+        guard let rootNode else { return }
+        let diagnostics = scanDiagnostics
+
+        Task {
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try ScanExporter.exportJSON(root: rootNode, diagnostics: diagnostics, to: url)
+                }.value
+            } catch {
+                self.errorMessage = "Failed to export JSON: \(error.localizedDescription)"
+                self.showError = true
+            }
         }
     }
-    
-    func calculateExtensionStats() {
-        guard let root = rootNode else {
-            self.extensionStats = []
+
+    func exportCSV(to url: URL) {
+        guard let rootNode else { return }
+
+        Task {
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try ScanExporter.exportCSV(root: rootNode, to: url)
+                }.value
+            } catch {
+                self.errorMessage = "Failed to export CSV: \(error.localizedDescription)"
+                self.showError = true
+            }
+        }
+    }
+
+    func restoreLastScan() {
+        guard let path = UserSettings.lastScanPath,
+              FileManager.default.fileExists(atPath: path) else {
             return
         }
-        
-        Task {
-            let stats = await Task.detached(priority: .userInitiated) {
-                var localStats: [String: (size: Int64, count: Int)] = [:]
-                
-                func traverse(_ node: FileNode) {
-                    if node.isDirectory {
-                        for child in node.children {
-                            traverse(child)
-                        }
-                    } else {
-                        let ext = (node.extension ?? "Unknown").lowercased()
-                        let current = localStats[ext, default: (0, 0)]
-                        localStats[ext] = (current.size + node.size, current.count + 1)
+        scan(url: URL(fileURLWithPath: path))
+    }
+
+    private func setCurrentNode(_ node: FileNode) {
+        currentNode = node
+        selectedNode = nil
+        breadcrumb = rootNode?.path(to: node.id) ?? [node]
+        scheduleSearch()
+    }
+
+    private func startAnalysis(for root: FileNode, scanID: UUID) {
+        analysisTask?.cancel()
+        isAnalyzing = true
+
+        analysisTask = Task { [weak self] in
+            let analysis = await Task.detached(priority: .userInitiated) {
+                Self.analyze(root: root)
+            }.value
+
+            guard let self,
+                  !Task.isCancelled,
+                  self.activeScanID == scanID,
+                  self.rootNode?.id == root.id else {
+                return
+            }
+
+            self.extensionStats = analysis.extensions.map {
+                ExtensionStat(ext: $0.ext, totalSize: $0.totalSize, fileCount: $0.fileCount)
+            }
+            self.largestFiles = analysis.largestFiles
+            self.oldLargeFiles = analysis.oldLargeFiles
+            self.duplicateCandidates = analysis.duplicateCandidates
+            self.searchIndex = analysis.searchIndex
+            self.isAnalyzing = false
+            self.scheduleSearch()
+        }
+    }
+
+    private func scheduleSearch() {
+        searchTask?.cancel()
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            searchResults = []
+            return
+        }
+
+        let index = searchIndex
+        let scopePath = currentNode?.path ?? ""
+        searchTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 150_000_000)
+                try Task.checkCancellation()
+            } catch {
+                return
+            }
+
+            let normalizedQuery = query.folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: .current
+            )
+            let matches = await Task.detached(priority: .userInitiated) {
+                var results: [FileNode] = []
+                results.reserveCapacity(200)
+
+                for entry in index {
+                    if Task.isCancelled { return results }
+                    let isInScope = scopePath.isEmpty ||
+                        entry.path == scopePath ||
+                        entry.path.hasPrefix(scopePath.hasSuffix("/") ? scopePath : scopePath + "/")
+                    if isInScope &&
+                       (entry.searchableName.contains(normalizedQuery) ||
+                        entry.searchablePath.contains(normalizedQuery)) {
+                        results.append(entry.node)
+                        if results.count == 2_000 { break }
                     }
                 }
-                
-                traverse(root)
-                
-                return localStats.map { (ext, value) in
-                    ExtensionStat(
-                        ext: ext,
-                        totalSize: value.size,
-                        fileCount: value.count,
-                        color: FileTypeColors.color(forExtension: ext)
-                    )
-                }.sorted { $0.totalSize > $1.totalSize }
+                return results
             }.value
-            
-            self.extensionStats = stats
+
+            guard let self,
+                  !Task.isCancelled,
+                  self.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines) == query else {
+                return
+            }
+            self.searchResults = matches
         }
     }
-    
-    func saveSettings() {
-        UserSettings.defaultViewMode = viewMode
-        UserSettings.defaultSortOrder = sortOrder
-        UserSettings.skipDeveloperFolders = skipDeveloperFolders
-        UserSettings.sizeThreshold = sizeThreshold
-        UserSettings.showHiddenFiles = showHiddenFiles
-        UserSettings.showPackageContents = showPackageContents
-        UserSettings.followSymlinks = followSymlinks
-    }
-    
-    func restoreLastScan() {
-        if let path = UserSettings.lastScanPath {
-            let url = URL(fileURLWithPath: path)
-            if FileManager.default.fileExists(atPath: path) {
-                scan(url: url)
+
+    nonisolated private static func analyze(root: FileNode) -> ScanAnalysis {
+        var extensions: [String: ExtensionAggregate] = [:]
+        var files: [FileNode] = []
+        var searchIndex: [SearchIndexEntry] = []
+        var duplicateGroups: [String: [FileNode]] = [:]
+        let oldFileCutoff = Calendar.current.date(byAdding: .year, value: -1, to: Date()) ?? .distantPast
+
+        var stack = [root]
+        while let node = stack.popLast() {
+            searchIndex.append(SearchIndexEntry(
+                node: node,
+                path: node.path,
+                searchableName: node.displayName.folding(
+                    options: [.caseInsensitive, .diacriticInsensitive],
+                    locale: .current
+                ),
+                searchablePath: node.path.folding(
+                    options: [.caseInsensitive, .diacriticInsensitive],
+                    locale: .current
+                )
+            ))
+
+            if node.isDirectory {
+                stack.append(contentsOf: node.children)
+                continue
+            }
+
+            files.append(node)
+            let ext = (node.extension?.lowercased()).flatMap { $0.isEmpty ? nil : $0 } ?? "unknown"
+            var aggregate = extensions[ext] ?? ExtensionAggregate(ext: ext, totalSize: 0, fileCount: 0)
+            aggregate.totalSize += node.size
+            aggregate.fileCount += 1
+            extensions[ext] = aggregate
+
+            if node.logicalSize >= 10_000_000,
+               !node.isHardLinkDuplicate {
+                let key = "\(node.logicalSize)|\(node.displayName.lowercased())"
+                duplicateGroups[key, default: []].append(node)
             }
         }
+
+        let largestFiles = files.sorted { $0.size > $1.size }.prefix(100)
+        let oldLargeFiles = files
+            .filter {
+                $0.size >= 100_000_000 &&
+                ($0.modificationDate ?? .distantFuture) < oldFileCutoff
+            }
+            .sorted { $0.size > $1.size }
+            .prefix(100)
+
+        let candidates = duplicateGroups.compactMap { key, matches -> DuplicateCandidate? in
+            guard matches.count > 1, let first = matches.first else { return nil }
+            return DuplicateCandidate(
+                id: key,
+                displayName: first.displayName,
+                fileSize: first.logicalSize,
+                files: matches.sorted { $0.path < $1.path }
+            )
+        }
+        .sorted { $0.potentialSavings > $1.potentialSavings }
+        .prefix(50)
+
+        return ScanAnalysis(
+            extensions: extensions.values.sorted { $0.totalSize > $1.totalSize },
+            largestFiles: Array(largestFiles),
+            oldLargeFiles: Array(oldLargeFiles),
+            duplicateCandidates: Array(candidates),
+            searchIndex: searchIndex
+        )
     }
+}
+
+private struct ExtensionAggregate: Sendable {
+    let ext: String
+    var totalSize: Int64
+    var fileCount: Int
+}
+
+private struct SearchIndexEntry: Sendable {
+    let node: FileNode
+    let path: String
+    let searchableName: String
+    let searchablePath: String
+}
+
+private struct ScanAnalysis: Sendable {
+    let extensions: [ExtensionAggregate]
+    let largestFiles: [FileNode]
+    let oldLargeFiles: [FileNode]
+    let duplicateCandidates: [DuplicateCandidate]
+    let searchIndex: [SearchIndexEntry]
 }

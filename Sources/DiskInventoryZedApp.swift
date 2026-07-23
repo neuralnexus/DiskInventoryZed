@@ -61,7 +61,7 @@ struct AboutView: View {
             Text("Disk Inventory Zed")
                 .font(.system(size: 20, weight: .bold))
             
-            Text("Version 1.0")
+            Text("Version 1.1")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
             
@@ -319,7 +319,7 @@ struct DiskInventoryZedApp: App {
                     viewModel.navigateUp()
                 }
                 .keyboardShortcut(.upArrow, modifiers: [.command])
-                .disabled(viewModel.currentNode?.parent == nil)
+                .disabled(viewModel.breadcrumb.count <= 1)
                 
                 Divider()
                 

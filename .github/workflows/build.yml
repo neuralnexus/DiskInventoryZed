@@ -25,6 +25,12 @@ jobs:
           key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.swift') }}
           restore-keys: |
             ${{ runner.os }}-spm-
+
+      - name: Run unit tests
+        run: swift test
+
+      - name: Build debug with concurrency diagnostics
+        run: swift build -Xswiftc -warn-concurrency
       
       - name: Build universal binary
         run: |
@@ -79,9 +85,9 @@ jobs:
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleShortVersionString</key>
-              <string>1.0</string>
+              <string>1.1</string>
               <key>CFBundleVersion</key>
-              <string>1</string>
+              <string>2</string>
               <key>LSMinimumSystemVersion</key>
               <string>13.0</string>
               <key>LSApplicationCategoryType</key>

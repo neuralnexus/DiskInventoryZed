@@ -15,13 +15,20 @@ Disk Inventory Zed is a native macOS application that visualizes disk usage with
 
 - **Interactive Treemap Visualization** — Squarified treemap algorithm for optimal space usage visualization
 - **Fast Concurrent Scanning** — Uses Swift concurrency for parallel directory traversal
-- **Dual View Modes** — Switch between treemap and detailed list view
+- **Crash-Safe Scan Snapshots** — Bounded workers build an immutable tree before SwiftUI sees it
+- **Three Visualizations** — Treemap, hierarchical sunburst, and detailed list views
 - **Smart Sorting** — Sort by name or size (ascending/descending)
 - **File Actions** — Reveal in Finder, move to trash
 - **Quick Access** — Scan Home, Applications, Documents, Downloads, or any custom folder
+- **Mounted Volume Overview** — Scan internal, external, and network volumes with free-space context
 - **Breadcrumb Navigation** — Easy traversal up and down the directory tree
 - **Dark Mode** — Native support for macOS dark mode
 - **File Type Colors** — Files colored by extension type for quick visual identification
+- **Storage Intelligence** — Largest files, old large files, and conservative duplicate candidates
+- **Accurate Storage Accounting** — Shows logical and allocated sizes and avoids hard-link double counting
+- **Scan Health** — Reports unreadable paths, skipped folders, packages, symlinks, and revisited targets
+- **Global Search** — Debounced indexed search by file name or path without blocking the interface
+- **Portable Exports** — Versioned JSON and streaming CSV with reliability metadata
 
 ## Requirements
 
@@ -96,12 +103,32 @@ The DMG installer includes:
 5. Switch to list view for detailed file information
 6. Right-click any file or folder for actions (reveal in Finder, move to trash)
 
+The analysis sidebar goes beyond the classic Disk Inventory X workflow:
+
+- **Types** aggregates storage by extension.
+- **Largest** finds the largest files anywhere in the scanned tree.
+- **Review** highlights old large files and files with the same name and byte size. Duplicate
+  candidates are intentionally labeled as possibilities; verify their contents before deleting.
+- **Selection** distinguishes logical size from space allocated on disk, which matters for sparse
+  files, clones, and hard links.
+
 ## Architecture
 
 - **SwiftUI** — Modern declarative UI framework
-- **Swift Concurrency** — Async/await with concurrent task groups for fast scanning
+- **Swift Concurrency** — A bounded actor-backed work queue with cooperative cancellation
+- **Immutable Snapshots** — Background workers never mutate data already published to SwiftUI
+- **Cycle Protection** — Symlink targets and previously visited directories are not traversed twice
 - **Squarified Treemap** — Industry-standard algorithm for optimal rectangle aspect ratios
 - **MVVM Pattern** — Clean separation between views and business logic
+
+## Accuracy Notes
+
+- “On disk” uses allocated size when macOS provides it; “logical” is the apparent file length.
+- Multiple hard links to the same file are shown, but their allocated storage is counted once.
+- APFS clones can share physical blocks without exposing enough public per-file metadata to measure
+  exact exclusive ownership. Disk Inventory Zed does not claim clone-level reclaimable bytes.
+- Unreadable or intentionally skipped directories are surfaced in scan diagnostics instead of
+  silently presenting the result as complete.
 
 ## License
 

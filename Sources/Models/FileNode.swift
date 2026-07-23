@@ -1,110 +1,162 @@
 // Disk Inventory Zed — a modern, fast, native disk usage visualizer
-// https://github.com/yourusername/DiskInventoryZed
 //
 // Copyright (C) 2026 Matt Ivan
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// Licensed under GPL-3.0-or-later.
 
 import Foundation
-import SwiftUI
 
+/// An immutable snapshot of a file-system entry.
+///
+/// The scanner builds the complete graph off the main actor and only then publishes it.
+/// Every stored property is immutable, so sharing a completed snapshot across actors is safe.
+/// Keeping the node as a reference type avoids copying entire subtrees for navigation and search.
 final class FileNode: Identifiable, Hashable, @unchecked Sendable {
-    let id = UUID()
+    enum Kind: String, Codable, Sendable {
+        case file
+        case directory
+        case package
+        case symbolicLink
+    }
+
+    let id: String
     let url: URL
     let name: String
-    let isDirectory: Bool
+    let kind: Kind
+    let isPackage: Bool
+    let isSymbolicLink: Bool
     let modificationDate: Date?
     let creationDate: Date?
     let `extension`: String?
-    
-    var size: Int64 = 0
-    var children: [FileNode] = [] {
-        didSet {
-            _directoryChildren = nil
-        }
-    }
-    weak var parent: FileNode?
-    
-    private var _directoryChildren: [FileNode]? = nil
-    
+    let logicalSize: Int64
+    let allocatedSize: Int64
+    let children: [FileNode]
+    let errorDescription: String?
+    let isHardLinkDuplicate: Bool
+
+    var size: Int64 { allocatedSize }
+    var isDirectory: Bool { kind == .directory }
+    var isUnreadable: Bool { errorDescription != nil }
+    var isLeaf: Bool { children.isEmpty }
+
     var formattedSize: String {
-        ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+        ByteCountFormatter.string(fromByteCount: allocatedSize, countStyle: .file)
     }
-    
-    var isLeaf: Bool {
-        !isDirectory || children.isEmpty
+
+    var formattedLogicalSize: String {
+        ByteCountFormatter.string(fromByteCount: logicalSize, countStyle: .file)
     }
-    
+
     var directoryChildren: [FileNode]? {
-        if let cached = _directoryChildren { return cached }
-        let dirs = children.filter { $0.isDirectory }
-        let result = dirs.isEmpty ? nil : dirs
-        _directoryChildren = result
-        return result
+        let directories = children.filter(\.isDirectory)
+        return directories.isEmpty ? nil : directories
     }
-    
+
     var displayName: String {
-        if name.isEmpty { return url.path }
-        return name
+        name.isEmpty ? url.path : name
     }
-    
+
     var path: String {
         url.path
     }
-    
-    var depth: Int {
-        var count = 0
-        var node: FileNode? = parent
-        while node != nil {
-            count += 1
-            node = node?.parent
-        }
-        return count
-    }
-    
-    static func == (lhs: FileNode, rhs: FileNode) -> Bool {
-        lhs.id == rhs.id
-    }
-    
-    func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
-    }
-    
-    init(url: URL, name: String, isDirectory: Bool, modificationDate: Date? = nil, creationDate: Date? = nil, extension: String? = nil) {
+
+    init(
+        id: String? = nil,
+        url: URL,
+        name: String,
+        kind: Kind,
+        isPackage: Bool? = nil,
+        isSymbolicLink: Bool? = nil,
+        modificationDate: Date? = nil,
+        creationDate: Date? = nil,
+        extension: String? = nil,
+        logicalSize: Int64,
+        allocatedSize: Int64,
+        children: [FileNode] = [],
+        errorDescription: String? = nil,
+        isHardLinkDuplicate: Bool = false
+    ) {
+        self.id = id ?? url.standardizedFileURL.path
         self.url = url
         self.name = name
-        self.isDirectory = isDirectory
+        self.kind = kind
+        self.isPackage = isPackage ?? kind == .package
+        self.isSymbolicLink = isSymbolicLink ?? kind == .symbolicLink
         self.modificationDate = modificationDate
         self.creationDate = creationDate
         self.extension = `extension`
+        self.logicalSize = max(0, logicalSize)
+        self.allocatedSize = max(0, allocatedSize)
+        self.children = children
+        self.errorDescription = errorDescription
+        self.isHardLinkDuplicate = isHardLinkDuplicate
     }
-    
-    func root() -> FileNode {
-        var node = self
-        while let parent = node.parent {
-            node = parent
-        }
-        return node
+
+    static func == (lhs: FileNode, rhs: FileNode) -> Bool {
+        lhs.id == rhs.id
     }
-    
-    func findChild(at url: URL) -> FileNode? {
-        if self.url == url { return self }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+
+    func findChild(withID targetID: String) -> FileNode? {
+        if id == targetID { return self }
         for child in children {
-            if let found = child.findChild(at: url) {
-                return found
+            if let match = child.findChild(withID: targetID) {
+                return match
             }
         }
         return nil
+    }
+
+    func findChild(at targetURL: URL) -> FileNode? {
+        findChild(withID: targetURL.standardizedFileURL.path)
+    }
+
+    func path(to targetID: String) -> [FileNode]? {
+        if id == targetID { return [self] }
+        for child in children {
+            if let childPath = child.path(to: targetID) {
+                return [self] + childPath
+            }
+        }
+        return nil
+    }
+
+    /// Returns a new immutable tree with the requested item removed.
+    /// Only ancestors of the removed item are rebuilt.
+    func removingDescendant(withID targetID: String) -> FileNode {
+        let updatedChildren = children.compactMap { child -> FileNode? in
+            if child.id == targetID { return nil }
+            if child.children.isEmpty { return child }
+            return child.removingDescendant(withID: targetID)
+        }
+
+        guard updatedChildren.count != children.count ||
+              zip(updatedChildren, children).contains(where: { pair in
+                  pair.0.id != pair.1.id || pair.0 !== pair.1
+              }) else {
+            return self
+        }
+
+        let newLogicalSize = updatedChildren.reduce(Int64(0)) { $0 + $1.logicalSize }
+        let newAllocatedSize = updatedChildren.reduce(Int64(0)) { $0 + $1.allocatedSize }
+
+        return FileNode(
+            id: id,
+            url: url,
+            name: name,
+            kind: kind,
+            isPackage: isPackage,
+            isSymbolicLink: isSymbolicLink,
+            modificationDate: modificationDate,
+            creationDate: creationDate,
+            extension: `extension`,
+            logicalSize: isDirectory ? newLogicalSize : logicalSize,
+            allocatedSize: isDirectory ? newAllocatedSize : allocatedSize,
+            children: updatedChildren,
+            errorDescription: errorDescription,
+            isHardLinkDuplicate: isHardLinkDuplicate
+        )
     }
 }
