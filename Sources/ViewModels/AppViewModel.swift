@@ -393,26 +393,8 @@ final class AppViewModel: ObservableObject {
     }
 
     func moveToTrash(node: FileNode) {
-        guard let rootNode else { return }
-        guard node.id != rootNode.id else {
-            presentError("The root of the current scan cannot be moved to Trash.")
-            return
-        }
-
-        let protectedPaths: Set<String> = [
-            "/",
-            "/Applications",
-            "/Library",
-            "/System",
-            "/Users",
-            FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
-        ]
-        guard !protectedPaths.contains(node.url.standardizedFileURL.path) else {
-            presentError("Disk Inventory Zed will not move this protected location to Trash.")
-            return
-        }
-        guard FileManager.default.fileExists(atPath: node.path) else {
-            presentError("The item no longer exists. Rescan the location to refresh the view.")
+        if let safetyError = cleanupSafetyError(for: node) {
+            presentError(safetyError)
             return
         }
 
@@ -426,6 +408,10 @@ final class AppViewModel: ObservableObject {
     func confirmMoveToTrash() {
         guard let node = pendingTrashNode else { return }
         pendingTrashNode = nil
+        if let safetyError = cleanupSafetyError(for: node) {
+            presentError(safetyError)
+            return
+        }
 
         do {
             try FileManager.default.trashItem(at: node.url, resultingItemURL: nil)
@@ -737,6 +723,51 @@ final class AppViewModel: ObservableObject {
     private func presentError(_ message: String) {
         errorMessage = message
         showError = true
+    }
+
+    private func cleanupSafetyError(for node: FileNode) -> String? {
+        guard let rootNode else { return "There is no active scan." }
+        guard node.id != rootNode.id else {
+            return "The root of the current scan cannot be moved to Trash."
+        }
+
+        let path = node.url.standardizedFileURL.path
+        let protectedPaths: Set<String> = [
+            "/",
+            "/Applications",
+            "/Library",
+            "/System",
+            "/Users",
+            "/bin",
+            "/cores",
+            "/dev",
+            "/etc",
+            "/private",
+            "/sbin",
+            "/tmp",
+            "/usr",
+            "/var",
+            FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+        ]
+        let protectedPrefixes = [
+            "/System/",
+            "/bin/",
+            "/cores/",
+            "/dev/",
+            "/etc/",
+            "/private/",
+            "/sbin/",
+            "/usr/",
+            "/var/"
+        ]
+        if protectedPaths.contains(path) ||
+           protectedPrefixes.contains(where: { path.hasPrefix($0) }) {
+            return "Disk Inventory Zed will not move this protected system location to Trash."
+        }
+        guard FileManager.default.fileExists(atPath: path) else {
+            return "The item no longer exists. Rescan the location to refresh the view."
+        }
+        return nil
     }
 }
 
