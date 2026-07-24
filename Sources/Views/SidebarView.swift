@@ -35,7 +35,7 @@ struct SidebarView: View {
                 Toggle(isOn: $viewModel.skipDeveloperFolders) {
                     Label("Skip Dev Folders", systemImage: "folder.badge.minus")
                 }
-                .help("Skip heavy developer folders like node_modules, .git, and deriveddata to make scans 10x faster.")
+                .help("Optionally skip node_modules, source-control metadata, build output, and DerivedData.")
                 
                 Toggle(isOn: $viewModel.showHiddenFiles) {
                     Label("Show Hidden Files", systemImage: "eye")
@@ -62,8 +62,8 @@ struct SidebarView: View {
             }
             
             Section("Volumes") {
-                ForEach(mountedVolumes, id: \.path) { volume in
-                    QuickAccessItem(title: volume.name, path: volume.url, icon: "externaldrive")
+                ForEach(mountedVolumes) { volume in
+                    VolumeAccessItem(volume: volume)
                 }
             }
         }
@@ -82,14 +82,65 @@ struct SidebarView: View {
         )
     }
     
-    private var mountedVolumes: [(name: String, path: String, url: URL)] {
-        let keys: [URLResourceKey] = [.volumeNameKey, .volumeIsLocalKey]
+    private var mountedVolumes: [MountedVolume] {
+        let keys: [URLResourceKey] = [
+            .volumeNameKey,
+            .volumeIsLocalKey,
+            .volumeTotalCapacityKey,
+            .volumeAvailableCapacityKey,
+            .volumeAvailableCapacityForImportantUsageKey
+        ]
         let urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: keys, options: [.skipHiddenVolumes]) ?? []
         return urls.compactMap { url in
-            guard let values = try? url.resourceValues(forKeys: [.volumeNameKey]),
+            guard let values = try? url.resourceValues(forKeys: Set(keys)),
                   let name = values.volumeName else { return nil }
-            return (name: name, path: url.path, url: url)
+            let totalCapacity = Int64(values.volumeTotalCapacity ?? 0)
+            let availableCapacity = values.volumeAvailableCapacityForImportantUsage ??
+                Int64(values.volumeAvailableCapacity ?? 0)
+            return MountedVolume(
+                url: url,
+                name: name,
+                isLocal: values.volumeIsLocal ?? true,
+                totalCapacity: totalCapacity,
+                availableCapacity: availableCapacity
+            )
         }
+    }
+}
+
+private struct MountedVolume: Identifiable {
+    var id: String { url.path }
+    let url: URL
+    let name: String
+    let isLocal: Bool
+    let totalCapacity: Int64
+    let availableCapacity: Int64
+}
+
+private struct VolumeAccessItem: View {
+    @EnvironmentObject var viewModel: AppViewModel
+    let volume: MountedVolume
+
+    var body: some View {
+        Button {
+            viewModel.scan(url: volume.url)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: volume.isLocal ? "internaldrive" : "externaldrive.connected.to.line.below")
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(volume.name)
+                        .lineLimit(1)
+                    if volume.totalCapacity > 0 {
+                        Text("\(ByteFormatter.string(from: volume.availableCapacity)) free of \(ByteFormatter.string(from: volume.totalCapacity))")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .help("Scan \(volume.url.path)")
     }
 }
 
@@ -129,6 +180,10 @@ struct SidebarRow: View {
             
             Button("Open Containing Folder") {
                 viewModel.openContainingFolder(node: node)
+            }
+
+            Button("Move to Trash") {
+                viewModel.moveToTrash(node: node)
             }
             
             Divider()

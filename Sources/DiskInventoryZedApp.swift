@@ -61,7 +61,7 @@ struct AboutView: View {
             Text("Disk Inventory Zed")
                 .font(.system(size: 20, weight: .bold))
             
-            Text("Version 1.0")
+            Text("Version 1.2")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
             
@@ -160,7 +160,7 @@ struct HelpView: View {
                         HelpItem(title: "Reveal in Finder", description: "Opens Finder and selects the file.")
                         HelpItem(title: "Open Containing Folder", description: "Opens the parent folder in Finder.")
                         HelpItem(title: "Move to Trash", description: "Moves the selected file to trash and refreshes the view.")
-                        HelpItem(title: "Quick Look", description: "Press the Preview button in the toolbar or select a file and press Space to preview.")
+                        HelpItem(title: "Quick Look", description: "Select an item and use the Preview button in the toolbar.")
                         HelpItem(title: "Drag and Drop", description: "Drag files from the treemap, sunburst, or list directly to Finder or other apps.")
                     }
                 }
@@ -188,7 +188,9 @@ struct HelpView: View {
                 // Export
                 HelpSection(title: "Export", icon: "square.and.arrow.up") {
                     VStack(alignment: .leading, spacing: 8) {
-                        HelpItem(title: "Export JSON", description: "Export the entire scan tree to a JSON file for further analysis or backup.")
+                        HelpItem(title: "Snapshot JSON", description: "Save a reconstructable, versioned snapshot with allocated and logical sizes plus scan diagnostics.")
+                        HelpItem(title: "Compare Snapshots", description: "Scan the same location later and compare it with an earlier snapshot to find growth, removals, and resized files.")
+                        HelpItem(title: "CSV", description: "Export a streaming flat-file inventory for analysis in spreadsheets, databases, or scripts.")
                     }
                 }
                 
@@ -285,12 +287,20 @@ struct DiskInventoryZedApp: App {
         }
         .commands {
             CommandMenu("View") {
-                Picker("View Mode", selection: $viewModel.viewMode) {
-                    ForEach(AppViewModel.ViewMode.allCases, id: \.self) { mode in
-                        Label(mode.rawValue, systemImage: mode.icon)
-                    }
+                Button("Treemap") {
+                    viewModel.viewMode = .treemap
                 }
-                .pickerStyle(.inline)
+                .keyboardShortcut("1", modifiers: .command)
+
+                Button("List") {
+                    viewModel.viewMode = .list
+                }
+                .keyboardShortcut("2", modifiers: .command)
+
+                Button("Sunburst") {
+                    viewModel.viewMode = .sunburst
+                }
+                .keyboardShortcut("3", modifiers: .command)
                 
                 Divider()
                 
@@ -319,7 +329,7 @@ struct DiskInventoryZedApp: App {
                     viewModel.navigateUp()
                 }
                 .keyboardShortcut(.upArrow, modifiers: [.command])
-                .disabled(viewModel.currentNode?.parent == nil)
+                .disabled(viewModel.breadcrumb.count <= 1)
                 
                 Divider()
                 

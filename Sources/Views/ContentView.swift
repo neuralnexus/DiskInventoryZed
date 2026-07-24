@@ -18,19 +18,49 @@
 
 import SwiftUI
 import QuickLook
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject var viewModel: AppViewModel
     @State private var showFilePicker = false
     @State private var quickLookURL: URL?
-    
-    private func showSavePanel() {
+
+    private enum ExportFormat {
+        case json
+        case csv
+    }
+
+    private func showSavePanel(format: ExportFormat) {
         let savePanel = NSSavePanel()
-        savePanel.allowedContentTypes = [.json]
-        savePanel.nameFieldStringValue = "DiskInventoryScan.json"
+        switch format {
+        case .json:
+            savePanel.allowedContentTypes = [.json]
+            savePanel.nameFieldStringValue = "DiskInventoryScan.json"
+        case .csv:
+            savePanel.allowedContentTypes = [.commaSeparatedText]
+            savePanel.nameFieldStringValue = "DiskInventoryScan.csv"
+        }
         savePanel.begin { response in
             if response == .OK, let url = savePanel.url {
-                viewModel.exportScanData(to: url)
+                switch format {
+                case .json:
+                    viewModel.exportScanData(to: url)
+                case .csv:
+                    viewModel.exportCSV(to: url)
+                }
+            }
+        }
+    }
+
+    private func showSnapshotComparisonPanel() {
+        let openPanel = NSOpenPanel()
+        openPanel.allowedContentTypes = [.json]
+        openPanel.allowsMultipleSelection = false
+        openPanel.canChooseDirectories = false
+        openPanel.message = "Choose a Disk Inventory Zed JSON snapshot from an earlier scan."
+        openPanel.begin { response in
+            if response == .OK, let url = openPanel.url {
+                viewModel.compareWithSnapshot(at: url)
             }
         }
     }
@@ -68,7 +98,7 @@ struct ContentView: View {
                 if viewModel.rootNode != nil && !viewModel.isScanning {
                     Divider()
                     RightSidebarView()
-                        .frame(width: 320)
+                        .frame(width: 360)
                         .background(.ultraThinMaterial)
                 }
             }
@@ -79,12 +109,30 @@ struct ContentView: View {
             ToolbarItem(placement: .primaryAction) {
                 HStack(spacing: 8) {
                     if viewModel.rootNode != nil && !viewModel.isScanning {
-                        Button(action: {
-                            showSavePanel()
-                        }) {
-                            Label("Export JSON", systemImage: "square.and.arrow.up")
+                        Menu {
+                            Button("Export Snapshot (JSON)…") {
+                                showSavePanel(format: .json)
+                            }
+                            Button("Export CSV…") {
+                                showSavePanel(format: .csv)
+                            }
+
+                            Divider()
+
+                            Button("Compare with Snapshot…") {
+                                showSnapshotComparisonPanel()
+                            }
+                        } label: {
+                            Label("Export", systemImage: "square.and.arrow.up")
                         }
-                        .help("Export scan results to a JSON file")
+                        .help("Export scan data or compare it with an earlier snapshot")
+
+                        Button {
+                            viewModel.rescan()
+                        } label: {
+                            Label("Rescan", systemImage: "arrow.clockwise")
+                        }
+                        .help("Scan this location again")
                     }
                     
                     Button(action: {
@@ -122,7 +170,7 @@ struct ContentView: View {
                 Button(action: { viewModel.navigateUp() }) {
                     Label("Up", systemImage: "arrow.up")
                 }
-                .disabled(viewModel.currentNode?.parent == nil)
+                .disabled(viewModel.breadcrumb.count <= 1)
                 .help("Go to parent folder (⌘↑)")
                 
                 Button(action: { viewModel.navigateToRoot() }) {
@@ -152,6 +200,25 @@ struct ContentView: View {
         } message: {
             Text(viewModel.errorMessage ?? "Unknown error")
         }
+        .alert(
+            "Move Item to Trash?",
+            isPresented: Binding(
+                get: { viewModel.pendingTrashNode != nil },
+                set: { isPresented in
+                    if !isPresented { viewModel.cancelMoveToTrash() }
+                }
+            ),
+            presenting: viewModel.pendingTrashNode
+        ) { _ in
+            Button("Move to Trash", role: .destructive) {
+                viewModel.confirmMoveToTrash()
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.cancelMoveToTrash()
+            }
+        } message: { node in
+            Text("“\(node.displayName)” uses \(node.formattedSize) on disk. This moves it to the macOS Trash; it is not permanently erased.")
+        }
     }
 }
 
@@ -160,24 +227,37 @@ struct ToolbarView: View {
     
     var body: some View {
         HStack(spacing: 12) {
-            HStack(spacing: 4) {
-                ForEach(viewModel.breadcrumb) { node in
-                    if node.id != viewModel.breadcrumb.first?.id {
-                        Image(systemName: "chevron.right")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(viewModel.breadcrumb) { node in
+                        if node.id != viewModel.breadcrumb.first?.id {
+                            Image(systemName: "chevron.right")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Button(node.displayName) {
+                            viewModel.navigateTo(node: node)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(node.id == viewModel.currentNode?.id ? .primary : .secondary)
+                        .font(.system(size: 12, weight: node.id == viewModel.currentNode?.id ? .semibold : .regular))
                     }
-                    
-                    Button(node.displayName) {
-                        viewModel.navigateTo(node: node)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(node.id == viewModel.currentNode?.id ? .primary : .secondary)
-                    .font(.system(size: 12, weight: node.id == viewModel.currentNode?.id ? .semibold : .regular))
                 }
             }
+            .frame(minWidth: 120)
             
             Spacer()
+
+            if !viewModel.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Picker("Search Scope", selection: $viewModel.searchScope) {
+                    ForEach(AppViewModel.SearchScope.allCases, id: \.self) { scope in
+                        Text(scope.rawValue)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(width: 125)
+            }
             
             Picker("View", selection: $viewModel.viewMode) {
                 ForEach(AppViewModel.ViewMode.allCases, id: \.self) { mode in
@@ -224,9 +304,24 @@ struct ScanningView: View {
                 .fontWeight(.semibold)
             
             VStack(spacing: 4) {
-                Text("\(viewModel.totalFiles) files, \(viewModel.totalDirectories) directories")
+                Text("\(viewModel.scanProgressFiles) files, \(viewModel.scanProgressDirectories) directories")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+
+                if viewModel.scanProgressUnreadableItems > 0 {
+                    Text("\(viewModel.scanProgressUnreadableItems) items could not be read")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.orange)
+                }
+
+                if !viewModel.scanStatusPath.isEmpty {
+                    Text(viewModel.scanStatusPath)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: 520)
+                }
             }
             
             Button("Cancel") {
@@ -271,6 +366,18 @@ struct EmptyStateView: View {
                 QuickScanButton(title: "Documents", path: FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first, icon: "doc.text")
             }
             .padding(.top, 16)
+
+            if let lastPath = UserSettings.lastScanPath,
+               FileManager.default.fileExists(atPath: lastPath) {
+                Button {
+                    viewModel.restoreLastScan()
+                } label: {
+                    Label("Rescan Last Location", systemImage: "clock.arrow.circlepath")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .padding(.top, 6)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.background)
@@ -345,6 +452,19 @@ struct StatusBarView: View {
                     
                     Text(String(format: "%.2fs", viewModel.scanDuration))
                         .font(.system(size: 10))
+                }
+
+                if viewModel.scanDiagnostics.unreadableItems > 0 && isExpanded {
+                    Text("·")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+
+                    Label(
+                        "\(viewModel.scanDiagnostics.unreadableItems) unreadable",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
                 }
             }
             

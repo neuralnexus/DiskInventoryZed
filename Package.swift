@@ -12,6 +12,11 @@ let package = Package(
             name: "DiskInventoryZed",
             path: "Sources",
             exclude: []
+        ),
+        .testTarget(
+            name: "DiskInventoryZedTests",
+            dependencies: ["DiskInventoryZed"],
+            path: "Tests"
         )
     ]
 )

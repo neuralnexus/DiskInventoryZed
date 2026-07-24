@@ -107,10 +107,8 @@ struct FileListRow: View {
                 viewModel.openContainingFolder(node: node)
             }
             
-            if !node.isDirectory {
-                Button("Move to Trash") {
-                    viewModel.moveToTrash(node: node)
-                }
+            Button("Move to Trash") {
+                viewModel.moveToTrash(node: node)
             }
             
             Divider()

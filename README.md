@@ -15,18 +15,28 @@ Disk Inventory Zed is a native macOS application that visualizes disk usage with
 
 - **Interactive Treemap Visualization** — Squarified treemap algorithm for optimal space usage visualization
 - **Fast Concurrent Scanning** — Uses Swift concurrency for parallel directory traversal
-- **Dual View Modes** — Switch between treemap and detailed list view
+- **Crash-Safe Scan Snapshots** — Bounded workers build an immutable tree before SwiftUI sees it
+- **Three Visualizations** — Treemap, hierarchical sunburst, and detailed list views
 - **Smart Sorting** — Sort by name or size (ascending/descending)
-- **File Actions** — Reveal in Finder, move to trash
+- **Safe Cleanup** — Reveal in Finder or move confirmed files and folders to macOS Trash; protected scan roots are blocked
 - **Quick Access** — Scan Home, Applications, Documents, Downloads, or any custom folder
+- **Mounted Volume Overview** — Scan internal, external, and network volumes with free-space context
 - **Breadcrumb Navigation** — Easy traversal up and down the directory tree
 - **Dark Mode** — Native support for macOS dark mode
 - **File Type Colors** — Files colored by extension type for quick visual identification
+- **Storage Intelligence** — Largest files, old large files, and same-size duplicate discovery
+- **Verified Duplicates** — Cancellable sample-first and full-file SHA-256 verification, including copies with different names
+- **Scan Comparison** — Compare a current scan with a versioned snapshot to find additions, removals, growth, and reclaimed space
+- **Accurate Storage Accounting** — Shows logical and allocated sizes and avoids hard-link double counting
+- **Scan Health** — Reports unreadable paths, skipped folders, packages, symlinks, and revisited targets
+- **Global Search** — Debounced indexed search by file name or path without blocking the interface
+- **Portable Exports** — Versioned JSON and streaming CSV with reliability metadata
+- **Deep-Tree Safety** — Iterative tree building, navigation, and cleanup updates avoid recursion overflow
 
 ## Requirements
 
 - macOS 13.0 (Ventura) or later
-- Intel or Apple Silicon (M1/M2/M3/M4 or later)
+- Intel or Apple Silicon
 - Xcode 15.0+ (for building from source)
 
 ## Building
@@ -53,7 +63,9 @@ This will create `DiskInventoryZed.app` in the current directory, built as a uni
 
 ## First Launch
 
-Since Disk Inventory Zed is not distributed through the Mac App Store or notarized by Apple, macOS Gatekeeper may show a security warning when you first try to open it:
+Developer builds are ad-hoc signed, so macOS Gatekeeper may show a security warning when you first
+try to open one. Tagged releases can be Developer ID signed and notarized when the repository's
+Apple signing credentials are configured:
 
 > **"Apple could not verify 'DiskInventoryZed' is free of malware that may harm your Mac or compromise your privacy."**
 
@@ -96,12 +108,37 @@ The DMG installer includes:
 5. Switch to list view for detailed file information
 6. Right-click any file or folder for actions (reveal in Finder, move to trash)
 
+The analysis sidebar goes beyond the classic Disk Inventory X workflow:
+
+- **Types** aggregates storage by extension.
+- **Largest** finds the largest files anywhere in the scanned tree.
+- **Review** highlights old large files and files with the same byte size. Duplicate
+  candidates are intentionally labeled as possibilities until the app verifies their full SHA-256
+  content digests. Matching names are not required.
+- **Changes** compares a current scan with an earlier snapshot of the same location and separates
+  growth, reductions, additions, and removals.
+- **Selection** distinguishes logical size from space allocated on disk, which matters for sparse
+  files, clones, and hard links.
+
 ## Architecture
 
 - **SwiftUI** — Modern declarative UI framework
-- **Swift Concurrency** — Async/await with concurrent task groups for fast scanning
+- **Swift Concurrency** — A bounded actor-backed work queue with cooperative cancellation
+- **Immutable Snapshots** — Background workers never mutate data already published to SwiftUI
+- **Iterative Tree Operations** — Deep paths do not consume one call-stack frame per directory
+- **Cycle Protection** — Symlink targets and previously visited directories are not traversed twice
+- **Two-Stage Duplicate Verification** — First/last-byte samples minimize I/O before full SHA-256 hashing
 - **Squarified Treemap** — Industry-standard algorithm for optimal rectangle aspect ratios
 - **MVVM Pattern** — Clean separation between views and business logic
+
+## Accuracy Notes
+
+- “On disk” uses allocated size when macOS provides it; “logical” is the apparent file length.
+- Multiple hard links to the same file are shown, but their allocated storage is counted once.
+- APFS clones can share physical blocks without exposing enough public per-file metadata to measure
+  exact exclusive ownership. Disk Inventory Zed does not claim clone-level reclaimable bytes.
+- Unreadable or intentionally skipped directories are surfaced in scan diagnostics instead of
+  silently presenting the result as complete.
 
 ## License
 

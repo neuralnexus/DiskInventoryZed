@@ -35,7 +35,7 @@ struct TreemapView: View {
                     rect: CGRect(origin: .zero, size: geometry.size)
                 )
                 
-                let clickedRect = rects.first(where: { $0.rect.contains(lastHoverPosition) })
+                let clickedRect = rects.last(where: { $0.rect.contains(lastHoverPosition) })
                 
                 Canvas { context, size in
                     for treemapRect in rects {
@@ -45,21 +45,38 @@ struct TreemapView: View {
                         var opacity: Double = 1.0
                         if let selectedExt = viewModel.selectedExtension {
                             let ext = treemapRect.node.extension?.lowercased() ?? ""
-                            if ext != selectedExt.lowercased() {
-                                opacity = 0.15
+                            if treemapRect.node.isDirectory {
+                                opacity = 0.45
+                            } else if ext != selectedExt.lowercased() {
+                                opacity = 0.12
                             }
                         } else if !viewModel.searchQuery.isEmpty {
-                            if !treemapRect.node.displayName.localizedCaseInsensitiveContains(viewModel.searchQuery) {
-                                opacity = 0.15
+                            let matches = treemapRect.node.displayName.localizedCaseInsensitiveContains(viewModel.searchQuery) ||
+                                treemapRect.node.path.localizedCaseInsensitiveContains(viewModel.searchQuery)
+                            if treemapRect.node.isDirectory {
+                                opacity = 0.45
+                            } else if !matches {
+                                opacity = 0.12
                             }
                         }
                         
                         var localContext = context
                         localContext.opacity = opacity
-                        localContext.fill(path, with: .color(treemapRect.color))
+                        localContext.fill(
+                            path,
+                            with: .color(
+                                treemapRect.node.isDirectory
+                                    ? treemapRect.color.opacity(0.72)
+                                    : treemapRect.color
+                            )
+                        )
                         
                         let strokePath = Path(treemapRect.rect.insetBy(dx: 0.5, dy: 0.5))
-                        localContext.stroke(strokePath, with: .color(.white.opacity(0.3)), lineWidth: 1)
+                        localContext.stroke(
+                            strokePath,
+                            with: .color(.white.opacity(treemapRect.node.isDirectory ? 0.55 : 0.25)),
+                            lineWidth: treemapRect.node.isDirectory ? 1.25 : 0.5
+                        )
                         
                         // If the rect is large enough, draw the name of the file/folder
                         if treemapRect.rect.width > 70 && treemapRect.rect.height > 25 {
@@ -71,7 +88,7 @@ struct TreemapView: View {
                     }
                 }
                 .onTapGesture { location in
-                    if let rect = rects.first(where: { $0.rect.contains(location) }) {
+                    if let rect = rects.last(where: { $0.rect.contains(location) }) {
                         viewModel.navigateTo(node: rect.node)
                     }
                 }
@@ -89,7 +106,7 @@ struct TreemapView: View {
                                 switch phase {
                                 case .active(let location):
                                     lastHoverPosition = location
-                                    if let rect = rects.first(where: { $0.rect.contains(location) }) {
+                                    if let rect = rects.last(where: { $0.rect.contains(location) }) {
                                         hoveredRect = rect
                                         tooltipPosition = location
                                     } else {
@@ -119,10 +136,8 @@ struct TreemapView: View {
                                         viewModel.openContainingFolder(node: hovered.node)
                                     }
                                     
-                                    if !hovered.node.isDirectory {
-                                        Button("Move to Trash") {
-                                            viewModel.moveToTrash(node: hovered.node)
-                                        }
+                                    Button("Move to Trash") {
+                                        viewModel.moveToTrash(node: hovered.node)
                                     }
                                 } else {
                                     Text("No item under mouse pointer")
@@ -141,142 +156,171 @@ struct TreemapView: View {
     }
     
     private func calculateTreemap(node: FileNode, rect: CGRect) -> [TreemapRect] {
-        let children = viewModel.filteredChildren
-        guard !children.isEmpty else { return [] }
-        
-        let totalSize = children.reduce(0) { $0 + $1.size }
-        guard totalSize > 0 else { return [] }
-        
-        var rects: [TreemapRect] = []
-        var remaining = rect
-        var remainingChildren = children
-        var remainingSize = totalSize
-        
-        while !remainingChildren.isEmpty && remainingSize > 0 {
-            let row = buildRow(
-                children: remainingChildren,
-                remainingSize: remainingSize,
-                rect: remaining
-            )
-            
-            let rowSize = row.reduce(0) { $0 + $1.size }
-            let rowRects = layoutRow(
-                row: row,
-                rowSize: rowSize,
-                totalSize: remainingSize,
-                rect: remaining
-            )
-            
-            rects.append(contentsOf: rowRects)
-            
-            remainingChildren.removeFirst(row.count)
-            remainingSize -= rowSize
-            
-            if rowRects.first?.rect.width ?? 0 > rowRects.first?.rect.height ?? 0 {
-                let usedHeight = rowRects.map { $0.rect.height }.max() ?? 0
-                remaining.origin.y += usedHeight
-                remaining.size.height -= usedHeight
-            } else {
-                let usedWidth = rowRects.map { $0.rect.width }.max() ?? 0
-                remaining.origin.x += usedWidth
-                remaining.size.width -= usedWidth
+        guard rect.width > 1, rect.height > 1 else { return [] }
+
+        let maximumRectangles = 60_000
+        let minimumExpandableArea: CGFloat = 120
+        let maximumDepth = 64
+        var result: [TreemapRect] = []
+        result.reserveCapacity(min(4_096, maximumRectangles))
+
+        func appendChildren(of parent: FileNode, in parentRect: CGRect, depth: Int) {
+            guard depth < maximumDepth,
+                  result.count < maximumRectangles else {
+                return
+            }
+
+            let availableRectangles = maximumRectangles - result.count
+            guard availableRectangles > 0 else { return }
+
+            var children: [FileNode] = []
+            children.reserveCapacity(min(parent.children.count, availableRectangles))
+            var eligibleTotalSize: Int64 = 0
+            for child in parent.children where
+                child.size > 0 &&
+                (viewModel.sizeThreshold == 0 || child.size >= viewModel.sizeThreshold) {
+                let (sum, overflow) = eligibleTotalSize.addingReportingOverflow(child.size)
+                eligibleTotalSize = overflow ? Int64.max : sum
+                if children.count < availableRectangles {
+                    children.append(child)
+                }
+            }
+            guard !children.isEmpty else {
+                return
+            }
+
+            for layout in squarify(
+                children: children,
+                in: parentRect,
+                totalSize: eligibleTotalSize
+            ) {
+                guard layout.rect.width >= 0.5,
+                      layout.rect.height >= 0.5 else {
+                    continue
+                }
+
+                result.append(TreemapRect(
+                    node: layout.node,
+                    rect: layout.rect,
+                    color: FileTypeColors.color(for: layout.node),
+                    depth: depth
+                ))
+
+                guard layout.node.isDirectory,
+                      !layout.node.children.isEmpty,
+                      layout.rect.width * layout.rect.height >= minimumExpandableArea,
+                      result.count < maximumRectangles else {
+                    continue
+                }
+
+                let inset: CGFloat = min(4, max(1.5, min(layout.rect.width, layout.rect.height) * 0.025))
+                var childRect = layout.rect.insetBy(dx: inset, dy: inset)
+                if layout.rect.height > 26 {
+                    childRect.origin.y += 12
+                    childRect.size.height -= 12
+                }
+                guard childRect.width > 2, childRect.height > 2 else { continue }
+                appendChildren(of: layout.node, in: childRect, depth: depth + 1)
             }
         }
-        
-        return rects
+
+        appendChildren(of: node, in: rect, depth: 0)
+        return result
     }
-    
-    private func buildRow(children: [FileNode], remainingSize: Int64, rect: CGRect) -> [FileNode] {
-        guard !children.isEmpty else { return [] }
-        
-        var row: [FileNode] = [children[0]]
-        var rowSize = children[0].size
-        
-        let shortSide = min(rect.width, rect.height)
-        
-        for i in 1..<children.count {
-            let newRow = row + [children[i]]
-            let newRowSize = rowSize + children[i].size
-            
-            let currentRatio = worstRatio(row: row, rowSize: rowSize, shortSide: shortSide)
-            let newRatio = worstRatio(row: newRow, rowSize: newRowSize, shortSide: shortSide)
-            
-            if newRatio <= currentRatio {
-                row = newRow
-                rowSize = newRowSize
-            } else {
-                break
+
+    private func squarify(
+        children: [FileNode],
+        in rect: CGRect,
+        totalSize: Int64
+    ) -> [NodeLayout] {
+        let sorted = children.filter { $0.size > 0 }.sorted { $0.size > $1.size }
+        guard totalSize > 0, rect.width > 0, rect.height > 0 else { return [] }
+
+        let scale = (rect.width * rect.height) / CGFloat(totalSize)
+        let items = sorted.map { WeightedNode(node: $0, area: CGFloat($0.size) * scale) }
+        var itemIndex = 0
+        var remainingRect = rect
+        var layouts: [NodeLayout] = []
+
+        while itemIndex < items.count && remainingRect.width > 0 && remainingRect.height > 0 {
+            var row: [WeightedNode] = []
+            let shortSide = min(remainingRect.width, remainingRect.height)
+            var rowMetrics = SquarifyRowMetrics()
+
+            while itemIndex < items.count {
+                let next = items[itemIndex]
+                let candidateMetrics = rowMetrics.adding(next.area)
+                if row.isEmpty ||
+                   candidateMetrics.worstRatio(shortSide: shortSide) <=
+                    rowMetrics.worstRatio(shortSide: shortSide) {
+                    row.append(next)
+                    rowMetrics = candidateMetrics
+                    itemIndex += 1
+                } else {
+                    break
+                }
             }
+
+            let laidOut = layout(row: row, in: remainingRect)
+            layouts.append(contentsOf: laidOut.layouts)
+            remainingRect = laidOut.remainder
         }
-        
-        return row
+
+        return layouts
     }
-    
-    private func worstRatio(row: [FileNode], rowSize: Int64, shortSide: CGFloat) -> CGFloat {
-        guard rowSize > 0 && shortSide > 0 else { return .infinity }
-        
-        let rowArea = CGFloat(rowSize)
-        let sideSquared = shortSide * shortSide
-        let rowSquared = rowArea * rowArea
-        
-        var maxRatio: CGFloat = 0
-        
-        for node in row {
-            let nodeArea = CGFloat(node.size)
-            let ratio = max(
-                sideSquared * nodeArea / rowSquared,
-                rowSquared / (sideSquared * nodeArea)
-            )
-            maxRatio = max(maxRatio, ratio)
-        }
-        
-        return maxRatio
-    }
-    
-    private func layoutRow(row: [FileNode], rowSize: Int64, totalSize: Int64, rect: CGRect) -> [TreemapRect] {
-        guard rowSize > 0 && totalSize > 0 else { return [] }
-        
-        let isHorizontal = rect.width > rect.height
-        let rowLength = isHorizontal ? rect.width : rect.height
-        let rowDepth = isHorizontal ? rect.height : rect.width
-        
-        let scale = CGFloat(rowSize) / CGFloat(totalSize)
-        let actualRowDepth = rowDepth * scale
-        
-        var currentPos: CGFloat = 0
-        var rects: [TreemapRect] = []
-        
-        for node in row {
-            let nodeScale = CGFloat(node.size) / CGFloat(rowSize)
-            let nodeLength = rowLength * nodeScale
-            
-            let nodeRect: CGRect
-            if isHorizontal {
-                nodeRect = CGRect(
-                    x: rect.origin.x + currentPos,
-                    y: rect.origin.y,
-                    width: nodeLength,
-                    height: actualRowDepth
+
+    private func layout(row: [WeightedNode], in rect: CGRect) -> (layouts: [NodeLayout], remainder: CGRect) {
+        guard !row.isEmpty else { return ([], rect) }
+        let rowArea = row.reduce(CGFloat(0)) { $0 + $1.area }
+        var layouts: [NodeLayout] = []
+
+        if rect.width >= rect.height {
+            let columnWidth = min(rect.width, rowArea / rect.height)
+            guard columnWidth > 0 else { return ([], rect) }
+            var y = rect.minY
+            for (index, item) in row.enumerated() {
+                let height = index == row.count - 1
+                    ? max(0, rect.maxY - y)
+                    : item.area / columnWidth
+                layouts.append(NodeLayout(
+                    node: item.node,
+                    rect: CGRect(x: rect.minX, y: y, width: columnWidth, height: height)
+                ))
+                y += height
+            }
+            return (
+                layouts,
+                CGRect(
+                    x: rect.minX + columnWidth,
+                    y: rect.minY,
+                    width: max(0, rect.width - columnWidth),
+                    height: rect.height
                 )
-            } else {
-                nodeRect = CGRect(
-                    x: rect.origin.x,
-                    y: rect.origin.y + currentPos,
-                    width: actualRowDepth,
-                    height: nodeLength
-                )
-            }
-            
-            rects.append(TreemapRect(
-                node: node,
-                rect: nodeRect,
-                color: FileTypeColors.color(for: node)
+            )
+        }
+
+        let rowHeight = min(rect.height, rowArea / rect.width)
+        guard rowHeight > 0 else { return ([], rect) }
+        var x = rect.minX
+        for (index, item) in row.enumerated() {
+            let width = index == row.count - 1
+                ? max(0, rect.maxX - x)
+                : item.area / rowHeight
+            layouts.append(NodeLayout(
+                node: item.node,
+                rect: CGRect(x: x, y: rect.minY, width: width, height: rowHeight)
             ))
-            
-            currentPos += nodeLength
+            x += width
         }
-        
-        return rects
+        return (
+            layouts,
+            CGRect(
+                x: rect.minX,
+                y: rect.minY + rowHeight,
+                width: rect.width,
+                height: max(0, rect.height - rowHeight)
+            )
+        )
     }
 }
 
@@ -285,6 +329,41 @@ struct TreemapRect: Identifiable {
     let node: FileNode
     let rect: CGRect
     let color: Color
+    let depth: Int
+}
+
+private struct WeightedNode {
+    let node: FileNode
+    let area: CGFloat
+}
+
+private struct SquarifyRowMetrics {
+    var sum: CGFloat = 0
+    var minimum: CGFloat = .infinity
+    var maximum: CGFloat = 0
+
+    func adding(_ area: CGFloat) -> SquarifyRowMetrics {
+        SquarifyRowMetrics(
+            sum: sum + area,
+            minimum: min(minimum, area),
+            maximum: max(maximum, area)
+        )
+    }
+
+    func worstRatio(shortSide: CGFloat) -> CGFloat {
+        guard sum > 0, minimum > 0, shortSide > 0 else { return .infinity }
+        let sideSquared = shortSide * shortSide
+        let sumSquared = sum * sum
+        return max(
+            sideSquared * maximum / sumSquared,
+            sumSquared / (sideSquared * minimum)
+        )
+    }
+}
+
+private struct NodeLayout {
+    let node: FileNode
+    let rect: CGRect
 }
 
 struct TreemapTooltip: View {
