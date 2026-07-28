@@ -258,3 +258,120 @@ struct HelpShortcut: View {
     
     var body: some View {
         HStack(spacing: 12) {
+            Text(key)
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .background(Color.secondary.opacity(0.15))
+                .cornerRadius(4)
+                .frame(minWidth: 80, alignment: .leading)
+            
+            Text(description)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            
+            Spacer()
+        }
+    }
+}
+
+@main
+struct DiskInventoryZedApp: App {
+    @StateObject private var viewModel = AppViewModel()
+    
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+                .environmentObject(viewModel)
+                .frame(minWidth: 900, minHeight: 600)
+        }
+        .commands {
+            CommandMenu("View") {
+                Button("Treemap") {
+                    viewModel.viewMode = .treemap
+                }
+                .keyboardShortcut("1", modifiers: .command)
+
+                Button("List") {
+                    viewModel.viewMode = .list
+                }
+                .keyboardShortcut("2", modifiers: .command)
+
+                Button("Sunburst") {
+                    viewModel.viewMode = .sunburst
+                }
+                .keyboardShortcut("3", modifiers: .command)
+                
+                Divider()
+                
+                Picker("Sort By", selection: $viewModel.sortOrder) {
+                    ForEach(AppViewModel.SortOrder.allCases, id: \.self) { order in
+                        Label(order.rawValue, systemImage: order.icon)
+                    }
+                }
+                .pickerStyle(.inline)
+            }
+            
+            CommandGroup(replacing: .textEditing) {
+                Button("Navigate Back") {
+                    viewModel.navigateBack()
+                }
+                .keyboardShortcut("[", modifiers: .command)
+                .disabled(!viewModel.canNavigateBack)
+                
+                Button("Navigate Forward") {
+                    viewModel.navigateForward()
+                }
+                .keyboardShortcut("]", modifiers: .command)
+                .disabled(!viewModel.canNavigateForward)
+                
+                Button("Navigate Up") {
+                    viewModel.navigateUp()
+                }
+                .keyboardShortcut(.upArrow, modifiers: [.command])
+                .disabled(viewModel.breadcrumb.count <= 1)
+                
+                Divider()
+                
+                Button("Open") {
+                    if let selected = viewModel.selectedNode {
+                        viewModel.openFile(node: selected)
+                    } else if let current = viewModel.currentNode {
+                        viewModel.openFile(node: current)
+                    }
+                }
+                .keyboardShortcut("o", modifiers: .command)
+                
+                Button("Reveal in Finder") {
+                    if let selected = viewModel.selectedNode {
+                        viewModel.revealInFinder(node: selected)
+                    } else if let current = viewModel.currentNode {
+                        viewModel.revealInFinder(node: current)
+                    }
+                }
+                .keyboardShortcut("r", modifiers: .command)
+                
+                Button("Move to Trash") {
+                    if let selected = viewModel.selectedNode {
+                        viewModel.moveToTrash(node: selected)
+                    }
+                }
+                .keyboardShortcut(.delete, modifiers: .command)
+            }
+            
+            CommandGroup(replacing: .appInfo) {
+                Button("About Disk Inventory Zed") {
+                    showAboutWindow()
+                }
+            }
+            
+            CommandGroup(replacing: .help) {
+                Button("Disk Inventory Zed Help") {
+                    showHelpWindow()
+                }
+                .keyboardShortcut("?", modifiers: .command)
+            }
+        }
+        .defaultSize(width: 1200, height: 800)
+    }
+}
