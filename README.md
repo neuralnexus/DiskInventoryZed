@@ -3,6 +3,8 @@
 # Disk Inventory Zed
 
 A modern, fast, native successor to the classic macOS utility **Disk Inventory X**.
+This is not a fork; it is a re-imagination of a kdirstat style treemapping disk utility built for MacOS file discovery. 
+License is GPL. 
 
 ## Overview
 
