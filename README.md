@@ -2,11 +2,12 @@
 
 # Disk Inventory Zed
 
-A modern, fast, native successor to the classic macOS utility **Disk Inventory X**.
+A modern, fast successor to the classic disk visualizers **Disk Inventory X** and **OverDisk**, with native applications for macOS and Windows.
+This is not a fork; it is a GPL-licensed re-imagination of a KDirStat-style disk mapping utility.
 
 ## Overview
 
-Disk Inventory Zed is a native macOS application that visualizes disk usage with beautiful, interactive treemaps and detailed file listings. Built with SwiftUI and modern macOS APIs, it supports both Intel and Apple Silicon Macs.
+Disk Inventory Zed visualizes disk usage with interactive sunbursts, treemaps, and detailed file listings. The macOS application uses SwiftUI; the Windows port uses WPF and supports x64 and ARM64 Windows systems, mapped drives, and UNC shares.
 
 <img width="1510" height="912" alt="Screenshot 2026-05-28 at 12 38 48 PM" src="https://github.com/user-attachments/assets/ab03ce74-0768-4226-ac5c-2bf87c44e8be" />
 
@@ -18,11 +19,11 @@ Disk Inventory Zed is a native macOS application that visualizes disk usage with
 - **Crash-Safe Scan Snapshots** — Bounded workers build an immutable tree before SwiftUI sees it
 - **Three Visualizations** — Treemap, hierarchical sunburst, and detailed list views
 - **Smart Sorting** — Sort by name or size (ascending/descending)
-- **Safe Cleanup** — Reveal in Finder or move confirmed files and folders to macOS Trash; protected scan roots are blocked
-- **Quick Access** — Scan Home, Applications, Documents, Downloads, or any custom folder
+- **Safe Cleanup** — Reveal in Finder or File Explorer and move confirmed local items to Trash or the Recycle Bin; protected roots are blocked
+- **Quick Access** — Scan common folders, drive letters, mounted volumes, mapped drives, UNC shares, or any custom folder
 - **Mounted Volume Overview** — Scan internal, external, and network volumes with free-space context
 - **Breadcrumb Navigation** — Easy traversal up and down the directory tree
-- **Dark Mode** — Native support for macOS dark mode
+- **Platform-Native UI** — SwiftUI on macOS and a sunburst-first WPF interface on Windows
 - **File Type Colors** — Files colored by extension type for quick visual identification
 - **Storage Intelligence** — Largest files, old large files, and same-size duplicate discovery
 - **Verified Duplicates** — Cancellable sample-first and full-file SHA-256 verification, including copies with different names
@@ -35,19 +36,27 @@ Disk Inventory Zed is a native macOS application that visualizes disk usage with
 
 ## Requirements
 
+### macOS
+
 - macOS 13.0 (Ventura) or later
 - Intel or Apple Silicon
 - Xcode 15.0+ (for building from source)
 
+### Windows
+
+- Windows 10 22H2 or Windows 11
+- x64 or ARM64
+- .NET 8 SDK and Visual Studio 2022 .NET desktop workload (only when building from source)
+
 ## Building
 
-### Using Swift Package Manager
+### macOS: Using Swift Package Manager
 
 ```bash
 swift build
 ```
 
-### Creating a Universal App Bundle
+### macOS: Creating a Universal App Bundle
 
 ```bash
 ./build.sh
@@ -55,13 +64,30 @@ swift build
 
 This will create `DiskInventoryZed.app` in the current directory, built as a universal binary for both Intel and Apple Silicon.
 
-### Using Xcode
+### macOS: Using Xcode
 
 1. Open the project in Xcode
 2. Select your target (Intel or Universal)
 3. Build and run
 
-## First Launch
+### Windows
+
+```powershell
+dotnet restore Windows\DiskInventoryZed.Windows.sln
+dotnet test Windows\tests\DiskInventoryZed.Core.Tests\DiskInventoryZed.Core.Tests.csproj -c Release
+dotnet run --project Windows\src\DiskInventoryZed.Windows\DiskInventoryZed.Windows.csproj
+```
+
+Create self-contained x64 or ARM64 release zips with:
+
+```powershell
+pwsh Windows\scripts\package.ps1 -Runtime win-x64
+pwsh Windows\scripts\package.ps1 -Runtime win-arm64
+```
+
+See [Windows/README.md](Windows/README.md) for network-path behavior, shortcuts, packaging, and accuracy notes.
+
+## macOS First Launch
 
 Developer builds are ad-hoc signed, so macOS Gatekeeper may show a security warning when you first
 try to open one. Tagged releases can be Developer ID signed and notarized when the repository's
@@ -106,7 +132,7 @@ The DMG installer includes:
 3. Wait for the scan to complete (progress is shown in real-time)
 4. Explore the treemap visualization — click any rectangle to zoom into that folder
 5. Switch to list view for detailed file information
-6. Right-click any file or folder for actions (reveal in Finder, move to trash)
+6. Right-click any file or folder for actions (reveal in Finder/File Explorer or move eligible local items to Trash/Recycle Bin)
 
 The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 
@@ -123,7 +149,9 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 ## Architecture
 
 - **SwiftUI** — Modern declarative UI framework
+- **WPF on .NET 8** — Native Windows desktop UI with custom-drawn sunburst and treemap controls
 - **Swift Concurrency** — A bounded actor-backed work queue with cooperative cancellation
+- **Windows File IDs** — ReFS/NTFS 128-bit identity for cycle protection and hard-link accounting
 - **Immutable Snapshots** — Background workers never mutate data already published to SwiftUI
 - **Iterative Tree Operations** — Deep paths do not consume one call-stack frame per directory
 - **Cycle Protection** — Symlink targets and previously visited directories are not traversed twice
@@ -134,11 +162,14 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 ## Accuracy Notes
 
 - “On disk” uses allocated size when macOS provides it; “logical” is the apparent file length.
+- Windows uses allocation size reported by the filesystem and marks logical-size fallbacks in scan diagnostics.
 - Multiple hard links to the same file are shown, but their allocated storage is counted once.
 - APFS clones can share physical blocks without exposing enough public per-file metadata to measure
   exact exclusive ownership. Disk Inventory Zed does not claim clone-level reclaimable bytes.
 - Unreadable or intentionally skipped directories are surfaced in scan diagnostics instead of
   silently presenting the result as complete.
+- NTFS alternate data streams are not included in the initial Windows port. ReFS clones, Windows
+  deduplication, cloud placeholders, and shared extents can also limit exact reclaimable-byte estimates.
 
 ## License
 
@@ -151,8 +182,9 @@ This project is licensed under the GNU General Public License v3.0 (GPL-3.0) —
 Design and concept inspired by:
 - **[Disk Inventory X](https://www.derlien.com/)** by Tjark Derlien — the original macOS disk usage visualizer that started it all
 - **[KDirStat](https://kdirstat.sourceforge.net/)** by Alexander Lehmann — the pioneering treemap visualization tool for disk usage
+- **OverDisk** — the classic Windows circular disk-usage visualization that inspired the Windows sunburst-first workflow
 
-These classic tools demonstrated that disk usage visualization should be beautiful, intuitive, and fast. Disk Inventory Zed carries that vision forward with modern macOS technologies.
+These classic tools demonstrated that disk usage visualization should be beautiful, intuitive, and fast. Disk Inventory Zed carries that vision forward on macOS and Windows.
 
 ## Contributing
 

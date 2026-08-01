@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <RootNamespace>DiskInventoryZed.Windows</RootNamespace>
+    <AssemblyName>DiskInventoryZed</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+    <PublishSelfContained>true</PublishSelfContained>
+    <PublishSingleFile>false</PublishSingleFile>
+    <PublishTrimmed>false</PublishTrimmed>
+    <Version>1.2.0</Version>
+    <Authors>Matt Ivan</Authors>
+    <Description>Windows disk usage visualizer with interactive sunburst and treemap views.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\DiskInventoryZed.Core\DiskInventoryZed.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Resource Include="Assets\AppIcon.ico" />
+  </ItemGroup>
+</Project>

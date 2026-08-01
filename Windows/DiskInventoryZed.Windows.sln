@@ -1,0 +1,30 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DiskInventoryZed.Core", "src\DiskInventoryZed.Core\DiskInventoryZed.Core.csproj", "{B94B56A0-D833-4E03-A6CA-4473C1510DC5}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DiskInventoryZed.Windows", "src\DiskInventoryZed.Windows\DiskInventoryZed.Windows.csproj", "{81E10D11-3D26-46B4-96E8-6A4E0B82B8E7}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DiskInventoryZed.Core.Tests", "tests\DiskInventoryZed.Core.Tests\DiskInventoryZed.Core.Tests.csproj", "{2B6A0122-D41D-42BD-B1F8-A901343B66AF}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B94B56A0-D833-4E03-A6CA-4473C1510DC5}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B94B56A0-D833-4E03-A6CA-4473C1510DC5}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B94B56A0-D833-4E03-A6CA-4473C1510DC5}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B94B56A0-D833-4E03-A6CA-4473C1510DC5}.Release|Any CPU.Build.0 = Release|Any CPU
+		{81E10D11-3D26-46B4-96E8-6A4E0B82B8E7}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{81E10D11-3D26-46B4-96E8-6A4E0B82B8E7}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{81E10D11-3D26-46B4-96E8-6A4E0B82B8E7}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{81E10D11-3D26-46B4-96E8-6A4E0B82B8E7}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2B6A0122-D41D-42BD-B1F8-A901343B66AF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2B6A0122-D41D-42BD-B1F8-A901343B66AF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2B6A0122-D41D-42BD-B1F8-A901343B66AF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2B6A0122-D41D-42BD-B1F8-A901343B66AF}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
