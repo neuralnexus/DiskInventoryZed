@@ -5,6 +5,21 @@
 
 import Foundation
 
+func fileNodeIdentity(for url: URL) -> String {
+#if os(Linux)
+    return url.withUnsafeFileSystemRepresentation { representation in
+        guard let representation else { return url.path }
+        var byteCount = 0
+        while representation[byteCount] != 0 {
+            byteCount += 1
+        }
+        return Data(bytes: representation, count: byteCount).base64EncodedString()
+    }
+#else
+    return url.standardizedFileURL.path
+#endif
+}
+
 /// An immutable snapshot of a file-system entry.
 ///
 /// The scanner builds the complete graph off the main actor and only then publishes it.
@@ -79,7 +94,7 @@ final class FileNode: Identifiable, Hashable, @unchecked Sendable {
         totalFileCount: Int? = nil,
         totalDirectoryCount: Int? = nil
     ) {
-        self.id = id ?? url.standardizedFileURL.path
+        self.id = id ?? fileNodeIdentity(for: url)
         self.url = url
         self.name = name
         self.kind = kind
@@ -123,7 +138,7 @@ final class FileNode: Identifiable, Hashable, @unchecked Sendable {
     }
 
     func findChild(at targetURL: URL) -> FileNode? {
-        findChild(withID: targetURL.standardizedFileURL.path)
+        findChild(withID: fileNodeIdentity(for: targetURL))
     }
 
     func path(to targetID: String) -> [FileNode]? {

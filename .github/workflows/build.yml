@@ -29,7 +29,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .build
-          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.swift') }}
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.swift', '**/Package.resolved') }}
           restore-keys: |
             ${{ runner.os }}-spm-
 
@@ -84,8 +84,55 @@ jobs:
           path: DiskInventoryZed.app
           if-no-files-found: error
 
+  linux:
+    runs-on: ubuntu-22.04
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "5.9"
+
+      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.swift', '**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Run Linux unit tests
+        run: swift test
+
+      - name: Build Linux CLI with concurrency diagnostics
+        run: swift build -c release -Xswiftc -strict-concurrency=complete
+
+      - name: Smoke test Linux CLI
+        run: |
+          INPUT="$RUNNER_TEMP/disk-inventory-zed-input"
+          OUTPUT="$RUNNER_TEMP/disk-inventory-zed-scan.json"
+          mkdir -p "$INPUT/nested"
+          printf 'linux smoke test\n' > "$INPUT/nested/file.txt"
+          BIN="$(swift build -c release --show-bin-path)/DiskInventoryZed"
+          "$BIN" --help
+          "$BIN" --json "$OUTPUT" "$INPUT"
+          python3 - "$OUTPUT" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              scan = json.load(source)
+          assert scan["schemaVersion"] == 4
+          assert any(entry["name"] == "file.txt" for entry in scan["entries"])
+          PY
+
   release:
-    needs: build
+    needs: [build, linux]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     permissions:

@@ -3,7 +3,11 @@
 // Copyright (C) 2026 Matt Ivan
 // Licensed under GPL-3.0-or-later.
 
-import Foundation
+@preconcurrency import Foundation
+
+#if os(Linux)
+import Glibc
+#endif
 
 struct ScanDiagnostics: Sendable, Equatable {
     var unreadableItems = 0
@@ -32,7 +36,7 @@ struct DiskScanResult: Sendable {
     let diagnostics: ScanDiagnostics
 }
 
-struct ScanOptions: Sendable {
+struct ScanOptions: Codable, Equatable, Sendable {
     let skipDeveloperFolders: Bool
     let showHiddenFiles: Bool
     let showPackageContents: Bool
@@ -57,11 +61,18 @@ final class DiskScanner: Sendable {
             case .invalidURL:
                 return "The selected location is not a readable folder."
             case .accessDenied(let path):
+#if os(macOS)
                 return "Disk Inventory Zed could not read \(path). Check Full Disk Access and try again."
+#else
+                return "Disk Inventory Zed could not read \(path). Check its file permissions and try again."
+#endif
             }
         }
     }
 
+#if os(Linux)
+    private let resourceKeys: Set<URLResourceKey> = []
+#else
     private let resourceKeys: Set<URLResourceKey> = [
         .isDirectoryKey,
         .isHiddenKey,
@@ -75,6 +86,7 @@ final class DiskScanner: Sendable {
         .fileResourceIdentifierKey,
         .volumeIdentifierKey
     ]
+#endif
 
     func scan(
         url: URL,
@@ -89,16 +101,20 @@ final class DiskScanner: Sendable {
         }
 
         let startTime = Date()
-        let rootValues = try? rootURL.resourceValues(forKeys: resourceKeys)
+        let rootMetadata = try? Self.metadata(
+            for: rootURL,
+            followSymlinks: true,
+            resourceKeys: resourceKeys
+        )
         let rootRecord = NodeRecord(
-            id: rootURL.path,
+            id: fileNodeIdentity(for: rootURL),
             url: rootURL,
             name: rootURL.lastPathComponent.isEmpty ? rootURL.path : rootURL.lastPathComponent,
             kind: .directory,
             isPackage: false,
             isSymbolicLink: false,
-            modificationDate: rootValues?.contentModificationDate,
-            creationDate: rootValues?.creationDate,
+            modificationDate: rootMetadata?.modificationDate,
+            creationDate: rootMetadata?.creationDate,
             extension: nil,
             logicalSize: 0,
             allocatedSize: 0,
@@ -129,7 +145,8 @@ final class DiskScanner: Sendable {
 
         do {
             let processorCount = ProcessInfo.processInfo.activeProcessorCount
-            let workerCount = max(2, min(8, processorCount))
+            // Following aliases serially keeps ownership of revisited directory targets stable.
+            let workerCount = options.followSymlinks ? 1 : max(2, min(8, processorCount))
 
             try await withThrowingTaskGroup(of: Void.self) { group in
                 for _ in 0..<workerCount {
@@ -194,6 +211,11 @@ final class DiskScanner: Sendable {
         options: ScanOptions,
         resourceKeys: Set<URLResourceKey>
     ) throws -> DirectoryOutput {
+#if os(Linux)
+        let urls = try FileManager().contentsOfDirectory(atPath: work.record.url.path)
+            .filter { options.showHiddenFiles || !$0.hasPrefix(".") }
+            .map { appendingFileName($0, to: work.record.url) }
+#else
         let directoryOptions: FileManager.DirectoryEnumerationOptions =
             options.showHiddenFiles ? [] : [.skipsHiddenFiles]
         let urls = try FileManager().contentsOfDirectory(
@@ -201,23 +223,31 @@ final class DiskScanner: Sendable {
             includingPropertiesForKeys: Array(resourceKeys),
             options: directoryOptions
         )
+#endif
 
         var children: [ChildRecord] = []
         children.reserveCapacity(urls.count)
         var skippedDirectories = 0
+        let orderedURLs = options.followSymlinks
+            ? urls.sorted { $0.path.utf8.lexicographicallyPrecedes($1.path.utf8) }
+            : urls
 
-        for childURL in urls {
+        for childURL in orderedURLs {
             try Task.checkCancellation()
 
-            guard let values = try? childURL.resourceValues(forKeys: resourceKeys) else {
+            guard let metadata = try? metadata(
+                for: childURL,
+                followSymlinks: options.followSymlinks,
+                resourceKeys: resourceKeys
+            ) else {
                 let inaccessible = NodeRecord.inaccessible(url: childURL)
                 children.append(ChildRecord(record: inaccessible, shouldTraverse: false, canonicalDirectoryPath: nil, fileIdentity: nil))
                 continue
             }
 
-            let childIsDirectory = values.isDirectory ?? false
-            let childIsSymlink = values.isSymbolicLink ?? false
-            let childIsPackage = values.isPackage ?? false
+            let childIsDirectory = metadata.isDirectory
+            let childIsSymlink = metadata.isSymbolicLink
+            let childIsPackage = metadata.isPackage
             let lowercasedName = childURL.lastPathComponent.lowercased()
 
             if options.skipDeveloperFolders,
@@ -227,12 +257,12 @@ final class DiskScanner: Sendable {
                 continue
             }
 
-            let shouldFollowDirectory = childIsDirectory && (!childIsSymlink || options.followSymlinks)
+            let shouldFollowDirectory = childIsDirectory && (!childIsSymlink || metadata.followedSymbolicLink)
             let shouldTraverse = shouldFollowDirectory
             let exposesChildren = shouldFollowDirectory && (!childIsPackage || options.showPackageContents)
 
             let kind: FileNode.Kind
-            if childIsSymlink && !options.followSymlinks {
+            if childIsSymlink && !metadata.followedSymbolicLink {
                 kind = .symbolicLink
             } else if childIsPackage && !options.showPackageContents {
                 kind = .package
@@ -242,29 +272,24 @@ final class DiskScanner: Sendable {
                 kind = .file
             }
 
-            let logicalSize = shouldTraverse ? 0 : Int64(values.fileSize ?? 0)
-            let allocatedSize = shouldTraverse ? 0 : Int64(
-                values.totalFileAllocatedSize ??
-                values.fileAllocatedSize ??
-                values.fileSize ??
-                0
-            )
+            let logicalSize = shouldTraverse ? 0 : metadata.logicalSize
+            let allocatedSize = shouldTraverse ? 0 : metadata.allocatedSize
 
             let record = NodeRecord(
-                id: childURL.standardizedFileURL.path,
+                id: fileNodeIdentity(for: childURL),
                 url: childURL,
                 name: childURL.lastPathComponent,
                 kind: kind,
                 isPackage: childIsPackage,
                 isSymbolicLink: childIsSymlink,
-                modificationDate: values.contentModificationDate,
-                creationDate: values.creationDate,
+                modificationDate: metadata.modificationDate,
+                creationDate: metadata.creationDate,
                 extension: childURL.pathExtension.isEmpty ? nil : childURL.pathExtension,
                 logicalSize: logicalSize,
                 allocatedSize: allocatedSize,
                 childIDs: [],
                 exposesChildren: exposesChildren,
-                errorDescription: nil,
+                errorDescription: metadata.errorDescription,
                 isHardLinkDuplicate: false
             )
 
@@ -272,7 +297,7 @@ final class DiskScanner: Sendable {
             if shouldTraverse || kind == .symbolicLink {
                 fileIdentity = nil
             } else {
-                fileIdentity = identityString(values: values)
+                fileIdentity = metadata.fileIdentity
             }
 
             children.append(ChildRecord(
@@ -293,14 +318,134 @@ final class DiskScanner: Sendable {
     }
 
     private static func canonicalDirectoryPath(for url: URL) -> String {
+#if os(Linux)
+        fileNodeIdentity(for: url.resolvingSymlinksInPath())
+#else
         url.resolvingSymlinksInPath().standardizedFileURL.path
+#endif
     }
 
+#if os(Linux)
+    private static func appendingFileName(_ name: String, to directoryURL: URL) -> URL {
+        directoryURL.withUnsafeFileSystemRepresentation { directoryPath in
+            guard let directoryPath else {
+                return directoryURL.appendingPathComponent(name)
+            }
+
+            var path: [CChar] = []
+            var index = 0
+            while directoryPath[index] != 0 {
+                path.append(directoryPath[index])
+                index += 1
+            }
+            if path.last != CChar(47) {
+                path.append(CChar(47))
+            }
+            path.append(contentsOf: name.utf8.map { CChar(bitPattern: $0) })
+            path.append(0)
+
+            return path.withUnsafeBufferPointer { buffer in
+                URL(
+                    fileURLWithFileSystemRepresentation: buffer.baseAddress!,
+                    isDirectory: false,
+                    relativeTo: nil
+                )
+            }
+        }
+    }
+#endif
+
+    private static func metadata(
+        for url: URL,
+        followSymlinks: Bool,
+        resourceKeys: Set<URLResourceKey>
+    ) throws -> FileSystemMetadata {
+#if os(Linux)
+        var linkStatus = stat()
+        let linkResult = url.path.withCString { path in
+            Glibc.lstat(path, &linkStatus)
+        }
+        guard linkResult == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        let isSymbolicLink = fileType(of: linkStatus.st_mode) == mode_t(S_IFLNK)
+        var status = linkStatus
+        var followedSymbolicLink = false
+        var metadataError: String?
+        if isSymbolicLink && followSymlinks {
+            var targetStatus = stat()
+            let targetResult = url.path.withCString { path in
+                stat(path, &targetStatus)
+            }
+            if targetResult == 0 {
+                status = targetStatus
+                followedSymbolicLink = true
+            } else {
+                let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                metadataError = "Symbolic link target could not be read: \(error.localizedDescription)"
+            }
+        }
+
+        let isDirectory = fileType(of: status.st_mode) == mode_t(S_IFDIR)
+        let logicalSize = max(0, Int64(status.st_size))
+        let blocks = max(0, Int64(status.st_blocks))
+        let (allocatedBytes, overflow) = blocks.multipliedReportingOverflow(by: 512)
+        let modificationDate = Date(
+            timeIntervalSince1970: TimeInterval(status.st_mtim.tv_sec) +
+                TimeInterval(status.st_mtim.tv_nsec) / 1_000_000_000
+        )
+
+        return FileSystemMetadata(
+            isDirectory: isDirectory,
+            isPackage: false,
+            isSymbolicLink: isSymbolicLink,
+            followedSymbolicLink: followedSymbolicLink,
+            logicalSize: logicalSize,
+            allocatedSize: overflow ? Int64.max : allocatedBytes,
+            modificationDate: modificationDate,
+            creationDate: nil,
+            fileIdentity: isDirectory || (isSymbolicLink && !followedSymbolicLink)
+                ? nil
+                : "\(status.st_dev)|\(status.st_ino)",
+            errorDescription: metadataError
+        )
+#else
+        let values = try url.resourceValues(forKeys: resourceKeys)
+        let logicalSize = Int64(values.fileSize ?? 0)
+        return FileSystemMetadata(
+            isDirectory: values.isDirectory ?? false,
+            isPackage: values.isPackage ?? false,
+            isSymbolicLink: values.isSymbolicLink ?? false,
+            followedSymbolicLink: (values.isSymbolicLink ?? false) && followSymlinks,
+            logicalSize: logicalSize,
+            allocatedSize: Int64(
+                values.totalFileAllocatedSize ??
+                values.fileAllocatedSize ??
+                values.fileSize ??
+                0
+            ),
+            modificationDate: values.contentModificationDate,
+            creationDate: values.creationDate,
+            fileIdentity: identityString(values: values),
+            errorDescription: nil
+        )
+#endif
+    }
+
+#if os(Linux)
+    private static func fileType(of mode: mode_t) -> mode_t {
+        mode & mode_t(S_IFMT)
+    }
+#endif
+
+#if !os(Linux)
     private static func identityString(values: URLResourceValues) -> String? {
         guard let fileID = values.fileResourceIdentifier else { return nil }
         let volumeID = values.volumeIdentifier.map { String(describing: $0) } ?? "unknown-volume"
         return "\(volumeID)|\(String(describing: fileID))"
     }
+#endif
 
     private static func buildTree(id: String, records: [String: NodeRecord]) -> FileNode? {
         guard records[id] != nil else { return nil }
@@ -366,6 +511,19 @@ final class DiskScanner: Sendable {
     ]
 }
 
+private struct FileSystemMetadata {
+    let isDirectory: Bool
+    let isPackage: Bool
+    let isSymbolicLink: Bool
+    let followedSymbolicLink: Bool
+    let logicalSize: Int64
+    let allocatedSize: Int64
+    let modificationDate: Date?
+    let creationDate: Date?
+    let fileIdentity: String?
+    let errorDescription: String?
+}
+
 // MARK: - Work queue
 
 private struct WorkItem: Sendable {
@@ -405,7 +563,7 @@ private struct NodeRecord: Sendable {
 
     static func inaccessible(url: URL) -> NodeRecord {
         NodeRecord(
-            id: url.standardizedFileURL.path,
+            id: fileNodeIdentity(for: url),
             url: url,
             name: url.lastPathComponent,
             kind: .file,
@@ -438,7 +596,7 @@ private actor ScanWorkQueue {
     private var waiters: [CheckedContinuation<WorkItem?, Never>] = []
     private var records: [String: NodeRecord]
     private var visitedDirectoryPaths: Set<String>
-    private var visitedFileIdentities: Set<String> = []
+    private var ownerByFileIdentity: [String: String] = [:]
     private var fileCount = 0
     private var directoryCount = 0
     private var diagnostics = ScanDiagnostics.empty
@@ -503,11 +661,23 @@ private actor ScanWorkQueue {
                     diagnostics.revisitedDirectories += 1
                 }
             } else {
-                if let identity = child.fileIdentity,
-                   !visitedFileIdentities.insert(identity).inserted {
-                    child.record.allocatedSize = 0
-                    child.record.isHardLinkDuplicate = true
-                    diagnostics.duplicateHardLinks += 1
+                if let identity = child.fileIdentity {
+                    if let ownerID = ownerByFileIdentity[identity] {
+                        diagnostics.duplicateHardLinks += 1
+                        if child.record.id < ownerID {
+                            if var previousOwner = records[ownerID] {
+                                previousOwner.allocatedSize = 0
+                                previousOwner.isHardLinkDuplicate = true
+                                records[ownerID] = previousOwner
+                            }
+                            ownerByFileIdentity[identity] = child.record.id
+                        } else {
+                            child.record.allocatedSize = 0
+                            child.record.isHardLinkDuplicate = true
+                        }
+                    } else {
+                        ownerByFileIdentity[identity] = child.record.id
+                    }
                 }
                 records[child.record.id] = child.record
                 fileCount += 1

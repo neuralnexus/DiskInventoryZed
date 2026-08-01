@@ -2,13 +2,12 @@
 
 # Disk Inventory Zed
 
-A modern, fast, native successor to the classic macOS utility **Disk Inventory X**.
-This is not a fork; it is a re-imagination of a kdirstat style treemapping disk utility built for MacOS file discovery. 
-License is GPL. 
+A modern disk usage analyzer with a native macOS interface and a read-only Linux CLI.
+This GPL-licensed project is not a fork of **Disk Inventory X**; it is a re-imagination of a KDirStat-style treemapping disk utility.
 
 ## Overview
 
-Disk Inventory Zed is a native macOS application that visualizes disk usage with beautiful, interactive treemaps and detailed file listings. Built with SwiftUI and modern macOS APIs, it supports both Intel and Apple Silicon Macs.
+Disk Inventory Zed visualizes disk usage on macOS with interactive treemaps and detailed file listings. The same concurrent scanner, storage accounting, exports, and snapshot comparison are available through a read-only command-line interface on Linux.
 
 <img width="1510" height="912" alt="Screenshot 2026-05-28 at 12 38 48 PM" src="https://github.com/user-attachments/assets/ab03ce74-0768-4226-ac5c-2bf87c44e8be" />
 
@@ -34,12 +33,20 @@ Disk Inventory Zed is a native macOS application that visualizes disk usage with
 - **Global Search** — Debounced indexed search by file name or path without blocking the interface
 - **Portable Exports** — Versioned JSON and streaming CSV with reliability metadata
 - **Deep-Tree Safety** — Iterative tree building, navigation, and cleanup updates avoid recursion overflow
+- **Linux CLI** — Read-only directory scans, JSON/CSV exports, and snapshot comparison
 
 ## Requirements
+
+### macOS App
 
 - macOS 13.0 (Ventura) or later
 - Intel or Apple Silicon
 - Xcode 15.0+ (for building from source)
+
+### Linux CLI
+
+- A Linux distribution supported by Swift 5.9 or later
+- Swift 5.9+ (for building from source)
 
 ## Building
 
@@ -48,6 +55,8 @@ Disk Inventory Zed is a native macOS application that visualizes disk usage with
 ```bash
 swift build
 ```
+
+SwiftPM builds the native app executable on macOS and the command-line executable on Linux.
 
 ### Creating a Universal App Bundle
 
@@ -63,7 +72,14 @@ This will create `DiskInventoryZed.app` in the current directory, built as a uni
 2. Select your target (Intel or Universal)
 3. Build and run
 
-## First Launch
+### Building the Linux CLI
+
+```bash
+swift build -c release
+.build/release/DiskInventoryZed --help
+```
+
+## macOS First Launch
 
 Developer builds are ad-hoc signed, so macOS Gatekeeper may show a security warning when you first
 try to open one. Tagged releases can be Developer ID signed and notarized when the repository's
@@ -101,7 +117,7 @@ The DMG installer includes:
 
 *Note: You only need to do this once. After the first launch, the app will open normally.*
 
-## Usage
+## macOS Usage
 
 1. Launch the app
 2. Click "Choose Folder" or select a quick access location from the sidebar
@@ -109,6 +125,32 @@ The DMG installer includes:
 4. Explore the treemap visualization — click any rectangle to zoom into that folder
 5. Switch to list view for detailed file information
 6. Right-click any file or folder for actions (reveal in Finder, move to trash)
+
+## Linux Usage
+
+Scan a directory and print a storage summary:
+
+```bash
+DiskInventoryZed /home/user
+```
+
+Create JSON and CSV exports, including hidden files:
+
+```bash
+DiskInventoryZed --show-hidden --json scan.json --csv scan.csv /home/user
+```
+
+Compare a new scan with an earlier JSON snapshot:
+
+```bash
+DiskInventoryZed --compare previous-scan.json /home/user
+```
+
+Comparison requires a schema v4 snapshot created with matching scan options.
+
+Use `--follow-symlinks` to traverse symlinked directories with cycle protection, or
+`--skip-developer-folders` to omit folders such as `.git`, `node_modules`, and `.build`.
+The Linux CLI never deletes or moves files.
 
 The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 
@@ -126,6 +168,7 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 
 - **SwiftUI** — Modern declarative UI framework
 - **Swift Concurrency** — A bounded actor-backed work queue with cooperative cancellation
+- **Platform Front Ends** — SwiftUI on macOS and a read-only command-line interface on Linux
 - **Immutable Snapshots** — Background workers never mutate data already published to SwiftUI
 - **Iterative Tree Operations** — Deep paths do not consume one call-stack frame per directory
 - **Cycle Protection** — Symlink targets and previously visited directories are not traversed twice
@@ -135,8 +178,10 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 
 ## Accuracy Notes
 
-- “On disk” uses allocated size when macOS provides it; “logical” is the apparent file length.
+- “On disk” uses allocated size when macOS provides it and Linux `stat` block accounting; “logical” is the apparent file length.
+- Totals sum file allocation and do not include filesystem directory-entry metadata.
 - Multiple hard links to the same file are shown, but their allocated storage is counted once.
+- Linux filenames that are not valid UTF-8 are reported as unreadable because exported paths are UTF-8 strings.
 - APFS clones can share physical blocks without exposing enough public per-file metadata to measure
   exact exclusive ownership. Disk Inventory Zed does not claim clone-level reclaimable bytes.
 - Unreadable or intentionally skipped directories are surfaced in scan diagnostics instead of
@@ -154,7 +199,7 @@ Design and concept inspired by:
 - **[Disk Inventory X](https://www.derlien.com/)** by Tjark Derlien — the original macOS disk usage visualizer that started it all
 - **[KDirStat](https://kdirstat.sourceforge.net/)** by Alexander Lehmann — the pioneering treemap visualization tool for disk usage
 
-These classic tools demonstrated that disk usage visualization should be beautiful, intuitive, and fast. Disk Inventory Zed carries that vision forward with modern macOS technologies.
+These classic tools demonstrated that disk usage analysis should be beautiful, intuitive, and fast. Disk Inventory Zed carries that vision forward with a native macOS interface and a portable Swift scanning core.
 
 ## Contributing
 

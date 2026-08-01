@@ -5,10 +5,19 @@
 
 import Foundation
 
+#if os(Linux)
+import Glibc
+#endif
+
 enum ScanExporter {
     /// Writes a reconstructable flat JSON document without first duplicating the entire
     /// in-memory tree. This keeps exports safe for scans containing millions of entries.
-    static func exportJSON(root: FileNode, diagnostics: ScanDiagnostics, to url: URL) throws {
+    static func exportJSON(
+        root: FileNode,
+        diagnostics: ScanDiagnostics,
+        options: ScanOptions,
+        to url: URL
+    ) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
@@ -16,11 +25,14 @@ enum ScanExporter {
         try writeAtomically(to: url) { handle in
             let formatter = ISO8601DateFormatter()
             let encodedDiagnostics = try encoder.encode(JSONDiagnostics(diagnostics))
+            let encodedOptions = try encoder.encode(options)
             let prefix = """
-            {"schemaVersion":3,"exportedAt":\(jsonString(formatter.string(from: Date()))),"rootPath":\(jsonString(root.path)),"diagnostics":
+            {"schemaVersion":4,"exportedAt":\(jsonString(formatter.string(from: Date()))),"rootPath":\(jsonString(root.path)),"diagnostics":
             """
             try write(prefix, to: handle)
             try handle.write(contentsOf: encodedDiagnostics)
+            try write(",\"options\":", to: handle)
+            try handle.write(contentsOf: encodedOptions)
             try write(",\"entries\":[", to: handle)
 
             var stack: [(node: FileNode, parentPath: String?)] = [(root, nil)]
@@ -45,8 +57,11 @@ enum ScanExporter {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         let document = try decoder.decode(JSONExportDocument.self, from: Data(contentsOf: url))
-        guard (2...3).contains(document.schemaVersion) else {
+        guard (2...4).contains(document.schemaVersion) else {
             throw SnapshotImportError.unsupportedSchema(document.schemaVersion)
+        }
+        if document.schemaVersion == 4, document.options == nil {
+            throw SnapshotImportError.missingScanOptions
         }
         guard let rootEntry = document.entries.first(where: { $0.parentPath == nil }) else {
             throw SnapshotImportError.missingRoot
@@ -57,7 +72,8 @@ enum ScanExporter {
             exportedAt: document.exportedAt,
             rootPath: document.rootPath ?? rootEntry.path,
             entries: document.entries,
-            diagnostics: document.diagnostics.scanDiagnostics
+            diagnostics: document.diagnostics.scanDiagnostics,
+            options: document.options
         )
     }
 
@@ -113,16 +129,44 @@ enum ScanExporter {
         do {
             do {
                 let handle = try FileHandle(forWritingTo: temporaryURL)
-                defer { handle.closeFile() }
+                defer { try? handle.close() }
                 try body(handle)
-                handle.synchronizeFile()
+                try handle.synchronize()
             }
 
+#if os(Linux)
+            var destinationStatus = stat()
+            let statusResult = destinationURL.path.withCString { destinationPath in
+                Glibc.lstat(destinationPath, &destinationStatus)
+            }
+            if statusResult == 0 {
+                guard destinationStatus.st_mode & mode_t(S_IFMT) != mode_t(S_IFLNK) else {
+                    throw ScanExportError.symbolicLinkDestination(destinationURL.path)
+                }
+                let permissionResult = temporaryURL.path.withCString { temporaryPath in
+                    Glibc.chmod(temporaryPath, destinationStatus.st_mode & 0o7777)
+                }
+                guard permissionResult == 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+            } else if errno != ENOENT {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            let renameResult = temporaryURL.path.withCString { sourcePath in
+                destinationURL.path.withCString { destinationPath in
+                    Glibc.rename(sourcePath, destinationPath)
+                }
+            }
+            guard renameResult == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+#else
             if fileManager.fileExists(atPath: destinationURL.path) {
                 _ = try fileManager.replaceItemAt(destinationURL, withItemAt: temporaryURL)
             } else {
                 try fileManager.moveItem(at: temporaryURL, to: destinationURL)
             }
+#endif
         } catch {
             try? fileManager.removeItem(at: temporaryURL)
             throw error
@@ -147,9 +191,21 @@ enum ScanExporter {
     }
 }
 
+enum ScanExportError: LocalizedError {
+    case symbolicLinkDestination(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .symbolicLinkDestination(let path):
+            return "Refusing to replace symbolic-link export destination: \(path)"
+        }
+    }
+}
+
 enum SnapshotImportError: LocalizedError {
     case unsupportedSchema(Int)
     case missingRoot
+    case missingScanOptions
 
     var errorDescription: String? {
         switch self {
@@ -157,6 +213,8 @@ enum SnapshotImportError: LocalizedError {
             return "Snapshot schema \(version) is not supported."
         case .missingRoot:
             return "The snapshot does not contain a root entry."
+        case .missingScanOptions:
+            return "The snapshot does not contain its scan options."
         }
     }
 }
@@ -166,6 +224,7 @@ struct JSONExportDocument: Codable {
     let exportedAt: Date
     let rootPath: String?
     let diagnostics: JSONDiagnostics
+    let options: ScanOptions?
     let entries: [JSONExportEntry]
 }
 
