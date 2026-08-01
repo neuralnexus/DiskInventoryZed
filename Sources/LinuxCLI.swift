@@ -7,16 +7,14 @@
 import Foundation
 import Glibc
 
-private let linuxCommandLineArguments = Array(CommandLine.arguments.dropFirst())
+private let linuxCommandLineArguments = Array(ProcessInfo.processInfo.arguments.dropFirst())
 
 struct LinuxCLIConfiguration: Equatable {
     let path: String
     let jsonOutput: String?
     let csvOutput: String?
-    let comparisonSnapshot: String?
     let showHiddenFiles: Bool
     let skipDeveloperFolders: Bool
-    let followSymlinks: Bool
 }
 
 enum LinuxCLIParseResult: Equatable {
@@ -28,10 +26,8 @@ enum LinuxCLIParser {
     static func parse(arguments: [String]) throws -> LinuxCLIParseResult {
         var jsonOutput: String?
         var csvOutput: String?
-        var comparisonSnapshot: String?
         var showHiddenFiles = false
         var skipDeveloperFolders = false
-        var followSymlinks = false
         var paths: [String] = []
         var parsesOptions = true
         var index = 0
@@ -43,17 +39,15 @@ enum LinuxCLIParser {
             } else if parsesOptions && (argument == "--help" || argument == "-h") {
                 return .help
             } else if parsesOptions && argument == "--json" {
+                guard jsonOutput == nil else { throw LinuxCLIError.duplicateOption(argument) }
                 jsonOutput = try value(after: argument, at: &index, in: arguments)
             } else if parsesOptions && argument == "--csv" {
+                guard csvOutput == nil else { throw LinuxCLIError.duplicateOption(argument) }
                 csvOutput = try value(after: argument, at: &index, in: arguments)
-            } else if parsesOptions && argument == "--compare" {
-                comparisonSnapshot = try value(after: argument, at: &index, in: arguments)
             } else if parsesOptions && argument == "--show-hidden" {
                 showHiddenFiles = true
             } else if parsesOptions && argument == "--skip-developer-folders" {
                 skipDeveloperFolders = true
-            } else if parsesOptions && argument == "--follow-symlinks" {
-                followSymlinks = true
             } else if parsesOptions && argument.hasPrefix("-") {
                 throw LinuxCLIError.unknownOption(argument)
             } else {
@@ -68,21 +62,16 @@ enum LinuxCLIParser {
         guard paths.count == 1 else {
             throw LinuxCLIError.tooManyPaths
         }
-
-        try validateDistinctFileRoles([
-            ("--json", jsonOutput),
-            ("--csv", csvOutput),
-            ("--compare", comparisonSnapshot)
-        ])
+        guard jsonOutput == nil || csvOutput == nil else {
+            throw LinuxCLIError.multipleOutputs
+        }
 
         return .run(LinuxCLIConfiguration(
             path: path,
             jsonOutput: jsonOutput,
             csvOutput: csvOutput,
-            comparisonSnapshot: comparisonSnapshot,
             showHiddenFiles: showHiddenFiles,
-            skipDeveloperFolders: skipDeveloperFolders,
-            followSymlinks: followSymlinks
+            skipDeveloperFolders: skipDeveloperFolders
         ))
     }
 
@@ -95,52 +84,11 @@ enum LinuxCLIParser {
         guard index < arguments.count else {
             throw LinuxCLIError.missingValue(option)
         }
-        return arguments[index]
-    }
-
-    private static func validateDistinctFileRoles(_ roles: [(String, String?)]) throws {
-        var rolesByPath: [String: String] = [:]
-        for (role, path) in roles {
-            guard let path else { continue }
-            let expandedPath = NSString(string: path).expandingTildeInPath
-            let absolutePath = expandedPath.hasPrefix("/")
-                ? expandedPath
-                : FileManager.default.currentDirectoryPath + "/" + expandedPath
-            let lexicalURL = URL(fileURLWithPath: absolutePath).standardizedFileURL
-            let identity = fileRoleIdentity(for: lexicalURL)
-            if let existingRole = rolesByPath[identity] {
-                throw LinuxCLIError.conflictingPaths(existingRole, role)
-            }
-            rolesByPath[identity] = role
+        let value = arguments[index]
+        guard !value.hasPrefix("-") else {
+            throw LinuxCLIError.missingValue(option)
         }
-    }
-
-    private static func fileRoleIdentity(for url: URL) -> String {
-        var entryStatus = stat()
-        let entryResult = url.path.withCString { path in
-            stat(path, &entryStatus)
-        }
-        if entryResult == 0 {
-            return "entry|\(entryStatus.st_dev)|\(entryStatus.st_ino)"
-        }
-
-        let parentPath = url.deletingLastPathComponent().path
-        var parentStatus = stat()
-        let parentResult = parentPath.withCString { path in
-            stat(path, &parentStatus)
-        }
-        if parentResult == 0 {
-            let encodedName = Data(url.lastPathComponent.utf8).base64EncodedString()
-            return "parent|\(parentStatus.st_dev)|\(parentStatus.st_ino)|\(encodedName)"
-        }
-
-        return parentPath.withCString { fileSystemPath in
-            guard let resolvedPath = Glibc.realpath(fileSystemPath, nil) else {
-                return "path|\(url.path)"
-            }
-            defer { Glibc.free(resolvedPath) }
-            return "path|\(String(cString: resolvedPath))/\(url.lastPathComponent)"
-        }
+        return value
     }
 }
 
@@ -149,7 +97,8 @@ enum LinuxCLIError: LocalizedError {
     case tooManyPaths
     case missingValue(String)
     case unknownOption(String)
-    case conflictingPaths(String, String)
+    case duplicateOption(String)
+    case multipleOutputs
 
     var errorDescription: String? {
         switch self {
@@ -161,8 +110,24 @@ enum LinuxCLIError: LocalizedError {
             return "\(option) requires an output path."
         case .unknownOption(let option):
             return "Unknown option: \(option)"
-        case .conflictingPaths(let first, let second):
-            return "\(first) and \(second) must use different paths."
+        case .duplicateOption(let option):
+            return "\(option) can only be specified once."
+        case .multipleOutputs:
+            return "Only one of --json or --csv can be used per scan."
+        }
+    }
+}
+
+private enum LinuxCLIRuntimeError: LocalizedError {
+    case invalidFileSystemPath(String)
+    case outputInsideScan(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidFileSystemPath(let path):
+            return "The file-system path could not be resolved: \(path)"
+        case .outputInsideScan(let path):
+            return "Export output must be outside the scanned directory: \(path)"
         }
     }
 }
@@ -178,11 +143,12 @@ struct DiskInventoryZedCLI {
     Options:
       --json OUTPUT              Export a versioned JSON snapshot
       --csv OUTPUT               Export all entries as CSV
-      --compare SNAPSHOT         Compare with an earlier JSON snapshot
       --show-hidden              Include hidden files and directories
       --skip-developer-folders   Skip .git, node_modules, .build, and similar folders
-      --follow-symlinks          Follow symlinked directories with cycle protection
       -h, --help                 Show this help
+
+    Symlinks are listed but never followed. Use one export option per scan;
+    the output must be outside PATH and must not already exist.
     """
 
     static func main() async {
@@ -192,7 +158,7 @@ struct DiskInventoryZedCLI {
         }
     }
 
-    private static func execute(arguments: [String]) async -> Int32 {
+    static func execute(arguments: [String]) async -> Int32 {
         let parseResult: LinuxCLIParseResult
         do {
             parseResult = try LinuxCLIParser.parse(arguments: arguments)
@@ -209,11 +175,13 @@ struct DiskInventoryZedCLI {
         let displaysProgress = Glibc.isatty(STDERR_FILENO) == 1
         do {
             let sourceURL = fileURL(for: configuration.path)
+            try validateOutputLocation(configuration.jsonOutput, relativeTo: sourceURL)
+            try validateOutputLocation(configuration.csvOutput, relativeTo: sourceURL)
             let options = ScanOptions(
                 skipDeveloperFolders: configuration.skipDeveloperFolders,
                 showHiddenFiles: configuration.showHiddenFiles,
                 showPackageContents: true,
-                followSymlinks: configuration.followSymlinks
+                followSymlinks: false
             )
             let result = try await DiskScanner().scan(
                 url: sourceURL,
@@ -230,35 +198,36 @@ struct DiskInventoryZedCLI {
                 write("\n", to: .standardError)
             }
 
-            let comparison: ScanComparison?
-            if let path = configuration.comparisonSnapshot {
-                let baseline = try ScanExporter.importSnapshot(from: fileURL(for: path))
-                comparison = try ScanSnapshotComparator.compare(
-                    current: result.root,
-                    options: options,
-                    diagnostics: result.diagnostics,
-                    with: baseline
+            guard result.diagnostics.unreadableItems == 0,
+                  result.diagnostics.revisitedDirectories == 0 else {
+                printSummary(result)
+                write(
+                    "error: Scan was incomplete; no export was written.\n",
+                    to: .standardError
                 )
-            } else {
-                comparison = nil
+                return 1
             }
 
             if let path = configuration.jsonOutput {
+                let destination = try ScanExporter.prepareLinuxDestination(
+                    for: fileURL(for: path),
+                    excludingDirectoryIdentities: result.scannedDirectoryIdentities
+                )
                 try ScanExporter.exportJSON(
                     root: result.root,
                     diagnostics: result.diagnostics,
-                    options: options,
-                    to: fileURL(for: path)
+                    to: destination
                 )
             }
             if let path = configuration.csvOutput {
-                try ScanExporter.exportCSV(root: result.root, to: fileURL(for: path))
+                let destination = try ScanExporter.prepareLinuxDestination(
+                    for: fileURL(for: path),
+                    excludingDirectoryIdentities: result.scannedDirectoryIdentities
+                )
+                try ScanExporter.exportCSV(root: result.root, to: destination)
             }
 
             printSummary(result)
-            if let comparison {
-                printComparison(comparison)
-            }
             if let path = configuration.jsonOutput {
                 write("JSON snapshot: \(fileURL(for: path).path)\n", to: .standardOutput)
             }
@@ -297,34 +266,6 @@ struct DiskInventoryZedCLI {
         }
     }
 
-    private static func printComparison(_ comparison: ScanComparison) {
-        let date = ISO8601DateFormatter().string(from: comparison.baselineDate)
-        let delta = comparison.totalDelta > 0
-            ? "+\(formattedBytes(comparison.totalDelta))"
-            : formattedBytes(comparison.totalDelta)
-        let summary = """
-
-        Comparison with \(date):
-        Total change: \(delta)
-        Added: \(comparison.addedCount)
-        Removed: \(comparison.removedCount)
-        Changed: \(comparison.changedCount)
-        """
-        write(summary + "\n", to: .standardOutput)
-
-        let changes = Array(comparison.largestGrowth.prefix(5)) +
-            Array(comparison.largestShrinkage.prefix(5))
-        if !changes.isEmpty {
-            write("Largest changes:\n", to: .standardOutput)
-            for change in changes {
-                let changeSize = change.delta > 0
-                    ? "+\(formattedBytes(change.delta))"
-                    : formattedBytes(change.delta)
-                write("  \(changeSize)  \(change.path)\n", to: .standardOutput)
-            }
-        }
-    }
-
     private static func fileURL(for path: String) -> URL {
         let expandedPath = NSString(string: path).expandingTildeInPath
         let absolutePath: String
@@ -333,7 +274,40 @@ struct DiskInventoryZedCLI {
         } else {
             absolutePath = FileManager.default.currentDirectoryPath + "/" + expandedPath
         }
-        return URL(fileURLWithPath: absolutePath).standardizedFileURL
+        return URL(fileURLWithPath: absolutePath)
+    }
+
+    private static func validateOutputLocation(_ output: String?, relativeTo sourceURL: URL) throws {
+        guard let output else { return }
+
+        let scanPath = try resolvedPath(sourceURL.path)
+        let outputURL = fileURL(for: output)
+        let outputParent = try resolvedPath(outputURL.deletingLastPathComponent().path)
+        let outputPath = outputParent == "/"
+            ? "/\(outputURL.lastPathComponent)"
+            : "\(outputParent)/\(outputURL.lastPathComponent)"
+
+        guard !isSameOrDescendant(outputPath, of: scanPath) else {
+            throw LinuxCLIRuntimeError.outputInsideScan(outputURL.path)
+        }
+    }
+
+    private static func resolvedPath(_ path: String) throws -> String {
+        try path.withCString { fileSystemPath in
+            guard let resolved = Glibc.realpath(fileSystemPath, nil) else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            defer { Glibc.free(resolved) }
+            guard let value = String(validatingUTF8: resolved) else {
+                throw LinuxCLIRuntimeError.invalidFileSystemPath(path)
+            }
+            return value
+        }
+    }
+
+    private static func isSameOrDescendant(_ path: String, of directory: String) -> Bool {
+        if directory == "/" { return path.hasPrefix("/") }
+        return path == directory || path.hasPrefix(directory + "/")
     }
 
     private static func formattedBytes(_ bytes: Int64) -> String {

@@ -3,6 +3,7 @@ import PackageDescription
 
 #if os(Linux)
 let excludedSources = [
+    "Analysis/DuplicateVerifier.swift",
     "DiskInventoryZedApp.swift",
     "Utilities/Formatters.swift",
     "ViewModels",
@@ -18,19 +19,9 @@ let package = Package(
     products: [
         .executable(name: "DiskInventoryZed", targets: ["DiskInventoryZed"])
     ],
-    dependencies: [
-        .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0")
-    ],
     targets: [
         .executableTarget(
             name: "DiskInventoryZed",
-            dependencies: [
-                .product(
-                    name: "Crypto",
-                    package: "swift-crypto",
-                    condition: .when(platforms: [.linux])
-                )
-            ],
             path: "Sources",
             exclude: excludedSources
         ),

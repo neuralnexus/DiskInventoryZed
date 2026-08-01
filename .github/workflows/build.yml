@@ -29,12 +29,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .build
-          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.swift', '**/Package.resolved') }}
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.swift') }}
           restore-keys: |
             ${{ runner.os }}-spm-
 
       - name: Run unit tests
-        run: swift test
+        run: swift test -Xswiftc -strict-concurrency=complete
 
       - name: Build debug with concurrency diagnostics
         run: swift build -Xswiftc -strict-concurrency=complete
@@ -102,12 +102,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .build
-          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.swift', '**/Package.resolved') }}
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.swift') }}
           restore-keys: |
             ${{ runner.os }}-spm-
 
       - name: Run Linux unit tests
-        run: swift test
+        run: swift test -Xswiftc -strict-concurrency=complete
 
       - name: Build Linux CLI with concurrency diagnostics
         run: swift build -c release -Xswiftc -strict-concurrency=complete
@@ -121,13 +121,14 @@ jobs:
           BIN="$(swift build -c release --show-bin-path)/DiskInventoryZed"
           "$BIN" --help
           "$BIN" --json "$OUTPUT" "$INPUT"
+          test "$(stat -c '%a' "$OUTPUT")" = 600
           python3 - "$OUTPUT" <<'PY'
           import json
           import sys
 
           with open(sys.argv[1], encoding="utf-8") as source:
               scan = json.load(source)
-          assert scan["schemaVersion"] == 4
+          assert scan["schemaVersion"] == 3
           assert any(entry["name"] == "file.txt" for entry in scan["entries"])
           PY
 

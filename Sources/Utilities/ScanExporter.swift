@@ -7,32 +7,55 @@ import Foundation
 
 #if os(Linux)
 import Glibc
+private let linuxOTemporaryFile = Int32(0o20200000)
 #endif
 
 enum ScanExporter {
+    private typealias AtomicWriter = (_ body: (FileHandle) throws -> Void) throws -> Void
+
+#if os(Linux)
+    private enum UnnamedTemporaryError: Error {
+        case publicationUnavailable
+    }
+#endif
+
     /// Writes a reconstructable flat JSON document without first duplicating the entire
     /// in-memory tree. This keeps exports safe for scans containing millions of entries.
+    static func exportJSON(root: FileNode, diagnostics: ScanDiagnostics, to url: URL) throws {
+        try exportJSON(root: root, diagnostics: diagnostics) { body in
+            try writeAtomically(to: url, body: body)
+        }
+    }
+
+#if os(Linux)
     static func exportJSON(
         root: FileNode,
         diagnostics: ScanDiagnostics,
-        options: ScanOptions,
-        to url: URL
+        to destination: LinuxExportDestination
+    ) throws {
+        try exportJSON(root: root, diagnostics: diagnostics) { body in
+            try writeAtomicallyOnLinux(to: destination, body: body)
+        }
+    }
+#endif
+
+    private static func exportJSON(
+        root: FileNode,
+        diagnostics: ScanDiagnostics,
+        writer: AtomicWriter
     ) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
 
-        try writeAtomically(to: url) { handle in
+        try writer { handle in
             let formatter = ISO8601DateFormatter()
             let encodedDiagnostics = try encoder.encode(JSONDiagnostics(diagnostics))
-            let encodedOptions = try encoder.encode(options)
             let prefix = """
-            {"schemaVersion":4,"exportedAt":\(jsonString(formatter.string(from: Date()))),"rootPath":\(jsonString(root.path)),"diagnostics":
+            {"schemaVersion":3,"exportedAt":\(jsonString(formatter.string(from: Date()))),"rootPath":\(jsonString(root.path)),"diagnostics":
             """
             try write(prefix, to: handle)
             try handle.write(contentsOf: encodedDiagnostics)
-            try write(",\"options\":", to: handle)
-            try handle.write(contentsOf: encodedOptions)
             try write(",\"entries\":[", to: handle)
 
             var stack: [(node: FileNode, parentPath: String?)] = [(root, nil)]
@@ -54,31 +77,47 @@ enum ScanExporter {
     }
 
     static func importSnapshot(from url: URL) throws -> ImportedScanSnapshot {
+        try Task.checkCancellation()
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let document = try decoder.decode(JSONExportDocument.self, from: Data(contentsOf: url))
-        guard (2...4).contains(document.schemaVersion) else {
+        let data = try Data(contentsOf: url)
+        try Task.checkCancellation()
+        let document = try decoder.decode(JSONExportDocument.self, from: data)
+        try Task.checkCancellation()
+        guard (2...3).contains(document.schemaVersion) else {
             throw SnapshotImportError.unsupportedSchema(document.schemaVersion)
         }
-        if document.schemaVersion == 4, document.options == nil {
-            throw SnapshotImportError.missingScanOptions
-        }
-        guard let rootEntry = document.entries.first(where: { $0.parentPath == nil }) else {
-            throw SnapshotImportError.missingRoot
-        }
+        let rootEntry = try ScanSnapshotValidator.validate(
+            entries: document.entries,
+            declaredRootPath: document.rootPath,
+            diagnostics: document.diagnostics.scanDiagnostics
+        )
 
         return ImportedScanSnapshot(
             schemaVersion: document.schemaVersion,
             exportedAt: document.exportedAt,
             rootPath: document.rootPath ?? rootEntry.path,
             entries: document.entries,
-            diagnostics: document.diagnostics.scanDiagnostics,
-            options: document.options
+            diagnostics: document.diagnostics.scanDiagnostics
         )
     }
 
     static func exportCSV(root: FileNode, to url: URL) throws {
-        try writeAtomically(to: url) { handle in
+        try exportCSV(root: root) { body in
+            try writeAtomically(to: url, body: body)
+        }
+    }
+
+#if os(Linux)
+    static func exportCSV(root: FileNode, to destination: LinuxExportDestination) throws {
+        try exportCSV(root: root) { body in
+            try writeAtomicallyOnLinux(to: destination, body: body)
+        }
+    }
+#endif
+
+    private static func exportCSV(root: FileNode, writer: AtomicWriter) throws {
+        try writer { handle in
             try write(
                 "path,parent_path,name,kind,is_package,is_symbolic_link,allocated_bytes,logical_bytes,child_count,total_file_count,total_directory_count,created_at,modified_at,hard_link_duplicate,issue\n",
                 to: handle
@@ -118,6 +157,13 @@ enum ScanExporter {
         to destinationURL: URL,
         body: (FileHandle) throws -> Void
     ) throws {
+#if os(Linux)
+        let destination = try prepareLinuxDestination(
+            for: destinationURL,
+            excludingDirectoryIdentities: []
+        )
+        try writeAtomicallyOnLinux(to: destination, body: body)
+#else
         let fileManager = FileManager.default
         let temporaryURL = destinationURL.deletingLastPathComponent()
             .appendingPathComponent(".\(destinationURL.lastPathComponent).\(UUID().uuidString).tmp")
@@ -134,44 +180,412 @@ enum ScanExporter {
                 try handle.synchronize()
             }
 
-#if os(Linux)
-            var destinationStatus = stat()
-            let statusResult = destinationURL.path.withCString { destinationPath in
-                Glibc.lstat(destinationPath, &destinationStatus)
-            }
-            if statusResult == 0 {
-                guard destinationStatus.st_mode & mode_t(S_IFMT) != mode_t(S_IFLNK) else {
-                    throw ScanExportError.symbolicLinkDestination(destinationURL.path)
-                }
-                let permissionResult = temporaryURL.path.withCString { temporaryPath in
-                    Glibc.chmod(temporaryPath, destinationStatus.st_mode & 0o7777)
-                }
-                guard permissionResult == 0 else {
-                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-                }
-            } else if errno != ENOENT {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
-            let renameResult = temporaryURL.path.withCString { sourcePath in
-                destinationURL.path.withCString { destinationPath in
-                    Glibc.rename(sourcePath, destinationPath)
-                }
-            }
-            guard renameResult == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
-#else
             if fileManager.fileExists(atPath: destinationURL.path) {
                 _ = try fileManager.replaceItemAt(destinationURL, withItemAt: temporaryURL)
             } else {
                 try fileManager.moveItem(at: temporaryURL, to: destinationURL)
             }
-#endif
         } catch {
             try? fileManager.removeItem(at: temporaryURL)
             throw error
         }
+#endif
     }
+
+#if os(Linux)
+    static func prepareLinuxDestination(
+        for destinationURL: URL,
+        excludingDirectoryIdentities excludedIdentities: Set<String>
+    ) throws -> LinuxExportDestination {
+        let destinationName = destinationURL.lastPathComponent
+        guard !destinationName.isEmpty, destinationName != ".", destinationName != ".." else {
+            throw ScanExportError.invalidDestination(destinationURL.path)
+        }
+
+        let parentURL = destinationURL.deletingLastPathComponent()
+        let parentDescriptor = parentURL.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Glibc.open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        }
+        guard parentDescriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        do {
+            try validateDestinationParent(
+                parentDescriptor,
+                excludes: excludedIdentities,
+                displayPath: destinationURL.path
+            )
+            return LinuxExportDestination(
+                parentDescriptor: parentDescriptor,
+                name: destinationName,
+                displayPath: destinationURL.path,
+                excludedDirectoryIdentities: excludedIdentities
+            )
+        } catch {
+            Glibc.close(parentDescriptor)
+            throw error
+        }
+    }
+
+    private static func writeAtomicallyOnLinux(
+        to destination: LinuxExportDestination,
+        body: (FileHandle) throws -> Void
+    ) throws {
+        try validateDestinationParent(
+            destination.parentDescriptor,
+            excludes: destination.excludedDirectoryIdentities,
+            displayPath: destination.displayPath
+        )
+        let unnamedDescriptor = Glibc.openat(
+            destination.parentDescriptor,
+            ".",
+            O_WRONLY | linuxOTemporaryFile | O_CLOEXEC,
+            mode_t(0o600)
+        )
+        if unnamedDescriptor >= 0 {
+            do {
+                try writeUnnamedTemporary(
+                    descriptor: unnamedDescriptor,
+                    to: destination,
+                    body: body
+                )
+                return
+            } catch is UnnamedTemporaryError {
+                // Some systems allow O_TMPFILE but cannot publish it through procfs.
+            }
+        }
+        if unnamedDescriptor < 0 {
+            let unnamedError = errno
+            guard unnamedError == EOPNOTSUPP ||
+                    unnamedError == EINVAL ||
+                    unnamedError == EISDIR ||
+                    unnamedError == ENOENT else {
+                throw POSIXError(POSIXErrorCode(rawValue: unnamedError) ?? .EIO)
+            }
+        }
+
+        try validateDestinationParent(
+            destination.parentDescriptor,
+            excludes: destination.excludedDirectoryIdentities,
+            displayPath: destination.displayPath
+        )
+
+        let stagingName = ".DiskInventoryZed-\(UUID().uuidString).tmp"
+        let createStagingResult = stagingName.withCString { name in
+            Glibc.mkdirat(destination.parentDescriptor, name, mode_t(0o700))
+        }
+        guard createStagingResult == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        var stagingDescriptor: Int32 = -1
+        defer {
+            if stagingDescriptor >= 0 {
+                Glibc.close(stagingDescriptor)
+            }
+            _ = stagingName.withCString { name in
+                Glibc.unlinkat(destination.parentDescriptor, name, AT_REMOVEDIR)
+            }
+        }
+
+        var createdStagingStatus = stat()
+        let stagingStatusResult = stagingName.withCString { name in
+            Glibc.fstatat(
+                destination.parentDescriptor,
+                name,
+                &createdStagingStatus,
+                AT_SYMLINK_NOFOLLOW
+            )
+        }
+        guard stagingStatusResult == 0,
+              createdStagingStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+              createdStagingStatus.st_uid == Glibc.geteuid() else {
+            throw ScanExportError.invalidTemporaryFile
+        }
+
+        stagingDescriptor = stagingName.withCString { name in
+            Glibc.openat(
+                destination.parentDescriptor,
+                name,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+        }
+        guard stagingDescriptor >= 0,
+              Glibc.fchmod(stagingDescriptor, mode_t(0o700)) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        var openedStagingStatus = stat()
+        guard Glibc.fstat(stagingDescriptor, &openedStagingStatus) == 0,
+              openedStagingStatus.st_dev == createdStagingStatus.st_dev,
+              openedStagingStatus.st_ino == createdStagingStatus.st_ino else {
+            throw ScanExportError.invalidTemporaryFile
+        }
+
+        let temporaryName = "export"
+        let temporaryDescriptor = temporaryName.withCString { name in
+            Glibc.openat(
+                stagingDescriptor,
+                name,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                mode_t(0o600)
+            )
+        }
+        guard temporaryDescriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        var temporaryExists = true
+        defer {
+            if temporaryExists {
+                _ = temporaryName.withCString { name in
+                    Glibc.unlinkat(stagingDescriptor, name, 0)
+                }
+            }
+        }
+
+        guard Glibc.fchmod(temporaryDescriptor, mode_t(0o600)) == 0 else {
+            Glibc.close(temporaryDescriptor)
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        var temporaryStatus = stat()
+        guard Glibc.fstat(temporaryDescriptor, &temporaryStatus) == 0,
+              temporaryStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              temporaryStatus.st_mode & mode_t(0o777) == mode_t(0o600) else {
+            Glibc.close(temporaryDescriptor)
+            throw ScanExportError.invalidTemporaryFile
+        }
+
+        let handle = FileHandle(fileDescriptor: temporaryDescriptor, closeOnDealloc: true)
+        do {
+            try body(handle)
+            try handle.synchronize()
+            try handle.close()
+        } catch {
+            try? handle.close()
+            throw error
+        }
+        try Task.checkCancellation()
+
+        var destinationStatus = stat()
+        try validateDestinationParent(
+            destination.parentDescriptor,
+            excludes: destination.excludedDirectoryIdentities,
+            displayPath: destination.displayPath
+        )
+        let statusResult = destination.name.withCString { name in
+            Glibc.fstatat(
+                destination.parentDescriptor,
+                name,
+                &destinationStatus,
+                AT_SYMLINK_NOFOLLOW
+            )
+        }
+        if statusResult == 0 {
+            if destinationStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFLNK) {
+                throw ScanExportError.symbolicLinkDestination(destination.displayPath)
+            }
+            throw ScanExportError.destinationExists(destination.displayPath)
+        } else if errno != ENOENT {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        let linkResult = temporaryName.withCString { temporaryPath in
+            destination.name.withCString { destinationPath in
+                Glibc.linkat(
+                    stagingDescriptor,
+                    temporaryPath,
+                    destination.parentDescriptor,
+                    destinationPath,
+                    0
+                )
+            }
+        }
+        guard linkResult == 0 else {
+            if errno == EEXIST {
+                throw ScanExportError.destinationExists(destination.displayPath)
+            }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        do {
+            try validateDestinationParent(
+                destination.parentDescriptor,
+                excludes: destination.excludedDirectoryIdentities,
+                displayPath: destination.displayPath
+            )
+        } catch {
+            removePublishedFileIfUnchanged(
+                destination: destination,
+                expectedStatus: temporaryStatus
+            )
+            throw error
+        }
+
+        _ = Glibc.fsync(destination.parentDescriptor)
+        let unlinkResult = temporaryName.withCString { name in
+            Glibc.unlinkat(stagingDescriptor, name, 0)
+        }
+        if unlinkResult == 0 {
+            temporaryExists = false
+        }
+    }
+
+    private static func writeUnnamedTemporary(
+        descriptor: Int32,
+        to destination: LinuxExportDestination,
+        body: (FileHandle) throws -> Void
+    ) throws {
+        defer { Glibc.close(descriptor) }
+        guard Glibc.fchmod(descriptor, mode_t(0o600)) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        var temporaryStatus = stat()
+        guard Glibc.fstat(descriptor, &temporaryStatus) == 0,
+              temporaryStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              temporaryStatus.st_mode & mode_t(0o777) == mode_t(0o600) else {
+            throw ScanExportError.invalidTemporaryFile
+        }
+
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        try body(handle)
+        try handle.synchronize()
+        try Task.checkCancellation()
+
+        try validateDestinationParent(
+            destination.parentDescriptor,
+            excludes: destination.excludedDirectoryIdentities,
+            displayPath: destination.displayPath
+        )
+        var destinationStatus = stat()
+        let statusResult = destination.name.withCString { name in
+            Glibc.fstatat(
+                destination.parentDescriptor,
+                name,
+                &destinationStatus,
+                AT_SYMLINK_NOFOLLOW
+            )
+        }
+        if statusResult == 0 {
+            if destinationStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFLNK) {
+                throw ScanExportError.symbolicLinkDestination(destination.displayPath)
+            }
+            throw ScanExportError.destinationExists(destination.displayPath)
+        } else if errno != ENOENT {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        let descriptorPath = "/proc/self/fd/\(descriptor)"
+        let linkResult = descriptorPath.withCString { sourcePath in
+            destination.name.withCString { destinationPath in
+                Glibc.linkat(
+                    AT_FDCWD,
+                    sourcePath,
+                    destination.parentDescriptor,
+                    destinationPath,
+                    AT_SYMLINK_FOLLOW
+                )
+            }
+        }
+        guard linkResult == 0 else {
+            if errno == EEXIST {
+                throw ScanExportError.destinationExists(destination.displayPath)
+            }
+            if errno == ENOENT || errno == EPERM || errno == EACCES || errno == EXDEV {
+                throw UnnamedTemporaryError.publicationUnavailable
+            }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        do {
+            try validateDestinationParent(
+                destination.parentDescriptor,
+                excludes: destination.excludedDirectoryIdentities,
+                displayPath: destination.displayPath
+            )
+        } catch {
+            removePublishedFileIfUnchanged(
+                destination: destination,
+                expectedStatus: temporaryStatus
+            )
+            throw error
+        }
+        _ = Glibc.fsync(destination.parentDescriptor)
+    }
+
+    private static func removePublishedFileIfUnchanged(
+        destination: LinuxExportDestination,
+        expectedStatus: stat
+    ) {
+        var publishedStatus = stat()
+        let publishedResult = destination.name.withCString { name in
+            Glibc.fstatat(
+                destination.parentDescriptor,
+                name,
+                &publishedStatus,
+                AT_SYMLINK_NOFOLLOW
+            )
+        }
+        if publishedResult == 0,
+           publishedStatus.st_dev == expectedStatus.st_dev,
+           publishedStatus.st_ino == expectedStatus.st_ino {
+            _ = destination.name.withCString { name in
+                Glibc.unlinkat(destination.parentDescriptor, name, 0)
+            }
+        }
+    }
+
+    private static func validateDestinationParent(
+        _ parentDescriptor: Int32,
+        excludes excludedIdentities: Set<String>,
+        displayPath: String
+    ) throws {
+        guard !excludedIdentities.isEmpty else { return }
+        var descriptor = Glibc.openat(
+            parentDescriptor,
+            ".",
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { Glibc.close(descriptor) }
+
+        while true {
+            var status = stat()
+            guard Glibc.fstat(descriptor, &status) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            let identity = "\(status.st_dev)|\(status.st_ino)"
+            if excludedIdentities.contains(identity) {
+                throw ScanExportError.outputInsideScan(displayPath)
+            }
+
+            let parent = Glibc.openat(
+                descriptor,
+                "..",
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+            guard parent >= 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            var parentStatus = stat()
+            guard Glibc.fstat(parent, &parentStatus) == 0 else {
+                let errorCode = errno
+                Glibc.close(parent)
+                throw POSIXError(POSIXErrorCode(rawValue: errorCode) ?? .EIO)
+            }
+            if parentStatus.st_dev == status.st_dev,
+               parentStatus.st_ino == status.st_ino {
+                Glibc.close(parent)
+                break
+            }
+
+            Glibc.close(descriptor)
+            descriptor = parent
+        }
+    }
+#endif
 
     private static func write(_ string: String, to handle: FileHandle) throws {
         guard let data = string.data(using: .utf8) else {
@@ -191,13 +605,50 @@ enum ScanExporter {
     }
 }
 
+#if os(Linux)
+final class LinuxExportDestination {
+    let parentDescriptor: Int32
+    let name: String
+    let displayPath: String
+    let excludedDirectoryIdentities: Set<String>
+
+    init(
+        parentDescriptor: Int32,
+        name: String,
+        displayPath: String,
+        excludedDirectoryIdentities: Set<String>
+    ) {
+        self.parentDescriptor = parentDescriptor
+        self.name = name
+        self.displayPath = displayPath
+        self.excludedDirectoryIdentities = excludedDirectoryIdentities
+    }
+
+    deinit {
+        Glibc.close(parentDescriptor)
+    }
+}
+#endif
+
 enum ScanExportError: LocalizedError {
     case symbolicLinkDestination(String)
+    case destinationExists(String)
+    case invalidDestination(String)
+    case invalidTemporaryFile
+    case outputInsideScan(String)
 
     var errorDescription: String? {
         switch self {
         case .symbolicLinkDestination(let path):
             return "Refusing to replace symbolic-link export destination: \(path)"
+        case .destinationExists(let path):
+            return "Refusing to replace existing Linux export destination: \(path)"
+        case .invalidDestination(let path):
+            return "Invalid export destination: \(path)"
+        case .invalidTemporaryFile:
+            return "The private export staging file could not be verified."
+        case .outputInsideScan(let path):
+            return "Export output must be outside the scanned directory: \(path)"
         }
     }
 }
@@ -205,7 +656,7 @@ enum ScanExportError: LocalizedError {
 enum SnapshotImportError: LocalizedError {
     case unsupportedSchema(Int)
     case missingRoot
-    case missingScanOptions
+    case invalidSnapshot(String)
 
     var errorDescription: String? {
         switch self {
@@ -213,8 +664,8 @@ enum SnapshotImportError: LocalizedError {
             return "Snapshot schema \(version) is not supported."
         case .missingRoot:
             return "The snapshot does not contain a root entry."
-        case .missingScanOptions:
-            return "The snapshot does not contain its scan options."
+        case .invalidSnapshot(let reason):
+            return "The snapshot is invalid: \(reason)."
         }
     }
 }
@@ -224,7 +675,6 @@ struct JSONExportDocument: Codable {
     let exportedAt: Date
     let rootPath: String?
     let diagnostics: JSONDiagnostics
-    let options: ScanOptions?
     let entries: [JSONExportEntry]
 }
 
@@ -258,6 +708,7 @@ struct JSONDiagnostics: Codable {
             firstUnreadablePaths: firstUnreadablePaths
         )
     }
+
 }
 
 struct JSONExportEntry: Codable, Sendable {

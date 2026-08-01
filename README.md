@@ -7,7 +7,7 @@ This GPL-licensed project is not a fork of **Disk Inventory X**; it is a re-imag
 
 ## Overview
 
-Disk Inventory Zed visualizes disk usage on macOS with interactive treemaps and detailed file listings. The same concurrent scanner, storage accounting, exports, and snapshot comparison are available through a read-only command-line interface on Linux.
+Disk Inventory Zed visualizes disk usage on macOS with interactive treemaps and detailed file listings. The same storage accounting and versioned exports are available through a read-only command-line interface on Linux.
 
 <img width="1510" height="912" alt="Screenshot 2026-05-28 at 12 38 48 PM" src="https://github.com/user-attachments/assets/ab03ce74-0768-4226-ac5c-2bf87c44e8be" />
 
@@ -33,7 +33,7 @@ Disk Inventory Zed visualizes disk usage on macOS with interactive treemaps and 
 - **Global Search** — Debounced indexed search by file name or path without blocking the interface
 - **Portable Exports** — Versioned JSON and streaming CSV with reliability metadata
 - **Deep-Tree Safety** — Iterative tree building, navigation, and cleanup updates avoid recursion overflow
-- **Linux CLI** — Read-only directory scans, JSON/CSV exports, and snapshot comparison
+- **Linux CLI** — Read-only directory scans and JSON/CSV exports
 
 ## Requirements
 
@@ -134,23 +134,24 @@ Scan a directory and print a storage summary:
 DiskInventoryZed /home/user
 ```
 
-Create JSON and CSV exports, including hidden files:
+Create a JSON export that includes hidden files:
 
 ```bash
-DiskInventoryZed --show-hidden --json scan.json --csv scan.csv /home/user
+DiskInventoryZed --show-hidden --json scan.json /home/user
 ```
 
-Compare a new scan with an earlier JSON snapshot:
+Create a CSV export in a separate scan:
 
 ```bash
-DiskInventoryZed --compare previous-scan.json /home/user
+DiskInventoryZed --csv scan.csv /home/user
 ```
 
-Comparison requires a schema v4 snapshot created with matching scan options.
-
-Use `--follow-symlinks` to traverse symlinked directories with cycle protection, or
-`--skip-developer-folders` to omit folders such as `.git`, `node_modules`, and `.build`.
-The Linux CLI never deletes or moves files.
+Use `--skip-developer-folders` to omit folders such as `.git`, `node_modules`, and `.build`.
+The Linux CLI lists symlinks but never follows them, and it never deletes or moves files. Use one
+export option per scan and place the output outside the scanned directory. If any entry cannot be
+read or represented safely, the command exits nonzero and does not write the requested export.
+Linux exports are create-only, refuse to replace any existing path, and use owner-only permissions
+(`0600`). Do not route an export through a bind mount that aliases any part of the scan path.
 
 The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 
@@ -181,7 +182,7 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 - “On disk” uses allocated size when macOS provides it and Linux `stat` block accounting; “logical” is the apparent file length.
 - Totals sum file allocation and do not include filesystem directory-entry metadata.
 - Multiple hard links to the same file are shown, but their allocated storage is counted once.
-- Linux filenames that are not valid UTF-8 are reported as unreadable because exported paths are UTF-8 strings.
+- Linux filenames that are not valid UTF-8 are reported as unreadable, and prevent export, because exported paths are UTF-8 strings.
 - APFS clones can share physical blocks without exposing enough public per-file metadata to measure
   exact exclusive ownership. Disk Inventory Zed does not claim clone-level reclaimable bytes.
 - Unreadable or intentionally skipped directories are surfaced in scan diagnostics instead of

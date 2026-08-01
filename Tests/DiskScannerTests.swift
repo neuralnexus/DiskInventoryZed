@@ -1,4 +1,7 @@
-import Foundation
+@preconcurrency import Foundation
+#if os(Linux)
+import Glibc
+#endif
 import XCTest
 @testable import DiskInventoryZed
 
@@ -174,7 +177,7 @@ final class DiskScannerTests: XCTestCase {
         XCTAssertEqual(result.diagnostics.packages, 0)
     }
 
-    func testLinuxDirectorySymlinkIsFollowedOnlyWhenRequested() async throws {
+    func testLinuxDirectorySymlinkIsNeverFollowed() async throws {
         let workspace = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: workspace) }
 
@@ -187,20 +190,7 @@ final class DiskScannerTests: XCTestCase {
         let link = root.appendingPathComponent("directory-link")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
 
-        let noFollow = try await DiskScanner().scan(
-            url: root,
-            options: ScanOptions(
-                skipDeveloperFolders: false,
-                showHiddenFiles: true,
-                showPackageContents: true,
-                followSymlinks: false
-            )
-        ) { _ in }
-        let unvisitedLink = try XCTUnwrap(noFollow.root.findChild(at: link))
-        XCTAssertEqual(unvisitedLink.kind, .symbolicLink)
-        XCTAssertTrue(unvisitedLink.children.isEmpty)
-
-        let follow = try await DiskScanner().scan(
+        let result = try await DiskScanner().scan(
             url: root,
             options: ScanOptions(
                 skipDeveloperFolders: false,
@@ -209,13 +199,14 @@ final class DiskScannerTests: XCTestCase {
                 followSymlinks: true
             )
         ) { _ in }
-        let visitedLink = try XCTUnwrap(follow.root.findChild(at: link))
-        XCTAssertTrue(visitedLink.isDirectory)
-        XCTAssertTrue(visitedLink.isSymbolicLink)
-        XCTAssertEqual(visitedLink.children.map(\.displayName), ["file.txt"])
+        let unvisitedLink = try XCTUnwrap(result.root.findChild(at: link))
+        XCTAssertEqual(unvisitedLink.kind, .symbolicLink)
+        XCTAssertTrue(unvisitedLink.children.isEmpty)
+        XCTAssertEqual(result.diagnostics.symbolicLinks, 1)
+        XCTAssertEqual(result.totalFiles, 1)
     }
 
-    func testLinuxBrokenSymlinkRetainsLinkMetadataWhenFollowing() async throws {
+    func testLinuxBrokenSymlinkIsReportedAsALinkRatherThanUnreadable() async throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
 
@@ -236,44 +227,107 @@ final class DiskScannerTests: XCTestCase {
 
         XCTAssertEqual(node.kind, .symbolicLink)
         XCTAssertTrue(node.isSymbolicLink)
-        XCTAssertNotNil(node.errorDescription)
+        XCTAssertNil(node.errorDescription)
         XCTAssertEqual(result.diagnostics.symbolicLinks, 1)
-        XCTAssertEqual(result.diagnostics.unreadableItems, 1)
+        XCTAssertEqual(result.diagnostics.unreadableItems, 0)
     }
 
-    func testLinuxFollowedDirectoryAliasOwnerIsDeterministic() async throws {
+    func testLinuxRejectsSymbolicLinkScanRoot() async throws {
         let workspace = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: workspace) }
-
-        let root = workspace.appendingPathComponent("scan", isDirectory: true)
         let target = workspace.appendingPathComponent("target", isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
-        try Data("target".utf8).write(to: target.appendingPathComponent("file.txt"))
+        let rootLink = workspace.appendingPathComponent("root-link")
+        try FileManager.default.createSymbolicLink(at: rootLink, withDestinationURL: target)
 
-        let laterAlias = root.appendingPathComponent("z-link")
-        let expectedOwner = root.appendingPathComponent("a-link")
-        try FileManager.default.createSymbolicLink(at: laterAlias, withDestinationURL: target)
-        try FileManager.default.createSymbolicLink(at: expectedOwner, withDestinationURL: target)
-
-        for _ in 0..<10 {
-            let result = try await DiskScanner().scan(
-                url: root,
-                options: ScanOptions(
-                    skipDeveloperFolders: false,
-                    showHiddenFiles: true,
-                    showPackageContents: true,
-                    followSymlinks: true
-                )
-            ) { _ in }
-            let owner = try XCTUnwrap(result.root.findChild(at: expectedOwner))
-            let revisited = try XCTUnwrap(result.root.findChild(at: laterAlias))
-
-            XCTAssertEqual(owner.children.map(\.displayName), ["file.txt"])
-            XCTAssertTrue(revisited.children.isEmpty)
-            XCTAssertNotNil(revisited.errorDescription)
-            XCTAssertEqual(result.diagnostics.revisitedDirectories, 1)
+        do {
+            _ = try await DiskScanner().scan(url: rootLink, options: .default) { _ in }
+            XCTFail("Expected a symbolic-link scan root to be rejected")
+        } catch {
+            // Expected.
         }
+    }
+
+    func testLinuxRejectsSymbolicLinkInScanRootAncestors() async throws {
+        let workspace = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let realRoot = workspace.appendingPathComponent("real", isDirectory: true)
+        let nested = realRoot.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        let alias = workspace.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: realRoot)
+        let aliasedNested = alias.appendingPathComponent("nested", isDirectory: true)
+
+        do {
+            _ = try await DiskScanner().scan(url: aliasedNested, options: .default) { _ in }
+            XCTFail("Expected a symlinked scan-root ancestor to be rejected")
+        } catch {
+            // Expected.
+        }
+    }
+
+    func testLinuxAllowsExecuteOnlyScanRootAncestor() async throws {
+        let workspace = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let ancestor = workspace.appendingPathComponent("searchable", isDirectory: true)
+        let root = ancestor.appendingPathComponent("scan", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("content".utf8).write(to: root.appendingPathComponent("file.txt"))
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o111],
+            ofItemAtPath: ancestor.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: ancestor.path
+            )
+        }
+
+        let result = try await DiskScanner().scan(url: root, options: .default) { _ in }
+
+        XCTAssertEqual(result.totalFiles, 1)
+    }
+
+    func testLinuxNonUTF8NameIsReportedWithoutCrashing() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directoryDescriptor = root.path.withCString {
+            Glibc.open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        }
+        XCTAssertGreaterThanOrEqual(directoryDescriptor, 0)
+        let invalidName = [CChar(bitPattern: 0xFF), CChar(0)]
+        let fileDescriptor = invalidName.withUnsafeBufferPointer {
+            Glibc.openat(
+                directoryDescriptor,
+                $0.baseAddress!,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                mode_t(0o600)
+            )
+        }
+        XCTAssertGreaterThanOrEqual(fileDescriptor, 0)
+        Glibc.close(fileDescriptor)
+        defer {
+            _ = invalidName.withUnsafeBufferPointer {
+                Glibc.unlinkat(directoryDescriptor, $0.baseAddress!, 0)
+            }
+            Glibc.close(directoryDescriptor)
+        }
+
+        let result = try await DiskScanner().scan(
+            url: root,
+            options: ScanOptions(
+                skipDeveloperFolders: false,
+                showHiddenFiles: true,
+                showPackageContents: true,
+                followSymlinks: false
+            )
+        ) { _ in }
+
+        XCTAssertEqual(result.totalFiles, 0)
+        XCTAssertEqual(result.diagnostics.unreadableItems, 1)
+        XCTAssertEqual(result.diagnostics.firstUnreadablePaths.count, 1)
+        XCTAssertTrue(result.diagnostics.firstUnreadablePaths[0].contains("non-UTF-8"))
     }
 #endif
 

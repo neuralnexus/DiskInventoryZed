@@ -3,13 +3,8 @@
 // Copyright (C) 2026 Matt Ivan
 // Licensed under GPL-3.0-or-later.
 
-import Foundation
-
-#if canImport(CryptoKit)
 import CryptoKit
-#else
-import Crypto
-#endif
+import Foundation
 
 struct DuplicateVerificationProgress: Sendable, Equatable {
     enum Phase: String, Equatable, Sendable {

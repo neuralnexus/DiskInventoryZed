@@ -68,6 +68,24 @@ struct ExtensionStat: Identifiable, Hashable {
     }
 }
 
+struct DuplicateCandidate: Identifiable, Hashable, Sendable {
+    let id: String
+    let fileSize: Int64
+    let files: [FileNode]
+
+    var displayName: String {
+        let names = Set(files.map { $0.displayName.lowercased() })
+        if names.count == 1, let name = files.first?.displayName {
+            return name
+        }
+        return "\(files.count) same-sized files"
+    }
+
+    var potentialSavings: Int64 {
+        files.dropFirst().reduce(Int64(0)) { $0 + $1.allocatedSize }
+    }
+}
+
 @MainActor
 final class AppViewModel: ObservableObject {
     @Published private(set) var rootNode: FileNode?
@@ -135,8 +153,8 @@ final class AppViewModel: ObservableObject {
     private var searchTask: Task<Void, Never>?
     private var duplicateVerificationTask: Task<Void, Never>?
     private var comparisonTask: Task<Void, Never>?
+    private var comparisonOperationID: UUID?
     private var searchIndex: [SearchIndexEntry] = []
-    private var currentScanOptions = ScanOptions.default
 
     var canNavigateBack: Bool { navigationIndex > 0 }
     var canNavigateForward: Bool { navigationIndex >= 0 && navigationIndex < navigationStack.count - 1 }
@@ -220,6 +238,8 @@ final class AppViewModel: ObservableObject {
         searchTask?.cancel()
         duplicateVerificationTask?.cancel()
         comparisonTask?.cancel()
+        comparisonTask = nil
+        comparisonOperationID = nil
 
         let scanID = UUID()
         activeScanID = scanID
@@ -269,7 +289,6 @@ final class AppViewModel: ObservableObject {
                 self.totalDirectories = result.totalDirectories
                 self.scanDuration = result.duration
                 self.scanDiagnostics = result.diagnostics
-                self.currentScanOptions = options
                 self.scanStatusPath = result.root.path
                 self.isScanning = false
                 self.scanProgressFiles = 0
@@ -485,33 +504,41 @@ final class AppViewModel: ObservableObject {
     func compareWithSnapshot(at url: URL) {
         comparisonTask?.cancel()
         guard let rootNode else { return }
-        let options = currentScanOptions
-        let diagnostics = scanDiagnostics
+        let operationID = UUID()
+        comparisonOperationID = operationID
         isComparingSnapshot = true
         scanComparison = nil
 
         comparisonTask = Task { [weak self] in
+            let worker = Task.detached(priority: .userInitiated) {
+                let snapshot = try ScanExporter.importSnapshot(from: url)
+                return try ScanSnapshotComparator.compare(current: rootNode, with: snapshot)
+            }
             do {
-                let comparison = try await Task.detached(priority: .userInitiated) {
-                    let snapshot = try ScanExporter.importSnapshot(from: url)
-                    return try ScanSnapshotComparator.compare(
-                        current: rootNode,
-                        options: options,
-                        diagnostics: diagnostics,
-                        with: snapshot
-                    )
-                }.value
+                let comparison = try await withTaskCancellationHandler {
+                    try await worker.value
+                } onCancel: {
+                    worker.cancel()
+                }
 
                 try Task.checkCancellation()
-                guard let self, self.rootNode === rootNode else { return }
+                guard let self,
+                      self.comparisonOperationID == operationID,
+                      self.rootNode === rootNode else { return }
                 self.scanComparison = comparison
                 self.isComparingSnapshot = false
+                self.comparisonTask = nil
+                self.comparisonOperationID = nil
             } catch is CancellationError {
-                guard let self else { return }
+                guard let self, self.comparisonOperationID == operationID else { return }
                 self.isComparingSnapshot = false
+                self.comparisonTask = nil
+                self.comparisonOperationID = nil
             } catch {
-                guard let self else { return }
+                guard let self, self.comparisonOperationID == operationID else { return }
                 self.isComparingSnapshot = false
+                self.comparisonTask = nil
+                self.comparisonOperationID = nil
                 self.presentError("Failed to compare snapshot: \(error.localizedDescription)")
             }
         }
@@ -520,6 +547,7 @@ final class AppViewModel: ObservableObject {
     func clearComparison() {
         comparisonTask?.cancel()
         comparisonTask = nil
+        comparisonOperationID = nil
         scanComparison = nil
         isComparingSnapshot = false
     }
@@ -527,17 +555,11 @@ final class AppViewModel: ObservableObject {
     func exportScanData(to url: URL) {
         guard let rootNode else { return }
         let diagnostics = scanDiagnostics
-        let options = currentScanOptions
 
         Task {
             do {
                 try await Task.detached(priority: .userInitiated) {
-                    try ScanExporter.exportJSON(
-                        root: rootNode,
-                        diagnostics: diagnostics,
-                        options: options,
-                        to: url
-                    )
+                    try ScanExporter.exportJSON(root: rootNode, diagnostics: diagnostics, to: url)
                 }.value
             } catch {
                 self.errorMessage = "Failed to export JSON: \(error.localizedDescription)"
