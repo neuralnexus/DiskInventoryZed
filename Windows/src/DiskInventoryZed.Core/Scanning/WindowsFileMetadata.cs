@@ -14,10 +14,13 @@ internal enum ReparsePointClassification
 }
 
 internal readonly record struct FileMetadata(
+    long LogicalSize,
     long AllocatedSize,
     FileIdentity? Identity,
     uint HardLinkCount,
     bool AllocatedSizeIsApproximate,
+    DateTimeOffset? CreationDate,
+    DateTimeOffset? ModificationDate,
     ReparsePointClassification ReparsePointClassification);
 
 internal static partial class WindowsFileMetadata
@@ -30,6 +33,8 @@ internal static partial class WindowsFileMetadata
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileFlagOpenReparsePoint = 0x00200000;
     private const uint IoReparseTagNameSurrogate = 0x20000000;
+    private const int FileBasicInfoClass = 0;
+    private const int FileStandardInfoClass = 1;
     private const int FileAttributeTagInfoClass = 9;
     private const int FileIdInfoClass = 18;
 
@@ -43,21 +48,33 @@ internal static partial class WindowsFileMetadata
         {
             return new FileMetadata(
                 logicalSize,
+                logicalSize,
                 null,
                 1,
                 true,
+                null,
+                null,
                 isReparsePoint
                     ? ReparsePointClassification.NameSurrogate
                     : ReparsePointClassification.NotReparsePoint);
         }
 
         var nativePath = ToExtendedPath(path);
-        var allocatedSize = TryGetAllocatedSize(nativePath, out var measuredSize)
-            ? measuredSize
-            : logicalSize;
         var reparseClassification = isReparsePoint
             ? ReadReparsePointClassification(nativePath, isDirectory)
             : ReparsePointClassification.NotReparsePoint;
+        if (reparseClassification == ReparsePointClassification.Unknown)
+        {
+            return new FileMetadata(
+                0,
+                0,
+                null,
+                1,
+                false,
+                null,
+                null,
+                reparseClassification);
+        }
 
         using var handle = CreateFileW(
             nativePath,
@@ -69,7 +86,39 @@ internal static partial class WindowsFileMetadata
             IntPtr.Zero);
         if (handle.IsInvalid)
         {
-            return new FileMetadata(allocatedSize, null, 1, measuredSize < 0, reparseClassification);
+            return new FileMetadata(
+                logicalSize,
+                logicalSize,
+                null,
+                1,
+                true,
+                null,
+                null,
+                reparseClassification);
+        }
+
+        var hasStandardInfo = GetFileStandardInformationByHandle(
+            handle,
+            FileStandardInfoClass,
+            out var standardInformation,
+            (uint)sizeof(FileStandardInfo));
+        var measuredLogicalSize = hasStandardInfo && !isDirectory
+            ? Math.Max(0, standardInformation.EndOfFile)
+            : logicalSize;
+        var measuredAllocatedSize = hasStandardInfo && !isDirectory
+            ? Math.Max(0, standardInformation.AllocationSize)
+            : isDirectory ? 0 : logicalSize;
+
+        DateTimeOffset? creationDate = null;
+        DateTimeOffset? modificationDate = null;
+        if (GetFileBasicInformationByHandle(
+                handle,
+                FileBasicInfoClass,
+                out var basicInformation,
+                (uint)sizeof(FileBasicInfo)))
+        {
+            creationDate = FromFileTime(basicInformation.CreationTime);
+            modificationDate = FromFileTime(basicInformation.LastWriteTime);
         }
 
         FileIdentity? identity = null;
@@ -84,14 +133,17 @@ internal static partial class WindowsFileMetadata
             identity = new FileIdentity(idInformation.VolumeSerialNumber, idInformation.FileId);
         }
 
-        var hardLinkCount = GetFileInformationByHandle(handle, out var information)
-            ? information.NumberOfLinks
-            : 1;
+        var hardLinkCount = hasStandardInfo
+            ? standardInformation.NumberOfLinks
+            : GetFileInformationByHandle(handle, out var information) ? information.NumberOfLinks : 1;
         return new FileMetadata(
-            allocatedSize,
+            measuredLogicalSize,
+            measuredAllocatedSize,
             identity,
             hardLinkCount,
-            measuredSize < 0,
+            !hasStandardInfo,
+            creationDate,
+            modificationDate,
             reparseClassification);
     }
 
@@ -122,19 +174,21 @@ internal static partial class WindowsFileMetadata
             : ReparsePointClassification.Other;
     }
 
-    private static bool TryGetAllocatedSize(string path, out long allocatedSize)
+    private static DateTimeOffset? FromFileTime(long value)
     {
-        Marshal.SetLastPInvokeError(0);
-        var low = GetCompressedFileSizeW(path, out var high);
-        var error = Marshal.GetLastPInvokeError();
-        if (low == uint.MaxValue && error != 0)
+        if (value <= 0)
         {
-            allocatedSize = -1;
-            return false;
+            return null;
         }
 
-        allocatedSize = checked((long)(((ulong)high << 32) | low));
-        return true;
+        try
+        {
+            return new DateTimeOffset(DateTime.FromFileTimeUtc(value), TimeSpan.Zero);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return null;
+        }
     }
 
     private static string ToExtendedPath(string path)
@@ -169,6 +223,22 @@ internal static partial class WindowsFileMetadata
 
     [LibraryImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool GetFileStandardInformationByHandle(
+        SafeFileHandle file,
+        int informationClass,
+        out FileStandardInfo information,
+        uint bufferSize);
+
+    [LibraryImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool GetFileBasicInformationByHandle(
+        SafeFileHandle file,
+        int informationClass,
+        out FileBasicInfo information,
+        uint bufferSize);
+
+    [LibraryImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool GetFileIdInformationByHandle(
         SafeFileHandle file,
         int informationClass,
@@ -182,9 +252,6 @@ internal static partial class WindowsFileMetadata
         int informationClass,
         out FileAttributeTagInfo information,
         uint bufferSize);
-
-    [LibraryImport("kernel32.dll", EntryPoint = "GetCompressedFileSizeW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
-    private static partial uint GetCompressedFileSizeW(string fileName, out uint fileSizeHigh);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct ByHandleFileInformation
@@ -206,6 +273,26 @@ internal static partial class WindowsFileMetadata
     {
         public ulong VolumeSerialNumber;
         public Guid FileId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileStandardInfo
+    {
+        public long AllocationSize;
+        public long EndOfFile;
+        public uint NumberOfLinks;
+        public byte DeletePending;
+        public byte Directory;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileBasicInfo
+    {
+        public long CreationTime;
+        public long LastAccessTime;
+        public long LastWriteTime;
+        public long ChangeTime;
+        public uint FileAttributes;
     }
 
     [StructLayout(LayoutKind.Sequential)]

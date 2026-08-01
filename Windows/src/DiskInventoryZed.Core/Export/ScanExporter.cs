@@ -12,6 +12,7 @@ public static class ScanExporter
         FileNode root,
         ScanDiagnostics diagnostics,
         string destinationPath,
+        ScanOptions? options = null,
         CancellationToken cancellationToken = default)
     {
         await WriteAtomicallyAsync(destinationPath, async stream =>
@@ -22,6 +23,7 @@ public static class ScanExporter
             writer.WriteString("exportedAt", JsonDate(DateTimeOffset.UtcNow));
             writer.WriteString("rootPath", root.FullPath);
             WriteDiagnostics(writer, diagnostics);
+            WriteOptions(writer, options);
             writer.WriteStartArray("entries");
 
             var stack = new Stack<(FileNode Node, string? ParentPath)>();
@@ -50,7 +52,7 @@ public static class ScanExporter
         await WriteAtomicallyAsync(destinationPath, async stream =>
         {
             await using var writer = new StreamWriter(stream, new UTF8Encoding(false), 64 * 1024, leaveOpen: true);
-            await writer.WriteLineAsync("path,parent_path,name,kind,is_package,is_symbolic_link,allocated_bytes,logical_bytes,child_count,total_file_count,total_directory_count,created_at,modified_at,hard_link_duplicate,issue");
+            await writer.WriteLineAsync("path,parent_path,name,kind,is_package,is_symbolic_link,allocated_bytes,logical_bytes,child_count,total_file_count,total_directory_count,created_at,modified_at,hard_link_duplicate,hard_link_identity_unavailable,issue");
             var stack = new Stack<(FileNode Node, string? ParentPath)>();
             stack.Push((root, null));
             while (stack.TryPop(out var item))
@@ -73,6 +75,7 @@ public static class ScanExporter
                     Csv(node.CreationDate?.ToString("O") ?? string.Empty),
                     Csv(node.ModificationDate?.ToString("O") ?? string.Empty),
                     node.IsHardLinkDuplicate ? "true" : "false",
+                    node.HasUnverifiedHardLinks ? "true" : "false",
                     Csv(node.Issue ?? string.Empty)
                 };
                 await writer.WriteLineAsync(string.Join(',', fields).AsMemory(), cancellationToken);
@@ -91,9 +94,11 @@ public static class ScanExporter
         writer.WriteStartObject("diagnostics");
         writer.WriteNumber("unreadableItems", diagnostics.UnreadableItems);
         writer.WriteNumber("skippedDirectories", diagnostics.SkippedDirectories);
+        writer.WriteNumber("hiddenItemsExcluded", diagnostics.HiddenItemsExcluded);
         writer.WriteNumber("symbolicLinks", diagnostics.SymbolicLinks);
         writer.WriteNumber("packages", diagnostics.Packages);
         writer.WriteNumber("duplicateHardLinks", diagnostics.DuplicateHardLinks);
+        writer.WriteNumber("unverifiedHardLinks", diagnostics.UnverifiedHardLinks);
         writer.WriteNumber("revisitedDirectories", diagnostics.RevisitedDirectories);
         writer.WriteNumber("approximateAllocatedSizes", diagnostics.ApproximateAllocatedSizes);
         writer.WriteStartArray("firstUnreadablePaths");
@@ -103,6 +108,20 @@ public static class ScanExporter
         }
 
         writer.WriteEndArray();
+        writer.WriteEndObject();
+    }
+
+    private static void WriteOptions(Utf8JsonWriter writer, ScanOptions? options)
+    {
+        if (options is null)
+        {
+            return;
+        }
+
+        writer.WriteStartObject("scanOptions");
+        writer.WriteBoolean("skipDeveloperFolders", options.SkipDeveloperFolders);
+        writer.WriteBoolean("showHiddenFiles", options.ShowHiddenFiles);
+        writer.WriteBoolean("followReparsePoints", options.FollowReparsePoints);
         writer.WriteEndObject();
     }
 
@@ -139,6 +158,7 @@ public static class ScanExporter
         }
 
         writer.WriteBoolean("isHardLinkDuplicate", node.IsHardLinkDuplicate);
+        writer.WriteBoolean("hardLinkIdentityUnavailable", node.HasUnverifiedHardLinks);
         if (node.Issue is not null)
         {
             writer.WriteString("issue", node.Issue);
@@ -156,7 +176,17 @@ public static class ScanExporter
         _ => "file"
     };
 
-    private static string Csv(string value) => $"\"{value.Replace("\"", "\"\"")}\"";
+    private static string Csv(string value)
+    {
+        var firstMeaningful = value.FirstOrDefault(character =>
+            !char.IsWhiteSpace(character) && character != '\uFEFF');
+        if (firstMeaningful is '=' or '+' or '-' or '@')
+        {
+            value = "'" + value;
+        }
+
+        return $"\"{value.Replace("\"", "\"\"")}\"";
+    }
 
     private static string JsonDate(DateTimeOffset value) =>
         value.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);

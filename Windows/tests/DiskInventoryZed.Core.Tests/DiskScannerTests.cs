@@ -68,6 +68,25 @@ public sealed partial class DiskScannerTests
     }
 
     [Fact]
+    public async Task WindowsAllocationComesFromHandleMetadata()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using var fixture = new TemporaryDirectory();
+        await File.WriteAllBytesAsync(Path.Combine(fixture.Path, "one-byte.bin"), [0x2A]);
+
+        var result = await new DiskScanner().ScanAsync(fixture.Path, new ScanOptions(ShowHiddenFiles: true));
+        var file = Assert.Single(result.Root.Children);
+
+        Assert.Equal(1, file.LogicalSize);
+        Assert.True(file.AllocatedSize >= file.LogicalSize);
+        Assert.Equal(0, result.Diagnostics.ApproximateAllocatedSizes);
+    }
+
+    [Fact]
     public async Task WindowsJunctionsAreNotFollowedByDefault()
     {
         if (!OperatingSystem.IsWindows())
@@ -100,6 +119,33 @@ public sealed partial class DiskScannerTests
     }
 
     [Fact]
+    public async Task WindowsJunctionCannotBypassRootLinkPolicy()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using var fixture = new TemporaryDirectory();
+        var target = Directory.CreateDirectory(Path.Combine(fixture.Path, "target"));
+        var junction = Path.Combine(fixture.Path, "junction");
+        using var process = Process.Start(new ProcessStartInfo
+        {
+            FileName = "cmd.exe",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            ArgumentList = { "/d", "/c", "mklink", "/J", junction, target.FullName }
+        });
+        Assert.NotNull(process);
+        await process.WaitForExitAsync();
+        Assert.Equal(0, process.ExitCode);
+
+        var error = await Assert.ThrowsAsync<DiskScanException>(() => new DiskScanner().ScanAsync(junction));
+
+        Assert.Contains("Enable Follow links", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task WindowsHiddenAttributeControlsEnumeration()
     {
         if (!OperatingSystem.IsWindows())
@@ -116,7 +162,9 @@ public sealed partial class DiskScannerTests
         var hiddenIncluded = await new DiskScanner().ScanAsync(fixture.Path, new ScanOptions(ShowHiddenFiles: true));
 
         Assert.DoesNotContain(hiddenExcluded.Root.Children, node => node.DisplayName == "hidden.bin");
+        Assert.Equal(1, hiddenExcluded.Diagnostics.HiddenItemsExcluded);
         Assert.Contains(hiddenIncluded.Root.Children, node => node.DisplayName == "hidden.bin");
+        Assert.Equal(0, hiddenIncluded.Diagnostics.HiddenItemsExcluded);
     }
 
     [LibraryImport("kernel32.dll", EntryPoint = "CreateHardLinkW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]

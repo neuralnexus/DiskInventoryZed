@@ -29,6 +29,7 @@ public sealed class FileNode : IEquatable<FileNode>
         DateTimeOffset? modificationDate = null,
         bool isSymbolicLink = false,
         bool isHardLinkDuplicate = false,
+        bool hasUnverifiedHardLinks = false,
         string? issue = null,
         int? totalFileCount = null,
         int? totalDirectoryCount = null)
@@ -43,6 +44,7 @@ public sealed class FileNode : IEquatable<FileNode>
         ModificationDate = modificationDate;
         IsSymbolicLink = isSymbolicLink || kind == FileNodeKind.SymbolicLink;
         IsHardLinkDuplicate = isHardLinkDuplicate;
+        HasUnverifiedHardLinks = hasUnverifiedHardLinks;
         Issue = issue;
 
         var childArray = children?.ToArray() ?? [];
@@ -62,6 +64,7 @@ public sealed class FileNode : IEquatable<FileNode>
     public bool IsContainer => Kind is FileNodeKind.Directory or FileNodeKind.Package;
     public bool IsSymbolicLink { get; }
     public bool IsHardLinkDuplicate { get; }
+    public bool HasUnverifiedHardLinks { get; }
     public bool IsUnreadable => Issue is not null;
     public string? Issue { get; }
     public string? Extension => IsDirectory

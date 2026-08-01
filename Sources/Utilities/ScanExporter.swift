@@ -137,7 +137,9 @@ enum ScanExporter {
     }
 
     private static func csvField(_ value: String) -> String {
-        "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
+        let firstMeaningful = value.first { !$0.isWhitespace && $0 != "\u{FEFF}" }
+        let safeValue = firstMeaningful.map { "=+-@".contains($0) } == true ? "'" + value : value
+        return "\"\(safeValue.replacingOccurrences(of: "\"", with: "\"\""))\""
     }
 
     private static func jsonString(_ value: String) -> String {

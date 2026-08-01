@@ -13,25 +13,102 @@ permissions:
 
 concurrency:
   group: disk-inventory-zed-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout release metadata
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tagged release source
+        id: release
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            exit 0
+          fi
+          VERSION="$(python3 - <<'PY'
+          import os
+          import plistlib
+          import re
+          import xml.etree.ElementTree as ET
+
+          with open("Resources/Info.plist", "rb") as source:
+              mac_version = plistlib.load(source)["CFBundleShortVersionString"]
+          windows_version = ET.parse(
+              "Windows/src/DiskInventoryZed.Windows/DiskInventoryZed.Windows.csproj"
+          ).findtext(".//Version")
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", mac_version):
+              raise SystemExit(f"Invalid application version: {mac_version!r}")
+          if windows_version != mac_version:
+              raise SystemExit(
+                  f"Version mismatch: macOS={mac_version!r}, Windows={windows_version!r}"
+              )
+          expected_tag = f"v{mac_version}"
+          if os.environ["GITHUB_REF_NAME"] != expected_tag:
+              raise SystemExit(
+                  f"Release tag {os.environ['GITHUB_REF_NAME']!r} must equal {expected_tag!r}"
+              )
+          print(mac_version)
+          PY
+          )"
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main || {
+            echo "Release tag $GITHUB_REF_NAME is not on origin/main." >&2
+            exit 1
+          }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+
   build:
-    runs-on: macos-latest
+    needs: validate
+    runs-on: macos-15
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-      
-      - name: Cache Swift packages
-        uses: actions/cache@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          path: .build
-          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.swift') }}
-          restore-keys: |
-            ${{ runner.os }}-spm-
+          persist-credentials: false
+
+      - name: Validate tagged-release signing configuration
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          SIGNING_CERTIFICATE: ${{ secrets.APPLE_SIGNING_CERTIFICATE_BASE64 }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          for value in \
+            "$SIGNING_CERTIFICATE" \
+            "$SIGNING_CERTIFICATE_PASSWORD" \
+            "$KEYCHAIN_PASSWORD" \
+            "$SIGNING_IDENTITY" \
+            "$APPLE_ID" \
+            "$APPLE_TEAM_ID" \
+            "$APPLE_APP_PASSWORD"; do
+            if [ -z "$value" ]; then
+              echo "Tagged releases require complete Apple signing and notarization credentials." >&2
+              exit 1
+            fi
+          done
 
       - name: Run unit tests
         run: swift test
@@ -42,65 +119,98 @@ jobs:
       - name: Build universal binary
         run: |
           swift build -c release --arch arm64 --arch x86_64
+
+      - name: Install Apple signing certificate
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          SIGNING_CERTIFICATE: ${{ secrets.APPLE_SIGNING_CERTIFICATE_BASE64 }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/DiskInventoryZed-signing.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/DiskInventoryZed-signing.keychain-db"
+          printf '%s' "$SIGNING_CERTIFICATE" | base64 -D > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$SIGNING_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -F "$SIGNING_IDENTITY"
       
       - name: Package and verify app bundle
         env:
-          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        run: ./scripts/package-app.sh
+          RELEASE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          SIGNING_IDENTITY="-"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            SIGNING_IDENTITY="$RELEASE_SIGNING_IDENTITY"
+          fi
+          SIGNING_IDENTITY="$SIGNING_IDENTITY" ./scripts/package-app.sh
       
       - name: Create DMG
         run: |
           ./scripts/create-dmg.sh
 
-      - name: Notarize tagged release when credentials are configured
+      - name: Notarize tagged release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: ./scripts/notarize.sh DiskInventoryZed-*.dmg
+
+      - name: Remove Apple signing certificate
+        if: always() && startsWith(github.ref, 'refs/tags/v')
         run: |
-          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_TEAM_ID" ] && [ -n "$APPLE_APP_PASSWORD" ]; then
-            ./scripts/notarize.sh DiskInventoryZed-*.dmg
-          else
-            echo "Notarization credentials are not configured; publishing an unnotarized build."
-          fi
+          security delete-keychain "$RUNNER_TEMP/DiskInventoryZed-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/DiskInventoryZed-signing.p12"
+
+      - name: Archive app bundle artifact
+        run: ditto -c -k --sequesterRsrc --keepParent DiskInventoryZed.app DiskInventoryZed.app.zip
 
       - name: Generate release checksums
         run: shasum -a 256 DiskInventoryZed-*.dmg > DiskInventoryZed-checksums.txt
 
       - name: Upload DMG artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: DiskInventoryZed-DMG
           path: |
             DiskInventoryZed-*.dmg
             DiskInventoryZed-checksums.txt
           if-no-files-found: error
+          overwrite: true
       
       - name: Upload app bundle artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: DiskInventoryZed-App
-          path: DiskInventoryZed.app
+          path: DiskInventoryZed.app.zip
           if-no-files-found: error
+          overwrite: true
 
   windows:
-    runs-on: windows-latest
+    needs: validate
+    runs-on: windows-2025
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install .NET 8 SDK
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
-          dotnet-version: 8.0.x
+          dotnet-version: 8.0.423
 
       - name: Restore Windows solution
         shell: pwsh
-        run: dotnet restore Windows/DiskInventoryZed.Windows.sln
+        run: dotnet restore Windows/DiskInventoryZed.Windows.sln --locked-mode
 
       - name: Run Windows core and NTFS tests
         shell: pwsh
@@ -115,85 +225,157 @@ jobs:
         run: |
           ./Windows/scripts/package.ps1 -Runtime win-x64
           ./Windows/scripts/package.ps1 -Runtime win-arm64
-          Get-ChildItem artifacts/windows/*.zip | ForEach-Object {
+          $archives = @(Get-ChildItem artifacts/windows/*.zip)
+          if ($archives.Count -ne 2) {
+            throw "Expected exactly two Windows archives, found $($archives.Count)."
+          }
+          $archives | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $($_.Name)"
           } | Set-Content artifacts/windows/DiskInventoryZed-Windows-checksums.txt
 
       - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: DiskInventoryZed-Windows
           path: |
             artifacts/windows/*.zip
             artifacts/windows/DiskInventoryZed-Windows-checksums.txt
           if-no-files-found: error
+          overwrite: true
 
   release:
-    needs: [build, windows]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: [validate, build, windows]
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: release
     permissions:
       contents: write
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     
     steps:
-      - name: Checkout release metadata
-        uses: actions/checkout@v4
-
-      - name: Resolve release version
-        id: version
-        shell: bash
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          else
-            VERSION="$(python3 - <<'PY'
-            import plistlib
-            with open("Resources/Info.plist", "rb") as source:
-                print(plistlib.load(source)["CFBundleShortVersionString"])
-            PY
-            )"
-            echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Check whether release exists
-        id: existing
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ steps.version.outputs.tag }}
-        run: |
-          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Download artifacts
-        if: steps.existing.outputs.publish == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: DiskInventoryZed-DMG
 
       - name: Download Windows artifacts
-        if: steps.existing.outputs.publish == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: DiskInventoryZed-Windows
           path: windows-release
-      
-      - name: Create Release
-        if: steps.existing.outputs.publish == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          files: |
-            DiskInventoryZed-*.dmg
-            DiskInventoryZed-checksums.txt
-            windows-release/*.zip
-            windows-release/DiskInventoryZed-Windows-checksums.txt
-          generate_release_notes: true
+
+      - name: Verify release artifacts
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          test -s "DiskInventoryZed-$VERSION.dmg"
+          test -s DiskInventoryZed-checksums.txt
+          test -s "windows-release/DiskInventoryZed-Windows-v$VERSION-win-x64.zip"
+          test -s "windows-release/DiskInventoryZed-Windows-v$VERSION-win-arm64.zip"
+          test -s windows-release/DiskInventoryZed-Windows-checksums.txt
+          test "$(wc -l < DiskInventoryZed-checksums.txt)" -eq 1
+          test "$(wc -l < windows-release/DiskInventoryZed-Windows-checksums.txt)" -eq 2
+          sha256sum --check DiskInventoryZed-checksums.txt
+          (cd windows-release && sha256sum --check DiskInventoryZed-Windows-checksums.txt)
+
+      - name: Create and verify draft release
+        env:
+          TAG_NAME: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          MARKER="<!-- disk-inventory-zed-workflow-run:$GITHUB_RUN_ID -->"
+          RELEASE_JSON="$RUNNER_TEMP/disk-inventory-zed-release.json"
+          REPOSITORY_NAME="${GITHUB_REPOSITORY#*/}"
+          gh api graphql \
+            -f query='query($owner:String!, $name:String!, $tag:String!) { repository(owner:$owner, name:$name) { release(tagName:$tag) { databaseId isDraft description tagName } } }' \
+            -f owner="$GITHUB_REPOSITORY_OWNER" \
+            -f name="$REPOSITORY_NAME" \
+            -f tag="$TAG_NAME" > "$RELEASE_JSON"
+          EXISTING_DRAFT="$(MARKER="$MARKER" RELEASE_JSON="$RELEASE_JSON" python3 - <<'PY'
+          import json
+          import os
+
+          with open(os.environ["RELEASE_JSON"], encoding="utf-8") as source:
+              release = json.load(source)["data"]["repository"]["release"]
+          if release is None:
+              print("false")
+              raise SystemExit
+          if not release.get("isDraft"):
+              raise SystemExit("A published release already exists; refusing to modify it.")
+          if os.environ["MARKER"] not in (release.get("description") or ""):
+              raise SystemExit("The existing draft is not owned by this workflow run.")
+          print("true")
+          PY
+          )"
+          ASSETS=(
+            "DiskInventoryZed-$VERSION.dmg"
+            DiskInventoryZed-checksums.txt
+            "windows-release/DiskInventoryZed-Windows-v$VERSION-win-x64.zip"
+            "windows-release/DiskInventoryZed-Windows-v$VERSION-win-arm64.zip"
+            windows-release/DiskInventoryZed-Windows-checksums.txt
+          )
+          if [ "$EXISTING_DRAFT" = true ]; then
+            gh release upload "$TAG_NAME" "${ASSETS[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG_NAME" "${ASSETS[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --generate-notes \
+              --notes "$MARKER" \
+              --title "Disk Inventory Zed $VERSION"
+          fi
+          mkdir release-download
+          gh release download "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --dir release-download
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          expected = {
+              f"DiskInventoryZed-{version}.dmg",
+              "DiskInventoryZed-checksums.txt",
+              f"DiskInventoryZed-Windows-v{version}-win-x64.zip",
+              f"DiskInventoryZed-Windows-v{version}-win-arm64.zip",
+              "DiskInventoryZed-Windows-checksums.txt",
+          }
+          actual = {path.name for path in Path("release-download").iterdir() if path.is_file()}
+          if actual != expected:
+              raise SystemExit(f"Draft release assets differ: expected={sorted(expected)}, actual={sorted(actual)}")
+          for path in Path("release-download").iterdir():
+              if path.is_file() and path.stat().st_size == 0:
+                  raise SystemExit(f"Draft release asset is empty: {path.name}")
+          PY
+          (cd release-download && sha256sum --check DiskInventoryZed-checksums.txt)
+          (cd release-download && sha256sum --check DiskInventoryZed-Windows-checksums.txt)
+
+      - name: Publish verified release
+        env:
+          TAG_NAME: ${{ needs.validate.outputs.tag }}
+        run: |
+          MARKER="<!-- disk-inventory-zed-workflow-run:$GITHUB_RUN_ID -->"
+          RELEASE_JSON="$RUNNER_TEMP/disk-inventory-zed-release-before-publish.json"
+          REPOSITORY_NAME="${GITHUB_REPOSITORY#*/}"
+          gh api graphql \
+            -f query='query($owner:String!, $name:String!, $tag:String!) { repository(owner:$owner, name:$name) { release(tagName:$tag) { databaseId isDraft description tagName } } }' \
+            -f owner="$GITHUB_REPOSITORY_OWNER" \
+            -f name="$REPOSITORY_NAME" \
+            -f tag="$TAG_NAME" > "$RELEASE_JSON"
+          MARKER="$MARKER" RELEASE_JSON="$RELEASE_JSON" python3 - <<'PY'
+          import json
+          import os
+
+          with open(os.environ["RELEASE_JSON"], encoding="utf-8") as source:
+              release = json.load(source)["data"]["repository"]["release"]
+          if release is None:
+              raise SystemExit("The draft disappeared before publication; refusing to continue.")
+          if not release.get("isDraft"):
+              raise SystemExit("Release state changed before publication; refusing to continue.")
+          if os.environ["MARKER"] not in (release.get("description") or ""):
+              raise SystemExit("Draft ownership changed before publication; refusing to continue.")
+          PY
+          gh release edit "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          test "$(gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = "false"

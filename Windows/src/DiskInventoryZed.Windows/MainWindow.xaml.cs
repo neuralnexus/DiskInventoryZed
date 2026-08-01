@@ -3,7 +3,6 @@ using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
-using System.Windows.Interop;
 using System.Windows.Media;
 using DiskInventoryZed.Core.Analysis;
 using DiskInventoryZed.Core.Export;
@@ -18,7 +17,7 @@ namespace DiskInventoryZed.Windows;
 public partial class MainWindow : Window
 {
     private readonly MainViewModel _viewModel = new();
-    private bool _isRecycling;
+    private bool _isShellActionRunning;
 
     public MainWindow()
     {
@@ -34,14 +33,6 @@ public partial class MainWindow : Window
 
     private void Window_Closing(object? sender, CancelEventArgs e)
     {
-        if (_isRecycling)
-        {
-            e.Cancel = true;
-            MessageBox.Show(this, "Wait for the current Recycle Bin operation to finish before closing.",
-                "Disk Inventory Zed", MessageBoxButton.OK, MessageBoxImage.Information);
-            return;
-        }
-
         _viewModel.ErrorRaised -= ViewModel_ErrorRaised;
         _viewModel.Dispose();
     }
@@ -182,7 +173,9 @@ public partial class MainWindow : Window
 
     private async void ExportJson_Click(object sender, RoutedEventArgs e)
     {
-        if (_viewModel.RootNode is not { } root || _viewModel.ScanResult is not { } result)
+        if (!_viewModel.CanUseSnapshot ||
+            _viewModel.RootNode is not { } root ||
+            _viewModel.ScanResult is not { } result)
         {
             return;
         }
@@ -203,7 +196,7 @@ public partial class MainWindow : Window
         try
         {
             Mouse.OverrideCursor = Cursors.Wait;
-            await Task.Run(() => ScanExporter.ExportJsonAsync(root, result.Diagnostics, dialog.FileName));
+            await Task.Run(() => ScanExporter.ExportJsonAsync(root, result.Diagnostics, dialog.FileName, result.Options));
         }
         catch (Exception error)
         {
@@ -217,7 +210,7 @@ public partial class MainWindow : Window
 
     private async void ExportCsv_Click(object sender, RoutedEventArgs e)
     {
-        if (_viewModel.RootNode is not { } root)
+        if (!_viewModel.CanUseSnapshot || _viewModel.RootNode is not { } root)
         {
             return;
         }
@@ -251,12 +244,13 @@ public partial class MainWindow : Window
     }
 
     private void OpenSelected_Click(object sender, RoutedEventArgs e) => RunShellAction(WindowsShellService.Open);
-    private void RevealSelected_Click(object sender, RoutedEventArgs e) => RunShellAction(WindowsShellService.Reveal);
+    private async void RevealSelected_Click(object sender, RoutedEventArgs e) =>
+        await RunShellActionAsync(WindowsShellService.RevealAsync);
     private void OpenContaining_Click(object sender, RoutedEventArgs e) => RunShellAction(WindowsShellService.OpenContainingFolder);
 
     private void CopyPath_Click(object sender, RoutedEventArgs e)
     {
-        if (_viewModel.InspectedNode is { } node)
+        if (_viewModel.TryGetActiveNode(_viewModel.InspectedNode, out var node))
         {
             try
             {
@@ -269,63 +263,9 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void RecycleSelected_Click(object sender, RoutedEventArgs e)
-    {
-        if (_isRecycling)
-        {
-            return;
-        }
-
-        if (_viewModel.InspectedNode is not { } node || _viewModel.RootNode is not { } root)
-        {
-            return;
-        }
-
-        if (!WindowsShellService.CanMoveToRecycleBin(node, root, out var reason))
-        {
-            MessageBox.Show(this, reason, "Move to Recycle Bin", MessageBoxButton.OK, MessageBoxImage.Information);
-            return;
-        }
-
-        var response = MessageBox.Show(
-            this,
-            $"Move “{node.DisplayName}” ({node.FormattedSize}) to the Windows Recycle Bin?\n\nThis application never falls back to permanent deletion.",
-            "Move to Recycle Bin",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Warning,
-            MessageBoxResult.No);
-        if (response != MessageBoxResult.Yes)
-        {
-            return;
-        }
-
-        try
-        {
-            _isRecycling = true;
-            var owner = new WindowInteropHelper(this).Handle;
-            await WindowsShellService.MoveToRecycleBinAsync(node, root, owner);
-            if (ReferenceEquals(_viewModel.RootNode, root))
-            {
-                await _viewModel.ScanAsync(root.FullPath);
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // The user cancelled the Windows shell operation.
-        }
-        catch (Exception error)
-        {
-            ShowError($"The item could not be moved to the Recycle Bin: {error.Message}");
-        }
-        finally
-        {
-            _isRecycling = false;
-        }
-    }
-
     private void RunShellAction(Action<FileNode> action)
     {
-        if (_viewModel.InspectedNode is not { } node)
+        if (!_viewModel.TryGetActiveNode(_viewModel.InspectedNode, out var node))
         {
             return;
         }
@@ -337,6 +277,28 @@ public partial class MainWindow : Window
         catch (Exception error)
         {
             ShowError(error.Message);
+        }
+    }
+
+    private async Task RunShellActionAsync(Func<FileNode, Task> action)
+    {
+        if (_isShellActionRunning || !_viewModel.TryGetActiveNode(_viewModel.InspectedNode, out var node))
+        {
+            return;
+        }
+
+        try
+        {
+            _isShellActionRunning = true;
+            await action(node);
+        }
+        catch (Exception error)
+        {
+            ShowError(error.Message);
+        }
+        finally
+        {
+            _isShellActionRunning = false;
         }
     }
 
@@ -390,17 +352,6 @@ public partial class MainWindow : Window
         {
             _viewModel.NavigateUp();
             e.Handled = true;
-        }
-        else if (e.OriginalSource is not TextBox && e.Key == Key.Delete)
-        {
-            var focus = Keyboard.FocusedElement as DependencyObject;
-            var selectionSurfaceFocused = FileGrid.IsKeyboardFocusWithin ||
-                                          FindVisualParent<FileVisualizationControl>(focus) is not null;
-            if (_viewModel.SelectedNode is not null && selectionSurfaceFocused)
-            {
-                RecycleSelected_Click(this, new RoutedEventArgs());
-                e.Handled = true;
-            }
         }
     }
 

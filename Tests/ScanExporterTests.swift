@@ -132,4 +132,93 @@ final class ScanExporterTests: XCTestCase {
         XCTAssertEqual(Set(comparison.largestGrowth.map(\.kind)), [.added, .grew])
         XCTAssertEqual(comparison.largestShrinkage.first?.kind, .removed)
     }
+
+    func testCSVNeutralizesSpreadsheetFormulas() throws {
+        let names = ["=2+2.txt", "+cmd.txt", "-2+3.txt", "@SUM.txt", "  =2+2.txt"]
+        let files = names.map {
+            FileNode(
+                url: URL(fileURLWithPath: "/tmp/\($0)"),
+                name: $0,
+                kind: .file,
+                logicalSize: 1,
+                allocatedSize: 1
+            )
+        }
+        let root = FileNode(
+            url: URL(fileURLWithPath: "/tmp"),
+            name: "tmp",
+            kind: .directory,
+            logicalSize: Int64(files.count),
+            allocatedSize: Int64(files.count),
+            children: files
+        )
+        let outputDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DiskInventoryZedCSVTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outputDirectory) }
+        let csvURL = outputDirectory.appendingPathComponent("scan.csv")
+
+        try ScanExporter.exportCSV(root: root, to: csvURL)
+        let csv = try String(contentsOf: csvURL, encoding: .utf8)
+
+        for name in names {
+            XCTAssertTrue(csv.contains("\"'\(name)\""))
+        }
+    }
+
+    func testImporterAcceptsWindowsSchemaThreeReliabilityMetadata() throws {
+        let outputDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DiskInventoryZedWindowsSnapshotTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outputDirectory) }
+        let snapshotURL = outputDirectory.appendingPathComponent("windows.json")
+        let json = """
+        {
+          "schemaVersion": 3,
+          "exportedAt": "2026-08-01T12:00:00Z",
+          "rootPath": "C:\\\\fixture",
+          "diagnostics": {
+            "unreadableItems": 0,
+            "skippedDirectories": 0,
+            "hiddenItemsExcluded": 2,
+            "symbolicLinks": 0,
+            "packages": 0,
+            "duplicateHardLinks": 0,
+            "unverifiedHardLinks": 1,
+            "revisitedDirectories": 0,
+            "approximateAllocatedSizes": 0,
+            "firstUnreadablePaths": []
+          },
+          "scanOptions": {
+            "skipDeveloperFolders": false,
+            "showHiddenFiles": false,
+            "followReparsePoints": false
+          },
+          "entries": [
+            {
+              "path": "C:\\\\fixture",
+              "parentPath": null,
+              "name": "fixture",
+              "kind": "directory",
+              "isPackage": false,
+              "isSymbolicLink": false,
+              "allocatedSize": 0,
+              "logicalSize": 0,
+              "childCount": 0,
+              "totalFileCount": 0,
+              "totalDirectoryCount": 1,
+              "isHardLinkDuplicate": false,
+              "hardLinkIdentityUnavailable": false
+            }
+          ]
+        }
+        """
+        try Data(json.utf8).write(to: snapshotURL)
+
+        let imported = try ScanExporter.importSnapshot(from: snapshotURL)
+
+        XCTAssertEqual(imported.schemaVersion, 3)
+        XCTAssertEqual(imported.rootPath, "C:\\fixture")
+        XCTAssertEqual(imported.entries.count, 1)
+    }
 }

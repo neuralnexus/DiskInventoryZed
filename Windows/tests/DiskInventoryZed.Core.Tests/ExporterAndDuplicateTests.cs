@@ -24,13 +24,20 @@ public sealed class ExporterAndDuplicateTests
         var root = new FileNode(fixture.Path, "fixture", FileNodeKind.Directory, 10, 16, [file]);
         var diagnostics = ScanDiagnostics.Empty with { ApproximateAllocatedSizes = 1 };
 
-        await ScanExporter.ExportJsonAsync(root, diagnostics, destination);
+        await ScanExporter.ExportJsonAsync(
+            root,
+            diagnostics,
+            destination,
+            new ScanOptions(SkipDeveloperFolders: true, ShowHiddenFiles: true));
 
         using var document = JsonDocument.Parse(await File.ReadAllTextAsync(destination));
         var jsonRoot = document.RootElement;
         Assert.Equal(3, jsonRoot.GetProperty("schemaVersion").GetInt32());
         Assert.Matches("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$", jsonRoot.GetProperty("exportedAt").GetString()!);
         Assert.Equal(1, jsonRoot.GetProperty("diagnostics").GetProperty("approximateAllocatedSizes").GetInt32());
+        Assert.True(jsonRoot.GetProperty("scanOptions").GetProperty("skipDeveloperFolders").GetBoolean());
+        Assert.True(jsonRoot.GetProperty("scanOptions").GetProperty("showHiddenFiles").GetBoolean());
+        Assert.False(jsonRoot.GetProperty("scanOptions").GetProperty("followReparsePoints").GetBoolean());
         Assert.Equal("2026-07-31T20:33:00Z", jsonRoot.GetProperty("entries")[1].GetProperty("modificationDate").GetString());
     }
 
@@ -48,6 +55,26 @@ public sealed class ExporterAndDuplicateTests
         Assert.Contains("allocated_bytes,logical_bytes", csv);
         Assert.Contains("\"a,\"\"b.bin\"", csv);
         Assert.Contains(",16,10,", csv);
+    }
+
+    [Fact]
+    public async Task CsvExportNeutralizesSpreadsheetFormulas()
+    {
+        using var fixture = new TemporaryDirectory();
+        var destination = Path.Combine(fixture.Path, "inventory.csv");
+        var names = new[] { "=2+2.txt", "+cmd.txt", "-2+3.txt", "@SUM.txt", "  =2+2.txt" };
+        var files = names
+            .Select(name => new FileNode(Path.Combine(fixture.Path, name), name, FileNodeKind.File, 1, 1))
+            .ToArray();
+        var root = new FileNode(fixture.Path, "fixture", FileNodeKind.Directory, files.Length, files.Length, files);
+
+        await ScanExporter.ExportCsvAsync(root, destination);
+        var csv = await File.ReadAllTextAsync(destination);
+
+        foreach (var name in names)
+        {
+            Assert.Contains($"\"'{name}\"", csv, StringComparison.Ordinal);
+        }
     }
 
     [Fact]

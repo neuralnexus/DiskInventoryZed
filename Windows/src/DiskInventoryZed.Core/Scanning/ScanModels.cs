@@ -16,14 +16,16 @@ public sealed record ScanProgress(
 public sealed record ScanDiagnostics(
     int UnreadableItems,
     int SkippedDirectories,
+    int HiddenItemsExcluded,
     int SymbolicLinks,
     int Packages,
     int DuplicateHardLinks,
+    int UnverifiedHardLinks,
     int RevisitedDirectories,
     int ApproximateAllocatedSizes,
     IReadOnlyList<string> FirstUnreadablePaths)
 {
-    public static readonly ScanDiagnostics Empty = new(0, 0, 0, 0, 0, 0, 0, []);
+    public static readonly ScanDiagnostics Empty = new(0, 0, 0, 0, 0, 0, 0, 0, 0, []);
 }
 
 public sealed record DiskScanResult(
@@ -31,7 +33,8 @@ public sealed record DiskScanResult(
     int TotalFiles,
     int TotalDirectories,
     TimeSpan Duration,
-    ScanDiagnostics Diagnostics);
+    ScanDiagnostics Diagnostics,
+    ScanOptions Options);
 
 public sealed class DiskScanException : IOException
 {

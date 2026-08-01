@@ -75,7 +75,10 @@ public static class ScanAnalyzer
             var aggregate = extensions.GetValueOrDefault(extension);
             extensions[extension] = (aggregate.Size + node.AllocatedSize, aggregate.Count + 1);
 
-            if (node.Kind == FileNodeKind.File && node.LogicalSize >= 10_000_000 && !node.IsHardLinkDuplicate)
+            if (node.Kind == FileNodeKind.File &&
+                node.LogicalSize >= 10_000_000 &&
+                !node.IsHardLinkDuplicate &&
+                !node.HasUnverifiedHardLinks)
             {
                 if (!duplicateGroups.TryGetValue(node.LogicalSize, out var matches))
                 {

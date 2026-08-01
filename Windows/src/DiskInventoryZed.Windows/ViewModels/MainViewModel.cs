@@ -51,6 +51,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool _skipDeveloperFolders;
     private bool _showHiddenFiles;
     private bool _followReparsePoints;
+    private long _nextGeneration;
+    private long _publishedGeneration;
+    private string _visibleItemsStatus = string.Empty;
 
     public MainViewModel()
     {
@@ -106,6 +109,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 OnPropertyChanged(nameof(SummaryFileCount));
                 OnPropertyChanged(nameof(SummaryDirectoryCount));
                 OnPropertyChanged(nameof(CanRescan));
+                OnPropertyChanged(nameof(CanUseSnapshot));
+                OnPropertyChanged(nameof(CanVerifyDuplicates));
             }
         }
     }
@@ -128,6 +133,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         get => _selectedNode;
         set
         {
+            if (value is not null)
+            {
+                if (!CanUseSnapshot ||
+                    _analysis is null ||
+                    !_analysis.NodesById.TryGetValue(value.Id, out var activeNode))
+                {
+                    value = null;
+                }
+                else
+                {
+                    value = activeNode;
+                }
+            }
+
             if (SetProperty(ref _selectedNode, value))
             {
                 OnPropertyChanged(nameof(InspectedNode));
@@ -140,8 +159,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public bool HasScan => RootNode is not null;
     public bool CanRescan => RootNode is not null && !IsScanning;
-    public bool CanNavigateBack => _navigationIndex > 0;
-    public bool CanNavigateForward => _navigationIndex >= 0 && _navigationIndex < _navigation.Count - 1;
+    public bool CanStartScan => !IsScanning;
+    public bool CanUseSnapshot => RootNode is not null && !IsScanning;
+    public bool CanVerifyDuplicates => CanUseSnapshot && DuplicateCandidates.Count > 0 && !IsVerifying;
+    public bool CanNavigateBack => CanUseSnapshot && _navigationIndex > 0;
+    public bool CanNavigateForward => CanUseSnapshot && _navigationIndex >= 0 && _navigationIndex < _navigation.Count - 1;
 
     public bool IsScanning
     {
@@ -151,6 +173,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (SetProperty(ref _isScanning, value))
             {
                 OnPropertyChanged(nameof(CanRescan));
+                OnPropertyChanged(nameof(CanStartScan));
+                OnPropertyChanged(nameof(CanUseSnapshot));
+                OnPropertyChanged(nameof(CanVerifyDuplicates));
+                OnPropertyChanged(nameof(CanNavigateBack));
+                OnPropertyChanged(nameof(CanNavigateForward));
             }
         }
     }
@@ -164,7 +191,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public bool IsVerifying
     {
         get => _isVerifying;
-        private set => SetProperty(ref _isVerifying, value);
+        private set
+        {
+            if (SetProperty(ref _isVerifying, value))
+            {
+                OnPropertyChanged(nameof(CanVerifyDuplicates));
+            }
+        }
     }
 
     public string PathText
@@ -201,6 +234,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         get => _verificationStatus;
         private set => SetProperty(ref _verificationStatus, value);
+    }
+
+    public string VisibleItemsStatus
+    {
+        get => _visibleItemsStatus;
+        private set => SetProperty(ref _visibleItemsStatus, value);
     }
 
     public string? SelectedExtension
@@ -296,12 +335,25 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             var details = new List<string>();
             if (diagnostics.UnreadableItems > 0) details.Add($"{diagnostics.UnreadableItems:N0} unreadable");
             if (diagnostics.SkippedDirectories > 0) details.Add($"{diagnostics.SkippedDirectories:N0} skipped");
+            if (!_scanResult.Options.ShowHiddenFiles)
+            {
+                details.Add(diagnostics.HiddenItemsExcluded > 0
+                    ? $"{diagnostics.HiddenItemsExcluded:N0} hidden excluded"
+                    : "hidden items excluded by settings");
+            }
             if (diagnostics.SymbolicLinks > 0) details.Add($"{diagnostics.SymbolicLinks:N0} links");
             if (diagnostics.DuplicateHardLinks > 0) details.Add($"{diagnostics.DuplicateHardLinks:N0} hard-link aliases");
+            if (diagnostics.UnverifiedHardLinks > 0) details.Add($"{diagnostics.UnverifiedHardLinks:N0} hard links unverified");
             if (diagnostics.ApproximateAllocatedSizes > 0) details.Add($"{diagnostics.ApproximateAllocatedSizes:N0} estimated sizes");
-            return details.Count == 0 ? "Complete scan" : string.Join("  |  ", details);
+            return details.Count == 0 ? "Complete for selected options" : string.Join("  |  ", details);
         }
     }
+
+    public string DiagnosticsDetail => _scanResult is null
+        ? string.Empty
+        : _scanResult.Diagnostics.FirstUnreadablePaths.Count == 0
+            ? string.Empty
+            : "First unreadable paths:\n" + string.Join("\n", _scanResult.Diagnostics.FirstUnreadablePaths);
 
     public string StatusText => CurrentNode is null || _scanResult is null
         ? "Ready"
@@ -310,6 +362,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public async Task ScanAsync(string path)
     {
+        if (IsScanning)
+        {
+            ErrorRaised?.Invoke(this, "A scan is already active. Cancel it and wait for cancellation to finish before starting another location.");
+            return;
+        }
+
         path = Environment.ExpandEnvironmentVariables(path.Trim().Trim('"'));
         if (string.IsNullOrWhiteSpace(path))
         {
@@ -317,8 +375,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        _scanCancellation?.Cancel();
+        var generation = Interlocked.Increment(ref _nextGeneration);
+        var previousPath = RootNode?.FullPath ?? string.Empty;
         _verificationCancellation?.Cancel();
+        VerifiedDuplicates.Clear();
+        VerificationStatus = string.Empty;
         var cancellation = new CancellationTokenSource();
         _scanCancellation = cancellation;
         IsScanning = true;
@@ -326,6 +387,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ScanProgressText = "Preparing scan...";
         ScanStatusPath = path;
         PathText = path;
+        SelectedNode = null;
 
         var progress = new Progress<ScanProgress>(snapshot =>
         {
@@ -355,6 +417,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             }
 
             _scanResult = result;
+            _publishedGeneration = generation;
             OnPropertyChanged(nameof(ScanResult));
             _analysis = analysis;
             SelectedExtension = null;
@@ -379,11 +442,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         catch (OperationCanceledException)
         {
             // Cancellation leaves the previous completed snapshot visible.
+            PathText = previousPath;
+            ScanStatusPath = previousPath;
         }
         catch (Exception error)
         {
             if (ReferenceEquals(_scanCancellation, cancellation))
             {
+                PathText = previousPath;
+                ScanStatusPath = previousPath;
                 ErrorRaised?.Invoke(this, error.Message);
             }
         }
@@ -402,10 +469,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public void CancelScan() => _scanCancellation?.Cancel();
 
-    public Task RescanAsync() => RootNode is null ? Task.CompletedTask : ScanAsync(RootNode.FullPath);
+    public Task RescanAsync() => !CanRescan || RootNode is null ? Task.CompletedTask : ScanAsync(RootNode.FullPath);
 
     public void NavigateTo(FileNode node)
     {
+        if (!TryGetActiveNode(node, out var activeNode))
+        {
+            return;
+        }
+        node = activeNode;
+
         if (!node.IsDirectory)
         {
             SelectedNode = node;
@@ -434,21 +507,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public void NavigateBack()
     {
-        if (!CanNavigateBack) return;
+        if (!CanUseSnapshot || !CanNavigateBack) return;
         _navigationIndex--;
         SetCurrentNode(_navigation[_navigationIndex]);
     }
 
     public void NavigateForward()
     {
-        if (!CanNavigateForward) return;
+        if (!CanUseSnapshot || !CanNavigateForward) return;
         _navigationIndex++;
         SetCurrentNode(_navigation[_navigationIndex]);
     }
 
     public void NavigateUp()
     {
-        if (Breadcrumb.Count > 1)
+        if (CanUseSnapshot && Breadcrumb.Count > 1)
         {
             NavigateTo(Breadcrumb[^2]);
         }
@@ -456,7 +529,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public void NavigateToRoot()
     {
-        if (RootNode is not null)
+        if (CanUseSnapshot && RootNode is not null)
         {
             NavigateTo(RootNode);
         }
@@ -464,15 +537,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public void Focus(FileNode node)
     {
-        if (_analysis is null || !_analysis.NodesById.ContainsKey(node.Id))
+        if (!TryGetActiveNode(node, out var activeNode))
         {
-            SelectedNode = node;
             return;
         }
+        node = activeNode;
+        var analysis = _analysis!;
 
         var parent = node;
-        if (!node.IsDirectory && _analysis.ParentById.TryGetValue(node.Id, out var parentId) &&
-            _analysis.NodesById.TryGetValue(parentId, out var parentNode))
+        if (!node.IsDirectory && analysis.ParentById.TryGetValue(node.Id, out var parentId) &&
+            analysis.NodesById.TryGetValue(parentId, out var parentNode))
         {
             parent = parentNode;
         }
@@ -483,10 +557,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public async Task VerifyDuplicatesAsync()
     {
-        if (DuplicateCandidates.Count == 0 || IsVerifying)
+        if (!CanVerifyDuplicates || RootNode is not { } verificationRoot)
         {
             return;
         }
+
+        var verificationGeneration = _publishedGeneration;
 
         _verificationCancellation?.Cancel();
         var cancellation = new CancellationTokenSource();
@@ -495,7 +571,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         VerifiedDuplicates.Clear();
         var progress = new Progress<DuplicateVerificationProgress>(item =>
         {
-            if (!ReferenceEquals(_verificationCancellation, cancellation))
+            if (!IsVerificationCurrent(cancellation, verificationGeneration, verificationRoot))
             {
                 return;
             }
@@ -509,7 +585,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             var result = await Task.Run(
                 () => DuplicateVerifier.VerifyAsync(DuplicateCandidates.ToArray(), progress, cancellation.Token),
                 cancellation.Token);
-            if (!ReferenceEquals(_verificationCancellation, cancellation))
+            cancellation.Token.ThrowIfCancellationRequested();
+            if (!IsVerificationCurrent(cancellation, verificationGeneration, verificationRoot))
             {
                 return;
             }
@@ -525,14 +602,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         catch (OperationCanceledException)
         {
-            if (ReferenceEquals(_verificationCancellation, cancellation))
+            if (OwnsVerification(cancellation, verificationGeneration, verificationRoot))
             {
                 VerificationStatus = "Verification cancelled.";
             }
         }
         catch (Exception error)
         {
-            if (ReferenceEquals(_verificationCancellation, cancellation))
+            if (IsVerificationCurrent(cancellation, verificationGeneration, verificationRoot))
             {
                 ErrorRaised?.Invoke(this, $"Duplicate verification failed: {error.Message}");
             }
@@ -550,6 +627,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
 
     public void CancelDuplicateVerification() => _verificationCancellation?.Cancel();
+
+    public bool TryGetActiveNode(FileNode? candidate, out FileNode node)
+    {
+        if (CanUseSnapshot &&
+            candidate is not null &&
+            _analysis is not null &&
+            _analysis.NodesById.TryGetValue(candidate.Id, out var activeNode))
+        {
+            node = activeNode;
+            return true;
+        }
+
+        node = null!;
+        return false;
+    }
 
     public async Task RefreshDrivesAsync()
     {
@@ -575,6 +667,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         CurrentNode = node;
         SelectedNode = null;
+        VisibleItems.Clear();
+        VisibleItemsStatus = string.Empty;
         Replace(Breadcrumb, IndexedPathTo(node));
         OnPropertyChanged(nameof(CanNavigateBack));
         OnPropertyChanged(nameof(CanNavigateForward));
@@ -598,6 +692,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (current is null)
             {
                 VisibleItems.Clear();
+                VisibleItemsStatus = string.Empty;
                 return;
             }
 
@@ -605,7 +700,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             var extension = SelectedExtension;
             var minimumSize = MinimumSize;
             var sortOrder = SortOrder;
-            var candidates = await Task.Run(() =>
+            var filtered = await Task.Run(() =>
             {
                 cancellation.Token.ThrowIfCancellationRequested();
                 IEnumerable<FileNode> source = string.IsNullOrEmpty(query)
@@ -633,12 +728,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                     FileSortOrder.NameDescending => source.OrderByDescending(node => node.DisplayName, StringComparer.CurrentCultureIgnoreCase),
                     _ => source.OrderByDescending(node => node.AllocatedSize).ThenBy(node => node.DisplayName, StringComparer.CurrentCultureIgnoreCase)
                 };
-                return source.Take(2_000).ToArray();
+                var matches = source.ToArray();
+                return (Items: matches.Take(2_000).ToArray(), Total: matches.Length);
             }, cancellation.Token);
             cancellation.Token.ThrowIfCancellationRequested();
             if (ReferenceEquals(_filterCancellation, cancellation))
             {
-                Replace(VisibleItems, candidates);
+                Replace(VisibleItems, filtered.Items);
+                VisibleItemsStatus = filtered.Total > filtered.Items.Length
+                    ? $"Showing {filtered.Items.Length:N0} of {filtered.Total:N0} matches"
+                    : $"{filtered.Total:N0} items";
             }
         }
         catch (OperationCanceledException)
@@ -746,12 +845,29 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private void SaveSettings() => _settingsStore.Save(_settings);
 
+    private bool IsVerificationCurrent(
+        CancellationTokenSource cancellation,
+        long generation,
+        FileNode root) =>
+        OwnsVerification(cancellation, generation, root) &&
+        !cancellation.IsCancellationRequested;
+
+    private bool OwnsVerification(
+        CancellationTokenSource cancellation,
+        long generation,
+        FileNode root) =>
+        ReferenceEquals(_verificationCancellation, cancellation) &&
+        !IsScanning &&
+        generation == _publishedGeneration &&
+        ReferenceEquals(root, RootNode);
+
     private void RaiseScanSummaryProperties()
     {
         OnPropertyChanged(nameof(SummarySize));
         OnPropertyChanged(nameof(SummaryFileCount));
         OnPropertyChanged(nameof(SummaryDirectoryCount));
         OnPropertyChanged(nameof(DiagnosticsSummary));
+        OnPropertyChanged(nameof(DiagnosticsDetail));
         OnPropertyChanged(nameof(StatusText));
     }
 

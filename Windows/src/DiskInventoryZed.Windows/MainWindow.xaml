@@ -77,8 +77,8 @@
                                Foreground="{StaticResource SecondaryText}" FontSize="11" Margin="0,2,0,0" />
                 </StackPanel>
                 <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
-                    <Button Content="Export JSON" Click="ExportJson_Click" Margin="0,0,7,0" IsEnabled="{Binding HasScan}" />
-                    <Button Content="Export CSV" Click="ExportCsv_Click" Margin="0,0,7,0" IsEnabled="{Binding HasScan}" />
+                    <Button Content="Export JSON" Click="ExportJson_Click" Margin="0,0,7,0" IsEnabled="{Binding CanUseSnapshot}" />
+                    <Button Content="Export CSV" Click="ExportCsv_Click" Margin="0,0,7,0" IsEnabled="{Binding CanUseSnapshot}" />
                     <Button Content="Rescan" Click="Rescan_Click" IsEnabled="{Binding CanRescan}" />
                 </StackPanel>
             </Grid>
@@ -97,10 +97,11 @@
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <Button Style="{StaticResource IconButton}" Content="←" ToolTip="Back (Alt+Left)" Click="Back_Click" IsEnabled="{Binding CanNavigateBack}" />
                     <Button Style="{StaticResource IconButton}" Content="→" ToolTip="Forward (Alt+Right)" Click="Forward_Click" IsEnabled="{Binding CanNavigateForward}" Margin="4,0,0,0" />
-                    <Button Style="{StaticResource IconButton}" Content="↑" ToolTip="Up (Backspace)" Click="Up_Click" IsEnabled="{Binding HasScan}" Margin="4,0,0,0" />
-                    <Button Style="{StaticResource IconButton}" Content="⌂" ToolTip="Scan root" Click="Root_Click" IsEnabled="{Binding HasScan}" Margin="4,0,8,0" />
+                    <Button Style="{StaticResource IconButton}" Content="↑" ToolTip="Up (Backspace)" Click="Up_Click" IsEnabled="{Binding CanUseSnapshot}" Margin="4,0,0,0" />
+                    <Button Style="{StaticResource IconButton}" Content="⌂" ToolTip="Scan root" Click="Root_Click" IsEnabled="{Binding CanUseSnapshot}" Margin="4,0,8,0" />
                 </StackPanel>
-                <ScrollViewer Grid.Column="1" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled" Margin="0,0,10,0">
+                <ScrollViewer Grid.Column="1" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled" Margin="0,0,10,0"
+                              IsEnabled="{Binding CanUseSnapshot}">
                     <ItemsControl ItemsSource="{Binding Breadcrumb}" VerticalAlignment="Center">
                         <ItemsControl.ItemsPanel>
                             <ItemsPanelTemplate><StackPanel Orientation="Horizontal" /></ItemsPanelTemplate>
@@ -116,11 +117,14 @@
                     </ItemsControl>
                 </ScrollViewer>
                 <TextBox Grid.Column="2" Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}"
-                         ToolTip="Search names and full paths across this scan" Margin="0,0,8,0" />
+                         AutomationProperties.Name="Search files and paths"
+                         ToolTip="Search names and full paths across this scan" Margin="0,0,8,0" IsEnabled="{Binding CanUseSnapshot}" />
                 <ComboBox Grid.Column="3" ItemsSource="{Binding MinimumSizeOptions}" DisplayMemberPath="Label"
-                          SelectedValuePath="Value" SelectedValue="{Binding MinimumSize}" Margin="0,0,8,0" />
+                          AutomationProperties.Name="Minimum file size"
+                          SelectedValuePath="Value" SelectedValue="{Binding MinimumSize}" Margin="0,0,8,0" IsEnabled="{Binding CanUseSnapshot}" />
                 <ComboBox Grid.Column="4" ItemsSource="{Binding SortOptions}" DisplayMemberPath="Label"
-                          SelectedValuePath="Value" SelectedValue="{Binding SortOrder}" />
+                          AutomationProperties.Name="File sort order"
+                          SelectedValuePath="Value" SelectedValue="{Binding SortOrder}" IsEnabled="{Binding CanUseSnapshot}" />
             </Grid>
         </Border>
 
@@ -150,13 +154,18 @@
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
                             <TextBox x:Name="PathBox" Text="{Binding PathText, UpdateSourceTrigger=PropertyChanged}"
-                                     ToolTip="Examples: C:\, Z:\, or \\server\share" KeyDown="PathBox_KeyDown" />
-                            <Button Grid.Column="1" Content="Scan" Style="{StaticResource AccentButton}" Click="ScanPath_Click" Margin="6,0,0,0" />
+                                     AutomationProperties.Name="Folder, drive, or UNC path"
+                                     ToolTip="Examples: C:\, Z:\, or \\server\share" KeyDown="PathBox_KeyDown"
+                                     IsEnabled="{Binding CanStartScan}" />
+                            <Button Grid.Column="1" Content="Scan" Style="{StaticResource AccentButton}" Click="ScanPath_Click" Margin="6,0,0,0"
+                                    IsEnabled="{Binding CanStartScan}" />
                         </Grid>
-                        <Button Content="Choose folder..." Click="ChooseFolder_Click" Margin="0,7,0,0" HorizontalContentAlignment="Center" />
+                        <Button Content="Choose folder..." Click="ChooseFolder_Click" Margin="0,7,0,0" HorizontalContentAlignment="Center"
+                                IsEnabled="{Binding CanStartScan}" />
                     </StackPanel>
 
-                    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" MaxHeight="370" Margin="0,14,0,10">
+                    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" MaxHeight="370" Margin="0,14,0,10"
+                                  IsEnabled="{Binding CanStartScan}">
                         <StackPanel>
                             <TextBlock Text="SCAN OPTIONS" Style="{StaticResource SectionLabel}" Margin="0,0,0,3" />
                             <CheckBox Content="Show hidden items" IsChecked="{Binding ShowHiddenFiles}" />
@@ -168,7 +177,8 @@
                             <ItemsControl ItemsSource="{Binding QuickLocations}">
                                 <ItemsControl.ItemTemplate>
                                     <DataTemplate>
-                                        <Button Click="Location_Click" Margin="0,2" Padding="8,6" HorizontalContentAlignment="Left">
+                                        <Button Click="Location_Click" Margin="0,2" Padding="8,6" HorizontalContentAlignment="Left"
+                                                IsEnabled="{Binding DataContext.CanStartScan, RelativeSource={RelativeSource AncestorType=Window}}">
                                             <StackPanel>
                                                 <TextBlock Text="{Binding Label}" FontWeight="SemiBold" />
                                                 <TextBlock Text="{Binding Detail}" Foreground="{StaticResource SecondaryText}" FontSize="9" TextTrimming="CharacterEllipsis" />
@@ -182,7 +192,8 @@
                             <ItemsControl ItemsSource="{Binding Drives}">
                                 <ItemsControl.ItemTemplate>
                                     <DataTemplate>
-                                        <Button Click="Location_Click" Margin="0,2" Padding="8,6" HorizontalContentAlignment="Left">
+                                        <Button Click="Location_Click" Margin="0,2" Padding="8,6" HorizontalContentAlignment="Left"
+                                                IsEnabled="{Binding DataContext.CanStartScan, RelativeSource={RelativeSource AncestorType=Window}}">
                                             <Grid>
                                                 <Grid.ColumnDefinitions>
                                                     <ColumnDefinition Width="24" />
@@ -207,7 +218,8 @@
                             <RowDefinition Height="*" />
                         </Grid.RowDefinitions>
                         <TextBlock Text="SCANNED TREE" Style="{StaticResource SectionLabel}" Margin="0,0,0,5" />
-                        <TreeView Grid.Row="1" ItemsSource="{Binding RootFolders}" SelectedItemChanged="FolderTree_SelectedItemChanged" />
+                        <TreeView Grid.Row="1" ItemsSource="{Binding RootFolders}" SelectedItemChanged="FolderTree_SelectedItemChanged"
+                                  IsEnabled="{Binding CanUseSnapshot}" AutomationProperties.Name="Scanned folder tree" />
                     </Grid>
                 </Grid>
             </Border>
@@ -216,9 +228,12 @@
 
             <!-- Visualization workspace. Sunburst is deliberately first/default. -->
             <Grid Grid.Column="2" Background="#0A0E13">
-                <TabControl x:Name="VisualizationTabs" SelectedIndex="0" Margin="7">
-                    <TabItem Header="SUNBURST  Ctrl+1">
+                <TabControl x:Name="VisualizationTabs" SelectedIndex="0" Margin="7" IsEnabled="{Binding CanUseSnapshot}">
+                    <TabItem Header="SUNBURST  Ctrl+1"
+                             AutomationProperties.HelpText="Visual overview. Use the List tab for keyboard and screen-reader access to scanned items.">
                         <controls:SunburstControl Node="{Binding CurrentNode}"
+                                                  AutomationProperties.Name="Interactive disk usage sunburst"
+                                                  Focusable="False"
                                                   MinimumSize="{Binding MinimumSize}"
                                                   SearchText="{Binding SearchText}"
                                                   SelectedExtension="{Binding SelectedExtension}"
@@ -229,14 +244,15 @@
                                     <MenuItem Header="Open" Click="OpenSelected_Click" />
                                     <MenuItem Header="Show in File Explorer" Click="RevealSelected_Click" />
                                     <MenuItem Header="Open containing folder" Click="OpenContaining_Click" />
-                                    <Separator />
-                                    <MenuItem Header="Move to Recycle Bin" Click="RecycleSelected_Click" />
                                 </ContextMenu>
                             </controls:SunburstControl.ContextMenu>
                         </controls:SunburstControl>
                     </TabItem>
-                    <TabItem Header="HEATMAP  Ctrl+2">
+                    <TabItem Header="HEATMAP  Ctrl+2"
+                             AutomationProperties.HelpText="Visual overview. Use the List tab for keyboard and screen-reader access to scanned items.">
                         <controls:TreemapControl Node="{Binding CurrentNode}"
+                                                 AutomationProperties.Name="Interactive disk usage heatmap"
+                                                 Focusable="False"
                                                  MinimumSize="{Binding MinimumSize}"
                                                  SearchText="{Binding SearchText}"
                                                  SelectedExtension="{Binding SelectedExtension}"
@@ -247,14 +263,20 @@
                                     <MenuItem Header="Open" Click="OpenSelected_Click" />
                                     <MenuItem Header="Show in File Explorer" Click="RevealSelected_Click" />
                                     <MenuItem Header="Open containing folder" Click="OpenContaining_Click" />
-                                    <Separator />
-                                    <MenuItem Header="Move to Recycle Bin" Click="RecycleSelected_Click" />
                                 </ContextMenu>
                             </controls:TreemapControl.ContextMenu>
                         </controls:TreemapControl>
                     </TabItem>
                     <TabItem Header="LIST  Ctrl+3">
-                        <DataGrid x:Name="FileGrid"
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+                            <TextBlock Text="{Binding VisibleItemsStatus}" Foreground="{StaticResource SecondaryText}"
+                                       FontSize="10" Margin="8,4" AutomationProperties.LiveSetting="Polite" />
+                        <DataGrid x:Name="FileGrid" Grid.Row="1"
+                                  AutomationProperties.Name="Scanned files and folders"
                                   ItemsSource="{Binding VisibleItems}"
                                   SelectedItem="{Binding SelectedNode, Mode=TwoWay}"
                                   AutoGenerateColumns="False"
@@ -305,11 +327,10 @@
                                     <MenuItem Header="Open" Click="OpenSelected_Click" />
                                     <MenuItem Header="Show in File Explorer" Click="RevealSelected_Click" />
                                     <MenuItem Header="Open containing folder" Click="OpenContaining_Click" />
-                                    <Separator />
-                                    <MenuItem Header="Move to Recycle Bin" Click="RecycleSelected_Click" />
                                 </ContextMenu>
                             </DataGrid.ContextMenu>
                         </DataGrid>
+                        </Grid>
                     </TabItem>
                 </TabControl>
 
@@ -324,7 +345,8 @@
                         <TextBlock Text="See where the space went" FontSize="28" FontWeight="SemiBold" HorizontalAlignment="Center" />
                         <TextBlock Text="Start with a drive, folder, mapped drive letter, or a UNC share. The circular map opens first; switch to Heatmap for the rectangular view."
                                    Foreground="{StaticResource SecondaryText}" FontSize="13" TextAlignment="Center" TextWrapping="Wrap" Margin="0,9,0,18" />
-                        <Button Content="Choose a folder" Style="{StaticResource AccentButton}" Click="ChooseFolder_Click" HorizontalAlignment="Center" Padding="22,10" />
+                        <Button Content="Choose a folder" Style="{StaticResource AccentButton}" Click="ChooseFolder_Click" HorizontalAlignment="Center" Padding="22,10"
+                                IsEnabled="{Binding CanStartScan}" />
                     </StackPanel>
                 </Border>
 
@@ -363,11 +385,15 @@
                                 <StackPanel Grid.Column="1"><TextBlock Text="{Binding SummaryFileCount}" Style="{StaticResource MetricValue}" /><TextBlock Text="FILES" Style="{StaticResource SectionLabel}" /></StackPanel>
                                 <StackPanel Grid.Column="2"><TextBlock Text="{Binding SummaryDirectoryCount}" Style="{StaticResource MetricValue}" /><TextBlock Text="FOLDERS" Style="{StaticResource SectionLabel}" /></StackPanel>
                             </Grid>
-                            <TextBlock Text="{Binding DiagnosticsSummary}" Foreground="{StaticResource WarningBrush}" FontSize="9" TextWrapping="Wrap" Margin="0,9,0,0" />
+                            <TextBlock Text="{Binding DiagnosticsSummary}" Foreground="{StaticResource WarningBrush}" FontSize="9" TextWrapping="Wrap" Margin="0,9,0,0"
+                                       ToolTip="{Binding DiagnosticsDetail}" AutomationProperties.LiveSetting="Polite" />
+                            <TextBlock Text="{Binding DiagnosticsDetail}" Foreground="{StaticResource SecondaryText}" FontSize="8"
+                                       TextWrapping="Wrap" TextTrimming="CharacterEllipsis" MaxHeight="46" Margin="0,5,0,0" />
                         </StackPanel>
                     </Border>
 
-                    <TabControl Grid.Row="1" Margin="0,10,0,8" Visibility="{Binding HasScan, Converter={StaticResource BoolToVisibility}}">
+                    <TabControl Grid.Row="1" Margin="0,10,0,8" Visibility="{Binding HasScan, Converter={StaticResource BoolToVisibility}}"
+                                IsEnabled="{Binding CanUseSnapshot}">
                         <TabItem Header="TYPES">
                             <Grid>
                                 <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
@@ -428,7 +454,7 @@
                                         </ListBox.ItemTemplate>
                                     </ListBox>
                                     <StackPanel Orientation="Horizontal" Margin="5,7">
-                                        <Button Content="Verify contents" Click="VerifyDuplicates_Click" />
+                                        <Button Content="Verify contents" Click="VerifyDuplicates_Click" IsEnabled="{Binding CanVerifyDuplicates}" />
                                         <Button Content="Cancel" Click="CancelVerification_Click" Margin="6,0,0,0" Visibility="{Binding IsVerifying, Converter={StaticResource BoolToVisibility}}" />
                                     </StackPanel>
                                     <TextBlock Text="{Binding VerificationStatus}" Foreground="{StaticResource SecondaryText}" FontSize="9" TextWrapping="Wrap" Margin="5" />
@@ -445,7 +471,7 @@
                     </TabControl>
 
                     <Border Grid.Row="2" Background="#0E141B" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="11"
-                            Visibility="{Binding HasScan, Converter={StaticResource BoolToVisibility}}">
+                            Visibility="{Binding HasScan, Converter={StaticResource BoolToVisibility}}" IsEnabled="{Binding CanUseSnapshot}">
                         <StackPanel DataContext="{Binding InspectedNode}">
                             <TextBlock Text="SELECTION" Style="{StaticResource SectionLabel}" />
                             <DockPanel Margin="0,8,0,5">
@@ -465,7 +491,6 @@
                                 <Button Content="Open" Click="OpenSelected_Click" Margin="0,0,5,5" />
                                 <Button Content="Explorer" Click="RevealSelected_Click" Margin="0,0,5,5" />
                                 <Button Content="Copy path" Click="CopyPath_Click" Margin="0,0,5,5" />
-                                <Button Content="Recycle" Click="RecycleSelected_Click" Margin="0,0,5,5" />
                             </WrapPanel>
                         </StackPanel>
                     </Border>

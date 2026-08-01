@@ -19,7 +19,7 @@ Disk Inventory Zed visualizes disk usage with interactive sunbursts, treemaps, a
 - **Crash-Safe Scan Snapshots** — Bounded workers build an immutable tree before SwiftUI sees it
 - **Three Visualizations** — Treemap, hierarchical sunburst, and detailed list views
 - **Smart Sorting** — Sort by name or size (ascending/descending)
-- **Safe Cleanup** — Reveal in Finder or File Explorer and move confirmed local items to Trash or the Recycle Bin; protected roots are blocked
+- **Bounded File Actions** — Reveal items in Finder or File Explorer; macOS also supports confirmed moves to Trash, while Windows performs no deletion
 - **Quick Access** — Scan common folders, drive letters, mounted volumes, mapped drives, UNC shares, or any custom folder
 - **Mounted Volume Overview** — Scan internal, external, and network volumes with free-space context
 - **Breadcrumb Navigation** — Easy traversal up and down the directory tree
@@ -27,12 +27,12 @@ Disk Inventory Zed visualizes disk usage with interactive sunbursts, treemaps, a
 - **File Type Colors** — Files colored by extension type for quick visual identification
 - **Storage Intelligence** — Largest files, old large files, and same-size duplicate discovery
 - **Verified Duplicates** — Cancellable sample-first and full-file SHA-256 verification, including copies with different names
-- **Scan Comparison** — Compare a current scan with a versioned snapshot to find additions, removals, growth, and reclaimed space
-- **Accurate Storage Accounting** — Shows logical and allocated sizes and avoids hard-link double counting
+- **Scan Comparison (macOS)** — Compare a current scan with a versioned snapshot to find additions, removals, growth, and reclaimed space
+- **Storage Accounting** — Shows logical and allocated sizes, de-duplicates hard links when identity metadata is available, and reports uncertainty
 - **Scan Health** — Reports unreadable paths, skipped folders, packages, symlinks, and revisited targets
 - **Global Search** — Debounced indexed search by file name or path without blocking the interface
 - **Portable Exports** — Versioned JSON and streaming CSV with reliability metadata
-- **Deep-Tree Safety** — Iterative tree building, navigation, and cleanup updates avoid recursion overflow
+- **Deep-Tree Safety** — Iterative tree building, navigation, and export avoid recursion overflow
 
 ## Requirements
 
@@ -46,7 +46,7 @@ Disk Inventory Zed visualizes disk usage with interactive sunbursts, treemaps, a
 
 - Windows 10 22H2 or Windows 11
 - x64 or ARM64
-- .NET 8 SDK and Visual Studio 2022 .NET desktop workload (only when building from source)
+- .NET 8.0.423 SDK and Visual Studio 2022 .NET desktop workload (only when building from source)
 
 ## Building
 
@@ -90,8 +90,8 @@ See [Windows/README.md](Windows/README.md) for network-path behavior, shortcuts,
 ## macOS First Launch
 
 Developer builds are ad-hoc signed, so macOS Gatekeeper may show a security warning when you first
-try to open one. Tagged releases can be Developer ID signed and notarized when the repository's
-Apple signing credentials are configured:
+try to open one. The release workflow refuses to publish a tag unless its app is Developer ID signed
+and its DMG is notarized and stapled:
 
 > **"Apple could not verify 'DiskInventoryZed' is free of malware that may harm your Mac or compromise your privacy."**
 
@@ -99,22 +99,14 @@ Apple signing credentials are configured:
 
 The DMG installer includes:
 - **DiskInventoryZed.app** — the main application
-- **First-Run-Helper.app** — click this to open Security & Privacy settings automatically
 - **README.txt** — detailed first-launch instructions
+- **LICENSE.txt** — the complete GNU GPL version 3 license
 
 ### Quick Method: Right-click to Open
 
 1. **Right-click** (or Control-click) the `DiskInventoryZed.app`
 2. Select **"Open"** from the context menu
 3. Click **"Open"** in the dialog that appears
-
-### Using the First-Run-Helper
-
-1. Double-click **"First-Run-Helper.app"** in the DMG
-2. Click **"Open Security Settings"** in the dialog
-3. System Settings will open to the Security pane
-4. Click **"Open Anyway"** next to DiskInventoryZed
-5. Click **"Open"** in the confirmation dialog
 
 ### Manual Method
 
@@ -132,7 +124,7 @@ The DMG installer includes:
 3. Wait for the scan to complete (progress is shown in real-time)
 4. Explore the treemap visualization — click any rectangle to zoom into that folder
 5. Switch to list view for detailed file information
-6. Right-click any file or folder for actions (reveal in Finder/File Explorer or move eligible local items to Trash/Recycle Bin)
+6. Right-click any file or folder for actions. Both platforms can reveal items; only macOS offers a confirmed move to Trash.
 
 The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 
@@ -141,7 +133,7 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 - **Review** highlights old large files and files with the same byte size. Duplicate
   candidates are intentionally labeled as possibilities until the app verifies their full SHA-256
   content digests. Matching names are not required.
-- **Changes** compares a current scan with an earlier snapshot of the same location and separates
+- **Changes (macOS)** compares a current scan with an earlier snapshot of the same location and separates
   growth, reductions, additions, and removals.
 - **Selection** distinguishes logical size from space allocated on disk, which matters for sparse
   files, clones, and hard links.
@@ -152,7 +144,7 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 - **WPF on .NET 8** — Native Windows desktop UI with custom-drawn sunburst and treemap controls
 - **Swift Concurrency** — A bounded actor-backed work queue with cooperative cancellation
 - **Windows File IDs** — ReFS/NTFS 128-bit identity for cycle protection and hard-link accounting
-- **Immutable Snapshots** — Background workers never mutate data already published to SwiftUI
+- **Immutable Snapshots** — Background workers never mutate data already published to either UI
 - **Iterative Tree Operations** — Deep paths do not consume one call-stack frame per directory
 - **Cycle Protection** — Symlink targets and previously visited directories are not traversed twice
 - **Two-Stage Duplicate Verification** — First/last-byte samples minimize I/O before full SHA-256 hashing
@@ -163,13 +155,30 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 
 - “On disk” uses allocated size when macOS provides it; “logical” is the apparent file length.
 - Windows uses allocation size reported by the filesystem and marks logical-size fallbacks in scan diagnostics.
-- Multiple hard links to the same file are shown, but their allocated storage is counted once.
+- Multiple hard links to the same file are shown and counted once when the filesystem supplies stable identity metadata; uncertain cases are reported.
 - APFS clones can share physical blocks without exposing enough public per-file metadata to measure
   exact exclusive ownership. Disk Inventory Zed does not claim clone-level reclaimable bytes.
 - Unreadable or intentionally skipped directories are surfaced in scan diagnostics instead of
   silently presenting the result as complete.
+- Hidden Windows entries are excluded by default. The completed scan records that policy and reports
+  the number of hidden entries encountered; descendants of an excluded directory are not enumerated.
 - NTFS alternate data streams are not included in the initial Windows port. ReFS clones, Windows
   deduplication, cloud placeholders, and shared extents can also limit exact reclaimable-byte estimates.
+
+## Release Integrity
+
+- A release tag must exactly match the version in both platform manifests and point to a commit on `main`.
+- Tagged macOS artifacts require Developer ID signing and successful Apple notarization and stapling.
+- Tagged builds fail closed unless all `APPLE_SIGNING_*`, `APPLE_KEYCHAIN_PASSWORD`, `APPLE_ID`,
+  `APPLE_TEAM_ID`, and `APPLE_APP_PASSWORD` Actions secrets are configured.
+- The publication job targets the `release` environment; configure required reviewers on that
+  environment before enabling tagged releases.
+- CI creates a draft release, downloads every uploaded asset, verifies the platform checksums, and only
+  then publishes the release. Published releases are never overwritten; a failed workflow may resume
+  only a draft carrying that same workflow run's ownership marker.
+- Windows dependencies are restored from committed lock files with the repository-pinned .NET SDK.
+- Windows release zips are currently unsigned and include the .NET license and third-party notices;
+  users should verify the published SHA-256 checksums before running them.
 
 ## License
 
