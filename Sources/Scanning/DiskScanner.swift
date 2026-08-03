@@ -6,7 +6,13 @@
 @preconcurrency import Foundation
 
 #if os(Linux)
+#if canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
+#else
+#error("A supported Linux C library is required")
+#endif
 private let linuxOPath = Int32(0o10000000)
 #endif
 
@@ -475,16 +481,16 @@ final class DiskScanner: Sendable {
         examinedEntryCount: inout Int
     ) throws -> LinuxDirectoryListing {
         let descriptor = try openDirectoryWithoutFollowingSymlinks(at: work.record.url)
-        guard let directory = Glibc.fdopendir(descriptor) else {
+        guard let directory = fdopendir(descriptor) else {
             let errorCode = errno
-            Glibc.close(descriptor)
+            close(descriptor)
             throw POSIXError(POSIXErrorCode(rawValue: errorCode) ?? .EIO)
         }
-        defer { Glibc.closedir(directory) }
+        defer { closedir(directory) }
 
-        let directoryDescriptor = Glibc.dirfd(directory)
+        let directoryDescriptor = dirfd(directory)
         var openedStatus = stat()
-        guard Glibc.fstat(directoryDescriptor, &openedStatus) == 0 else {
+        guard fstat(directoryDescriptor, &openedStatus) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         guard fileType(of: openedStatus.st_mode) == mode_t(S_IFDIR),
@@ -500,7 +506,7 @@ final class DiskScanner: Sendable {
         while true {
             try Task.checkCancellation()
             errno = 0
-            guard let directoryEntry = Glibc.readdir(directory) else {
+            guard let directoryEntry = readdir(directory) else {
                 guard errno == 0 else {
                     throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
                 }
@@ -530,7 +536,7 @@ final class DiskScanner: Sendable {
             var fileSystemName = nameBytes.map { CChar(bitPattern: $0) }
             fileSystemName.append(0)
             let statusResult = fileSystemName.withUnsafeBufferPointer { buffer in
-                Glibc.fstatat(
+                fstatat(
                     directoryDescriptor,
                     buffer.baseAddress!,
                     &childStatus,
@@ -571,7 +577,7 @@ final class DiskScanner: Sendable {
         }
 
         var verificationStatus = stat()
-        guard Glibc.fstat(directoryDescriptor, &verificationStatus) == 0 else {
+        guard fstat(directoryDescriptor, &verificationStatus) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         guard linuxCanonicalDirectoryIdentity(verificationStatus) == work.canonicalDirectoryPath,
@@ -583,9 +589,9 @@ final class DiskScanner: Sendable {
         }
 
         let pathDescriptor = try openDirectoryWithoutFollowingSymlinks(at: work.record.url)
-        defer { Glibc.close(pathDescriptor) }
+        defer { close(pathDescriptor) }
         var pathStatus = stat()
-        guard Glibc.fstat(pathDescriptor, &pathStatus) == 0 else {
+        guard fstat(pathDescriptor, &pathStatus) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         guard linuxCanonicalDirectoryIdentity(pathStatus) == work.canonicalDirectoryPath else {
@@ -600,9 +606,9 @@ final class DiskScanner: Sendable {
 
     private static func linuxDirectoryMetadata(for url: URL) throws -> FileSystemMetadata {
         let descriptor = try openDirectoryWithoutFollowingSymlinks(at: url)
-        defer { Glibc.close(descriptor) }
+        defer { close(descriptor) }
         var status = stat()
-        guard Glibc.fstat(descriptor, &status) == 0 else {
+        guard fstat(descriptor, &status) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         return linuxMetadata(from: status)
@@ -626,7 +632,7 @@ final class DiskScanner: Sendable {
         let rootFlags = components.isEmpty
             ? O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
             : linuxOPath | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
-        var descriptor = Glibc.open("/", rootFlags)
+        var descriptor = open("/", rootFlags)
         guard descriptor >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
@@ -637,14 +643,14 @@ final class DiskScanner: Sendable {
                 ? O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
                 : linuxOPath | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
             let nextDescriptor = component.withCString { name in
-                Glibc.openat(descriptor, name, flags)
+                openat(descriptor, name, flags)
             }
             guard nextDescriptor >= 0 else {
                 let errorCode = errno
-                Glibc.close(descriptor)
+                close(descriptor)
                 throw POSIXError(POSIXErrorCode(rawValue: errorCode) ?? .EIO)
             }
-            Glibc.close(descriptor)
+            close(descriptor)
             descriptor = nextDescriptor
         }
 
@@ -728,7 +734,7 @@ final class DiskScanner: Sendable {
         _ = resourceKeys
         var linkStatus = stat()
         let linkResult = url.path.withCString { path in
-            Glibc.lstat(path, &linkStatus)
+            lstat(path, &linkStatus)
         }
         guard linkResult == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)

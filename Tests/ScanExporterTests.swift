@@ -1,4 +1,11 @@
 @preconcurrency import Foundation
+#if os(Linux)
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+#endif
 import XCTest
 @testable import DiskInventoryZed
 
@@ -945,7 +952,7 @@ final class ScanExporterTests: XCTestCase {
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: workspace) }
         XCTAssertEqual(outputDirectory.path.withCString {
-            Glibc.chmod($0, mode_t(0o777))
+            chmod($0, mode_t(0o777))
         }, 0)
 
         XCTAssertThrowsError(try ScanExporter.prepareLinuxDestination(

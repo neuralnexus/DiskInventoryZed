@@ -6,3 +6,4 @@ DiskInventoryZed.app/
 xcuserdata/
 DerivedData/
 *.moved-aside
+dist/

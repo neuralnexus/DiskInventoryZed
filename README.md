@@ -16,7 +16,7 @@ Disk Inventory Zed visualizes disk usage on macOS with interactive treemaps and 
 
 - **Interactive Treemap Visualization** — Squarified treemap algorithm for optimal space usage visualization
 - **Fast Concurrent Scanning** — Uses Swift concurrency for parallel directory traversal
-- **Crash-Safe Scan Snapshots** — Bounded workers build an immutable tree before SwiftUI sees it
+- **Immutable Scan Snapshots** — Bounded workers finish a tree before a frontend can observe it
 - **Three Visualizations** — Treemap, hierarchical sunburst, and detailed list views
 - **Smart Sorting** — Sort by name or size (ascending/descending)
 - **Safe Cleanup** — Reveal in Finder or move confirmed files and folders to macOS Trash; protected scan roots are blocked
@@ -35,6 +35,20 @@ Disk Inventory Zed visualizes disk usage on macOS with interactive treemaps and 
 - **Deep-Tree Safety** — Iterative tree building, navigation, and cleanup updates avoid recursion overflow
 - **Linux CLI** — Read-only directory scans and JSON/CSV exports
 
+### Platform Capabilities
+
+| Capability | macOS | Linux |
+| --- | --- | --- |
+| Bounded scanning, size accounting, hard-link handling, diagnostics | Yes | Yes |
+| JSON and CSV exports | Yes | Yes |
+| Treemap, sunburst, list browser, search, and analysis sidebar | Yes | No |
+| Snapshot comparison and duplicate verification UI | Yes | No |
+| Open, reveal, Quick Look, and move to Trash | Yes | No; the CLI is read-only |
+| Release packaging (v1.2+) | Universal notarized DMG | Static x86_64 and ARM64 archives |
+
+Linux currently provides the same hardened scanning and export core, not a desktop GUI equivalent.
+Headless comparison and analysis commands are planned before any separate Linux desktop frontend.
+
 ## Requirements
 
 ### macOS App
@@ -45,11 +59,13 @@ Disk Inventory Zed visualizes disk usage on macOS with interactive treemaps and 
 
 ### Linux CLI
 
-- A Linux distribution supported by Swift 5.9 or later
-- Swift 5.9+ (for building from source)
+- v1.2+ release archive: x86_64 or ARM64 Linux; no Swift runtime is required
+- Source build: a distribution and toolchain supported by Swift 5.9 or later
 
-Linux support is source-build only. No prebuilt Linux binary is attached to GitHub Releases;
-install Swift and build the CLI from source using the steps below.
+Starting with v1.2, release archives use Swift's fully static musl SDK and do not depend on a
+distribution's glibc, libstdc++, or Swift installation. CI runs the same x86_64 binary on Ubuntu
+22.04/24.04, Debian 12, Fedora 42, Rocky Linux 9, and Alpine 3.23, and runs the ARM64 binary on
+Ubuntu and Alpine.
 
 ## Building
 
@@ -71,9 +87,9 @@ This will create `DiskInventoryZed.app` in the current directory, built as a uni
 
 ### Using Xcode
 
-1. Open the project in Xcode
-2. Select your target (Intel or Universal)
-3. Build and run
+1. Open `Package.swift` in Xcode
+2. Select the `DiskInventoryZed` scheme and **My Mac** destination
+3. Build and run; use `./build.sh` for an explicit Intel/Apple Silicon universal bundle
 
 ### Building the Linux CLI
 
@@ -82,12 +98,37 @@ swift build -c release
 .build/release/DiskInventoryZed --help
 ```
 
+Native source-build smoke tests run on Ubuntu 22.04/24.04, Debian 12, Amazon Linux 2, and Red Hat
+UBI 9. Portable release packaging specifically requires the Swift 6.3.3 Linux toolchain. Install
+its matching Static Linux SDK, then build either architecture:
+
+```bash
+swift sdk install \
+  https://download.swift.org/swift-6.3.3-release/static-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz \
+  --checksum 87c3eaf908e67c0e13a84367119e12273cec1d2cd3d81f7d74bb36722d6b607b
+./scripts/package-linux.sh x86_64-swift-linux-musl
+./scripts/package-linux.sh aarch64-swift-linux-musl
+```
+
+### Installing a Linux Release
+
+Download the archive matching your architecture, then install the executable:
+
+```bash
+grep 'linux-x86_64\.tar\.gz$' DiskInventoryZed-checksums.txt | sha256sum -c -
+tar -xzf DiskInventoryZed-*-linux-x86_64.tar.gz
+sudo install -m 755 DiskInventoryZed-*-linux-x86_64/DiskInventoryZed /usr/local/bin/
+DiskInventoryZed --help
+```
+
+On ARM64, use the corresponding `linux-aarch64` archive and directory names.
+
 ## macOS First Launch
 
-Developer builds are ad-hoc signed, so macOS Gatekeeper may show a security warning when you first
-try to open one. The release workflow requires a tag on the current `main` commit plus Developer ID
-and notarization credentials in a repository `release` environment. Maintainers should protect that
-environment with required reviewers before configuring its secrets:
+Starting with v1.2, official tagged releases produced by the current workflow are Developer ID signed
+and notarized. The existing v1.1 release, developer builds, and ordinary CI builds may trigger a macOS
+Gatekeeper warning. Future release tags require the current `main` commit plus signing and notarization
+credentials in a protected repository `release` environment:
 
 > **"Apple could not verify 'DiskInventoryZed' is free of malware that may harm your Mac or compromise your privacy."**
 
@@ -154,12 +195,17 @@ Use `--skip-developer-folders` to omit folders such as `.git`, `node_modules`, a
 The Linux CLI lists symlinks but never follows them, and it never deletes or moves files. Use one
 export option per scan and place the output outside the scanned directory. If any entry cannot be
 read or represented safely, the command exits nonzero and does not write the requested export.
+`SIGINT` and `SIGTERM` cancel scans cooperatively so temporary export state can be removed.
+The selected scan root must not contain `..` or pass through a symbolic-link path component.
 Linux exports are create-only, refuse to replace any existing path, and use owner-only permissions
 (`0600`). Export directory ancestry must be owned by the current user or root; group- or
 world-writable directories require the sticky bit. Do not route an export through a bind mount that
-aliases any part of the scan path.
+aliases any part of the scan path. Export destinations must support Unix ownership, file modes, and
+hard links; FAT/exFAT and some SMB or FUSE mounts are not suitable export destinations.
 
-The analysis sidebar goes beyond the classic Disk Inventory X workflow:
+### macOS Analysis Sidebar
+
+The macOS analysis sidebar goes beyond the classic Disk Inventory X workflow:
 
 - **Types** aggregates storage by extension.
 - **Largest** finds the largest files anywhere in the scanned tree.
@@ -189,9 +235,11 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 - Totals sum file allocation and do not include filesystem directory-entry metadata.
 - Multiple hard links to the same file are shown, but their allocated storage is counted once.
 - Linux filenames that are not valid UTF-8 are reported as unreadable, and prevent export, because exported paths are UTF-8 strings.
-- Scans and exports are capped at 1,000,000 entries, individual Linux directories at 100,000 visible entries, and imported JSON snapshots at 256 MiB.
-- APFS clones can share physical blocks without exposing enough public per-file metadata to measure
-  exact exclusive ownership. Disk Inventory Zed does not claim clone-level reclaimable bytes.
+- Scans and exports are capped at 1,000,000 examined entries, individual directories at 100,000
+  examined entries including hidden entries, and imported JSON snapshots at 256 MiB.
+- APFS clones and Linux reflinks or deduplicated extents can share physical blocks without exposing
+  enough portable per-file metadata to measure exact exclusive ownership. Disk Inventory Zed reports
+  per-inode allocated blocks and does not claim clone-level or reflink-level reclaimable bytes.
 - Unreadable or intentionally skipped directories are surfaced in scan diagnostics instead of
   silently presenting the result as complete.
 

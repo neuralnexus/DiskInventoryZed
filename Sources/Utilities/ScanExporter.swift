@@ -6,7 +6,13 @@
 import Foundation
 
 #if os(Linux)
+#if canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
+#else
+#error("A supported Linux C library is required")
+#endif
 private let linuxOTemporaryFile = Int32(0o20200000)
 #else
 import Darwin
@@ -243,7 +249,7 @@ enum ScanExporter {
         let parentURL = destinationURL.deletingLastPathComponent()
         let parentDescriptor = parentURL.withUnsafeFileSystemRepresentation { path -> Int32 in
             guard let path else { return -1 }
-            return Glibc.open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         }
         guard parentDescriptor >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
@@ -267,7 +273,7 @@ enum ScanExporter {
                 excludedDirectoryIdentities: excludedIdentities
             )
         } catch {
-            Glibc.close(parentDescriptor)
+            close(parentDescriptor)
             throw error
         }
     }
@@ -294,7 +300,7 @@ enum ScanExporter {
             excludes: destination.excludedDirectoryIdentities,
             displayPath: destination.displayPath
         )
-        let unnamedDescriptor = Glibc.openat(
+        let unnamedDescriptor = openat(
             destination.parentDescriptor,
             ".",
             O_WRONLY | linuxOTemporaryFile | O_CLOEXEC,
@@ -330,7 +336,7 @@ enum ScanExporter {
 
         let stagingName = ".DiskInventoryZed-\(UUID().uuidString).tmp"
         let createStagingResult = stagingName.withCString { name in
-            Glibc.mkdirat(destination.parentDescriptor, name, mode_t(0o700))
+            mkdirat(destination.parentDescriptor, name, mode_t(0o700))
         }
         guard createStagingResult == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
@@ -339,16 +345,16 @@ enum ScanExporter {
         var stagingDescriptor: Int32 = -1
         defer {
             if stagingDescriptor >= 0 {
-                Glibc.close(stagingDescriptor)
+                close(stagingDescriptor)
             }
             _ = stagingName.withCString { name in
-                Glibc.unlinkat(destination.parentDescriptor, name, AT_REMOVEDIR)
+                unlinkat(destination.parentDescriptor, name, AT_REMOVEDIR)
             }
         }
 
         var createdStagingStatus = stat()
         let stagingStatusResult = stagingName.withCString { name in
-            Glibc.fstatat(
+            fstatat(
                 destination.parentDescriptor,
                 name,
                 &createdStagingStatus,
@@ -357,23 +363,23 @@ enum ScanExporter {
         }
         guard stagingStatusResult == 0,
               createdStagingStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
-              createdStagingStatus.st_uid == Glibc.geteuid() else {
+              createdStagingStatus.st_uid == geteuid() else {
             throw ScanExportError.invalidTemporaryFile
         }
 
         stagingDescriptor = stagingName.withCString { name in
-            Glibc.openat(
+            openat(
                 destination.parentDescriptor,
                 name,
                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
             )
         }
         guard stagingDescriptor >= 0,
-              Glibc.fchmod(stagingDescriptor, mode_t(0o700)) == 0 else {
+              fchmod(stagingDescriptor, mode_t(0o700)) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         var openedStagingStatus = stat()
-        guard Glibc.fstat(stagingDescriptor, &openedStagingStatus) == 0,
+        guard fstat(stagingDescriptor, &openedStagingStatus) == 0,
               openedStagingStatus.st_dev == createdStagingStatus.st_dev,
               openedStagingStatus.st_ino == createdStagingStatus.st_ino else {
             throw ScanExportError.invalidTemporaryFile
@@ -381,7 +387,7 @@ enum ScanExporter {
 
         let temporaryName = "export"
         let temporaryDescriptor = temporaryName.withCString { name in
-            Glibc.openat(
+            openat(
                 stagingDescriptor,
                 name,
                 O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
@@ -395,20 +401,20 @@ enum ScanExporter {
         defer {
             if temporaryExists {
                 _ = temporaryName.withCString { name in
-                    Glibc.unlinkat(stagingDescriptor, name, 0)
+                    unlinkat(stagingDescriptor, name, 0)
                 }
             }
         }
 
-        guard Glibc.fchmod(temporaryDescriptor, mode_t(0o600)) == 0 else {
-            Glibc.close(temporaryDescriptor)
+        guard fchmod(temporaryDescriptor, mode_t(0o600)) == 0 else {
+            close(temporaryDescriptor)
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         var temporaryStatus = stat()
-        guard Glibc.fstat(temporaryDescriptor, &temporaryStatus) == 0,
+        guard fstat(temporaryDescriptor, &temporaryStatus) == 0,
               temporaryStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
               temporaryStatus.st_mode & mode_t(0o777) == mode_t(0o600) else {
-            Glibc.close(temporaryDescriptor)
+            close(temporaryDescriptor)
             throw ScanExportError.invalidTemporaryFile
         }
 
@@ -430,7 +436,7 @@ enum ScanExporter {
             displayPath: destination.displayPath
         )
         let statusResult = destination.name.withCString { name in
-            Glibc.fstatat(
+            fstatat(
                 destination.parentDescriptor,
                 name,
                 &destinationStatus,
@@ -448,7 +454,7 @@ enum ScanExporter {
 
         let linkResult = temporaryName.withCString { temporaryPath in
             destination.name.withCString { destinationPath in
-                Glibc.linkat(
+                linkat(
                     stagingDescriptor,
                     temporaryPath,
                     destination.parentDescriptor,
@@ -462,6 +468,15 @@ enum ScanExporter {
                 throw ScanExportError.destinationExists(destination.displayPath)
             }
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        var publicationCommitted = false
+        defer {
+            if !publicationCommitted {
+                removePublishedFileIfUnchanged(
+                    destination: destination,
+                    expectedStatus: temporaryStatus
+                )
+            }
         }
 
         do {
@@ -478,13 +493,15 @@ enum ScanExporter {
             throw error
         }
 
-        _ = Glibc.fsync(destination.parentDescriptor)
+        _ = fsync(destination.parentDescriptor)
         let unlinkResult = temporaryName.withCString { name in
-            Glibc.unlinkat(stagingDescriptor, name, 0)
+            unlinkat(stagingDescriptor, name, 0)
         }
         if unlinkResult == 0 {
             temporaryExists = false
         }
+        try Task.checkCancellation()
+        publicationCommitted = true
     }
 
     private static func writeUnnamedTemporary(
@@ -492,12 +509,12 @@ enum ScanExporter {
         to destination: LinuxExportDestination,
         body: (FileHandle) throws -> Void
     ) throws {
-        defer { Glibc.close(descriptor) }
-        guard Glibc.fchmod(descriptor, mode_t(0o600)) == 0 else {
+        defer { close(descriptor) }
+        guard fchmod(descriptor, mode_t(0o600)) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         var temporaryStatus = stat()
-        guard Glibc.fstat(descriptor, &temporaryStatus) == 0,
+        guard fstat(descriptor, &temporaryStatus) == 0,
               temporaryStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
               temporaryStatus.st_mode & mode_t(0o777) == mode_t(0o600) else {
             throw ScanExportError.invalidTemporaryFile
@@ -515,7 +532,7 @@ enum ScanExporter {
         )
         var destinationStatus = stat()
         let statusResult = destination.name.withCString { name in
-            Glibc.fstatat(
+            fstatat(
                 destination.parentDescriptor,
                 name,
                 &destinationStatus,
@@ -534,7 +551,7 @@ enum ScanExporter {
         let descriptorPath = "/proc/self/fd/\(descriptor)"
         let linkResult = descriptorPath.withCString { sourcePath in
             destination.name.withCString { destinationPath in
-                Glibc.linkat(
+                linkat(
                     AT_FDCWD,
                     sourcePath,
                     destination.parentDescriptor,
@@ -552,6 +569,15 @@ enum ScanExporter {
             }
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
+        var publicationCommitted = false
+        defer {
+            if !publicationCommitted {
+                removePublishedFileIfUnchanged(
+                    destination: destination,
+                    expectedStatus: temporaryStatus
+                )
+            }
+        }
 
         do {
             try validateDestinationParent(
@@ -566,7 +592,9 @@ enum ScanExporter {
             )
             throw error
         }
-        _ = Glibc.fsync(destination.parentDescriptor)
+        _ = fsync(destination.parentDescriptor)
+        try Task.checkCancellation()
+        publicationCommitted = true
     }
 
     private static func removePublishedFileIfUnchanged(
@@ -575,7 +603,7 @@ enum ScanExporter {
     ) {
         var publishedStatus = stat()
         let publishedResult = destination.name.withCString { name in
-            Glibc.fstatat(
+            fstatat(
                 destination.parentDescriptor,
                 name,
                 &publishedStatus,
@@ -586,7 +614,7 @@ enum ScanExporter {
            publishedStatus.st_dev == expectedStatus.st_dev,
            publishedStatus.st_ino == expectedStatus.st_ino {
             _ = destination.name.withCString { name in
-                Glibc.unlinkat(destination.parentDescriptor, name, 0)
+                unlinkat(destination.parentDescriptor, name, 0)
             }
         }
     }
@@ -596,7 +624,7 @@ enum ScanExporter {
         excludes excludedIdentities: Set<String>,
         displayPath: String
     ) throws {
-        var descriptor = Glibc.openat(
+        var descriptor = openat(
             parentDescriptor,
             ".",
             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
@@ -604,14 +632,14 @@ enum ScanExporter {
         guard descriptor >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        defer { Glibc.close(descriptor) }
+        defer { close(descriptor) }
 
         while true {
             var status = stat()
-            guard Glibc.fstat(descriptor, &status) == 0 else {
+            guard fstat(descriptor, &status) == 0 else {
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
-            let ownerIsTrusted = status.st_uid == Glibc.geteuid() || status.st_uid == 0
+            let ownerIsTrusted = status.st_uid == geteuid() || status.st_uid == 0
             let writableByOthers = status.st_mode & mode_t(S_IWGRP | S_IWOTH) != 0
             let hasStickyBit = status.st_mode & mode_t(S_ISVTX) != 0
             guard ownerIsTrusted, !writableByOthers || hasStickyBit else {
@@ -622,7 +650,7 @@ enum ScanExporter {
                 throw ScanExportError.outputInsideScan(displayPath)
             }
 
-            let parent = Glibc.openat(
+            let parent = openat(
                 descriptor,
                 "..",
                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
@@ -631,18 +659,18 @@ enum ScanExporter {
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             var parentStatus = stat()
-            guard Glibc.fstat(parent, &parentStatus) == 0 else {
+            guard fstat(parent, &parentStatus) == 0 else {
                 let errorCode = errno
-                Glibc.close(parent)
+                close(parent)
                 throw POSIXError(POSIXErrorCode(rawValue: errorCode) ?? .EIO)
             }
             if parentStatus.st_dev == status.st_dev,
                parentStatus.st_ino == status.st_ino {
-                Glibc.close(parent)
+                close(parent)
                 break
             }
 
-            Glibc.close(descriptor)
+            close(descriptor)
             descriptor = parent
         }
     }
@@ -654,7 +682,7 @@ enum ScanExporter {
     ) throws {
         var destinationStatus = stat()
         let statusResult = name.withCString { path in
-            Glibc.fstatat(parentDescriptor, path, &destinationStatus, AT_SYMLINK_NOFOLLOW)
+            fstatat(parentDescriptor, path, &destinationStatus, AT_SYMLINK_NOFOLLOW)
         }
         if statusResult == 0 {
             if destinationStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFLNK) {
@@ -672,7 +700,7 @@ enum ScanExporter {
         let descriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
             guard let path else { return -1 }
 #if os(Linux)
-            return Glibc.open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
+            return open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
 #else
             return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
 #endif
@@ -682,7 +710,7 @@ enum ScanExporter {
         }
         defer {
 #if os(Linux)
-            Glibc.close(descriptor)
+            close(descriptor)
 #else
             Darwin.close(descriptor)
 #endif
@@ -690,7 +718,7 @@ enum ScanExporter {
 
         var status = stat()
 #if os(Linux)
-        let statusResult = Glibc.fstat(descriptor, &status)
+        let statusResult = fstat(descriptor, &status)
 #else
         let statusResult = Darwin.fstat(descriptor, &status)
 #endif
@@ -852,7 +880,7 @@ final class LinuxExportDestination {
     }
 
     deinit {
-        Glibc.close(parentDescriptor)
+        close(parentDescriptor)
     }
 }
 #endif

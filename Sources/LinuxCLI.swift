@@ -6,9 +6,44 @@
 #if os(Linux)
 import Dispatch
 import Foundation
+import CLinuxSignals
+#if canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
+#else
+#error("A supported Linux C library is required")
+#endif
 
 private let linuxCommandLineArguments = Array(ProcessInfo.processInfo.arguments.dropFirst())
+
+private final class LinuxSignalState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var signalExitCode: Int32?
+    private var commandTask: Task<Int32, Never>?
+
+    func handle(_ signalNumber: Int32) {
+        lock.lock()
+        guard signalExitCode == nil else {
+            lock.unlock()
+            return
+        }
+        signalExitCode = 128 + signalNumber
+        let task = commandTask
+        lock.unlock()
+        task?.cancel()
+    }
+
+    func register(_ task: Task<Int32, Never>) {
+        lock.lock()
+        commandTask = task
+        let shouldCancel = signalExitCode != nil
+        lock.unlock()
+        if shouldCancel {
+            task.cancel()
+        }
+    }
+}
 
 struct LinuxCLIConfiguration: Equatable {
     let path: String
@@ -172,24 +207,48 @@ struct DiskInventoryZedCLI {
     """
 
     static func main() async {
-        _ = Glibc.signal(SIGINT, SIG_IGN)
+        var signalDescriptors = [Int32](repeating: -1, count: 2)
+        let installResult = signalDescriptors.withUnsafeMutableBufferPointer { descriptors in
+            diz_install_signal_pipe(descriptors.baseAddress)
+        }
+        guard installResult == 0 else {
+            try? write("error: Could not install signal handlers.\n", to: .standardError)
+            exit(1)
+        }
+        let signalReadDescriptor = signalDescriptors[0]
+        let signalQueue = DispatchQueue(label: "DiskInventoryZed.signals")
+        let signalSource = DispatchSource.makeReadSource(
+            fileDescriptor: signalReadDescriptor,
+            queue: signalQueue
+        )
+        let signalState = LinuxSignalState()
+        signalSource.setEventHandler {
+            while true {
+                var signalNumber: Int32 = 0
+                let readCount = withUnsafeMutableBytes(of: &signalNumber) { buffer in
+                    read(signalReadDescriptor, buffer.baseAddress, buffer.count)
+                }
+                if readCount == MemoryLayout<Int32>.size {
+                    signalState.handle(signalNumber)
+                    continue
+                }
+                if readCount < 0 && errno == EINTR {
+                    continue
+                }
+                break
+            }
+        }
+        signalSource.resume()
         let commandTask = Task {
             await execute(arguments: linuxCommandLineArguments)
         }
-        let interruptSource = DispatchSource.makeSignalSource(
-            signal: SIGINT,
-            queue: DispatchQueue.global(qos: .userInitiated)
-        )
-        interruptSource.setEventHandler {
-            commandTask.cancel()
-            _ = Glibc.signal(SIGINT, SIG_DFL)
-        }
-        interruptSource.resume()
-        let exitCode = await commandTask.value
-        interruptSource.cancel()
-        _ = Glibc.signal(SIGINT, SIG_DFL)
+        signalState.register(commandTask)
+        let commandExitCode = await commandTask.value
+        signalSource.cancel()
+        let receivedSignal = diz_finish_signal_pipe()
+        let exitCode = receivedSignal == 0 ? commandExitCode : 128 + receivedSignal
         if exitCode != 0 {
-            Glibc.exit(exitCode)
+            exit(exitCode)
         }
     }
 
@@ -214,7 +273,7 @@ struct DiskInventoryZedCLI {
             }
         }
 
-        let displaysProgress = Glibc.isatty(STDERR_FILENO) == 1
+        let displaysProgress = isatty(STDERR_FILENO) == 1
         do {
             let sourceURL = fileURL(for: configuration.path)
             try validateOutputLocation(configuration.jsonOutput, relativeTo: sourceURL)
@@ -379,10 +438,10 @@ struct DiskInventoryZedCLI {
 
     private static func resolvedPath(_ path: String) throws -> String {
         try path.withCString { fileSystemPath in
-            guard let resolved = Glibc.realpath(fileSystemPath, nil) else {
+            guard let resolved = realpath(fileSystemPath, nil) else {
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
-            defer { Glibc.free(resolved) }
+            defer { free(resolved) }
             guard let value = String(validatingUTF8: resolved) else {
                 throw LinuxCLIRuntimeError.invalidFileSystemPath(path)
             }

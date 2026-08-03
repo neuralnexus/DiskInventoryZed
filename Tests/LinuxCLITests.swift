@@ -1,6 +1,10 @@
 #if os(Linux)
 import Foundation
+#if canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
 import XCTest
 @testable import DiskInventoryZed
 
@@ -102,12 +106,12 @@ final class LinuxCLITests: XCTestCase {
         let output = workspace.appendingPathComponent("scan.json")
 
         let directoryDescriptor = source.path.withCString {
-            Glibc.open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         }
         XCTAssertGreaterThanOrEqual(directoryDescriptor, 0)
         let invalidName = [CChar(bitPattern: 0xFF), CChar(0)]
         let fileDescriptor = invalidName.withUnsafeBufferPointer {
-            Glibc.openat(
+            openat(
                 directoryDescriptor,
                 $0.baseAddress!,
                 O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
@@ -115,12 +119,12 @@ final class LinuxCLITests: XCTestCase {
             )
         }
         XCTAssertGreaterThanOrEqual(fileDescriptor, 0)
-        Glibc.close(fileDescriptor)
+        close(fileDescriptor)
         defer {
             _ = invalidName.withUnsafeBufferPointer {
-                Glibc.unlinkat(directoryDescriptor, $0.baseAddress!, 0)
+                unlinkat(directoryDescriptor, $0.baseAddress!, 0)
             }
-            Glibc.close(directoryDescriptor)
+            close(directoryDescriptor)
         }
 
         let exitCode = await DiskInventoryZedCLI.execute(arguments: [

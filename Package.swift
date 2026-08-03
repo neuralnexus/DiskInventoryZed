@@ -22,8 +22,16 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "DiskInventoryZed",
+            dependencies: [
+                .target(name: "CLinuxSignals", condition: .when(platforms: [.linux]))
+            ],
             path: "Sources",
             exclude: excludedSources
+        ),
+        .target(
+            name: "CLinuxSignals",
+            path: "CLinuxSignals",
+            publicHeadersPath: "include"
         ),
         .testTarget(
             name: "DiskInventoryZedTests",

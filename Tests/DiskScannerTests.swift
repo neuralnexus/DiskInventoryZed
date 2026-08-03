@@ -1,6 +1,10 @@
 @preconcurrency import Foundation
 #if os(Linux)
+#if canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
 #endif
 import XCTest
 @testable import DiskInventoryZed
@@ -144,13 +148,13 @@ final class DiskScannerTests: XCTestCase {
         )
         let linkResult = original.path.withCString { originalPath in
             linked.path.withCString { linkedPath in
-                Glibc.link(originalPath, linkedPath)
+                link(originalPath, linkedPath)
             }
         }
         XCTAssertEqual(linkResult, 0)
 
         var linkStatus = stat()
-        XCTAssertEqual(original.path.withCString { Glibc.lstat($0, &linkStatus) }, 0)
+        XCTAssertEqual(original.path.withCString { lstat($0, &linkStatus) }, 0)
         XCTAssertEqual(linkStatus.st_nlink, 2)
 
         let result = try await DiskScanner().scan(url: root, options: .default) { _ in }
@@ -386,7 +390,7 @@ final class DiskScannerTests: XCTestCase {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let directoryDescriptor = root.path.withCString {
-            Glibc.open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         }
         XCTAssertGreaterThanOrEqual(directoryDescriptor, 0)
         let invalidNameBytes: [[UInt8]] = [[0xFF], [0xFE]]
@@ -396,17 +400,17 @@ final class DiskScannerTests: XCTestCase {
         defer {
             for invalidName in invalidNames {
                 _ = invalidName.withUnsafeBufferPointer {
-                    Glibc.unlinkat(directoryDescriptor, $0.baseAddress!, 0)
+                    unlinkat(directoryDescriptor, $0.baseAddress!, 0)
                 }
             }
-            Glibc.close(directoryDescriptor)
+            close(directoryDescriptor)
         }
 
         var expectedLogicalSize: Int64 = 0
         var expectedAllocatedSize: Int64 = 0
         for (index, invalidName) in invalidNames.enumerated() {
             let fileDescriptor = invalidName.withUnsafeBufferPointer {
-                Glibc.openat(
+                openat(
                     directoryDescriptor,
                     $0.baseAddress!,
                     O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
@@ -416,14 +420,14 @@ final class DiskScannerTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(fileDescriptor, 0)
             let contents = Data(repeating: UInt8(index + 1), count: 4_097 + index * 2_048)
             let written = contents.withUnsafeBytes { bytes in
-                Glibc.write(fileDescriptor, bytes.baseAddress!, bytes.count)
+                write(fileDescriptor, bytes.baseAddress!, bytes.count)
             }
             XCTAssertEqual(Int(written), contents.count)
             var status = stat()
-            XCTAssertEqual(Glibc.fstat(fileDescriptor, &status), 0)
+            XCTAssertEqual(fstat(fileDescriptor, &status), 0)
             expectedLogicalSize += Int64(status.st_size)
             expectedAllocatedSize += Int64(status.st_blocks) * 512
-            Glibc.close(fileDescriptor)
+            close(fileDescriptor)
         }
 
         let result = try await DiskScanner().scan(
@@ -457,22 +461,22 @@ final class DiskScannerTests: XCTestCase {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let directoryDescriptor = root.path.withCString {
-            Glibc.open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         }
         XCTAssertGreaterThanOrEqual(directoryDescriptor, 0)
         let invalidName = [CChar(bitPattern: 0xFF), CChar(bitPattern: 0x44), CChar(0)]
         XCTAssertEqual(invalidName.withUnsafeBufferPointer {
-            Glibc.mkdirat(directoryDescriptor, $0.baseAddress!, mode_t(0o700))
+            mkdirat(directoryDescriptor, $0.baseAddress!, mode_t(0o700))
         }, 0)
         defer {
             _ = invalidName.withUnsafeBufferPointer {
-                Glibc.unlinkat(directoryDescriptor, $0.baseAddress!, AT_REMOVEDIR)
+                unlinkat(directoryDescriptor, $0.baseAddress!, AT_REMOVEDIR)
             }
-            Glibc.close(directoryDescriptor)
+            close(directoryDescriptor)
         }
         var status = stat()
         XCTAssertEqual(invalidName.withUnsafeBufferPointer {
-            Glibc.fstatat(directoryDescriptor, $0.baseAddress!, &status, AT_SYMLINK_NOFOLLOW)
+            fstatat(directoryDescriptor, $0.baseAddress!, &status, AT_SYMLINK_NOFOLLOW)
         }, 0)
 
         let result = try await DiskScanner().scan(
@@ -503,12 +507,12 @@ final class DiskScannerTests: XCTestCase {
         try Data("valid".utf8).write(to: placeholder)
 
         let directoryDescriptor = root.path.withCString {
-            Glibc.open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         }
         XCTAssertGreaterThanOrEqual(directoryDescriptor, 0)
         let invalidName = [CChar(bitPattern: 0xFF), CChar(0)]
         let invalidDescriptor = invalidName.withUnsafeBufferPointer {
-            Glibc.openat(
+            openat(
                 directoryDescriptor,
                 $0.baseAddress!,
                 O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
@@ -516,12 +520,12 @@ final class DiskScannerTests: XCTestCase {
             )
         }
         XCTAssertGreaterThanOrEqual(invalidDescriptor, 0)
-        Glibc.close(invalidDescriptor)
+        close(invalidDescriptor)
         defer {
             _ = invalidName.withUnsafeBufferPointer {
-                Glibc.unlinkat(directoryDescriptor, $0.baseAddress!, 0)
+                unlinkat(directoryDescriptor, $0.baseAddress!, 0)
             }
-            Glibc.close(directoryDescriptor)
+            close(directoryDescriptor)
         }
 
         let result = try await DiskScanner().scan(
@@ -567,7 +571,7 @@ final class DiskScannerTests: XCTestCase {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let directoryDescriptor = root.path.withCString {
-            Glibc.open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         }
         XCTAssertGreaterThanOrEqual(directoryDescriptor, 0)
         let invalidName = [
@@ -576,17 +580,17 @@ final class DiskScannerTests: XCTestCase {
             CChar(0)
         ]
         XCTAssertEqual(invalidName.withUnsafeBufferPointer {
-            Glibc.mkdirat(directoryDescriptor, $0.baseAddress!, mode_t(0o700))
+            mkdirat(directoryDescriptor, $0.baseAddress!, mode_t(0o700))
         }, 0)
         defer {
             _ = invalidName.withUnsafeBufferPointer {
-                Glibc.unlinkat(directoryDescriptor, $0.baseAddress!, AT_REMOVEDIR)
+                unlinkat(directoryDescriptor, $0.baseAddress!, AT_REMOVEDIR)
             }
-            Glibc.close(directoryDescriptor)
+            close(directoryDescriptor)
         }
         var status = stat()
         XCTAssertEqual(invalidName.withUnsafeBufferPointer {
-            Glibc.fstatat(directoryDescriptor, $0.baseAddress!, &status, AT_SYMLINK_NOFOLLOW)
+            fstatat(directoryDescriptor, $0.baseAddress!, &status, AT_SYMLINK_NOFOLLOW)
         }, 0)
         let hiddenIdentity = "\(status.st_dev)|\(status.st_ino)"
 

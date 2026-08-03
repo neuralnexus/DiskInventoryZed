@@ -82,6 +82,13 @@ jobs:
         with:
           swift-version: "5.9"
 
+      - name: Compile signal bridge with strict C diagnostics
+        run: |
+          clang -std=c11 -Wall -Wextra -Werror -pedantic \
+            -I CLinuxSignals/include \
+            -c CLinuxSignals/CLinuxSignals.c \
+            -o "$RUNNER_TEMP/CLinuxSignals.o"
+
       - name: Run Linux unit tests
         run: swift test -Xswiftc -strict-concurrency=complete
 
@@ -108,8 +115,154 @@ jobs:
           assert any(entry["name"] == "file.txt" for entry in scan["entries"])
           PY
 
+  linux-distributions:
+    runs-on: ubuntu-22.04
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 24.04
+            image: swift:6.3.3-noble
+          - name: Debian 12
+            image: swift:6.3.3-bookworm
+          - name: Amazon Linux 2
+            image: swift:6.3.3-amazonlinux2
+          - name: Red Hat UBI 9
+            image: swift:6.3.3-rhel-ubi9
+
+    name: Linux source smoke (${{ matrix.name }})
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and smoke test CLI
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" \
+            -w /workspace \
+            "${{ matrix.image }}" \
+            /bin/bash -lc '
+              swift build -c release --scratch-path /tmp/diz-build -Xswiftc -strict-concurrency=complete &&
+              mkdir -p /tmp/diz-input/nested &&
+              printf "distribution smoke test\n" > /tmp/diz-input/nested/file.txt &&
+              /tmp/diz-build/x86_64-unknown-linux-gnu/release/DiskInventoryZed --json /tmp/scan.json /tmp/diz-input >/dev/null &&
+              test -s /tmp/scan.json
+            '
+
+  linux-portable:
+    runs-on: ubuntu-22.04
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Swift
+        uses: swift-actions/setup-swift@v3
+        with:
+          swift-version: "6.3.3"
+
+      - name: Install Static Linux SDK
+        run: |
+          swift sdk install \
+            https://download.swift.org/swift-6.3.3-release/static-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz \
+            --checksum 87c3eaf908e67c0e13a84367119e12273cec1d2cd3d81f7d74bb36722d6b607b
+
+      - name: Build portable Linux archives
+        run: |
+          ./scripts/package-linux.sh x86_64-swift-linux-musl dist
+          ./scripts/package-linux.sh aarch64-swift-linux-musl dist
+          mkdir -p dist/smoke/x86_64 dist/smoke/aarch64
+          tar -xzf dist/DiskInventoryZed-*-linux-x86_64.tar.gz \
+            -C dist/smoke/x86_64 --strip-components=1
+          tar -xzf dist/DiskInventoryZed-*-linux-aarch64.tar.gz \
+            -C dist/smoke/aarch64 --strip-components=1
+          test -x dist/smoke/x86_64/DiskInventoryZed
+          test -x dist/smoke/aarch64/DiskInventoryZed
+          file dist/smoke/x86_64/DiskInventoryZed | grep -Eq 'ELF 64-bit.*x86-64.*statically linked'
+          file dist/smoke/aarch64/DiskInventoryZed | grep -Eq 'ELF 64-bit.*ARM aarch64.*statically linked'
+
+      - name: Enable ARM64 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Smoke test portable binaries
+        run: |
+          smoke_binary() {
+            local platform="$1"
+            local image="$2"
+            local binary="$3"
+            docker run --rm --platform "$platform" \
+              -v "$GITHUB_WORKSPACE/$binary:/opt/DiskInventoryZed:ro" \
+              "$image" /bin/sh -c '
+                mkdir -p /tmp/diz-input/nested &&
+                printf "portable smoke test\n" > /tmp/diz-input/nested/file.txt &&
+                /opt/DiskInventoryZed --json /tmp/scan.json /tmp/diz-input >/dev/null &&
+                test -s /tmp/scan.json
+              '
+          }
+
+          for image in ubuntu:22.04 ubuntu:24.04 debian:12 fedora:42 rockylinux:9 alpine:3.23; do
+            smoke_binary linux/amd64 "$image" dist/smoke/x86_64/DiskInventoryZed
+          done
+          smoke_binary linux/arm64 ubuntu:22.04 dist/smoke/aarch64/DiskInventoryZed
+          smoke_binary linux/arm64 alpine:3.23 dist/smoke/aarch64/DiskInventoryZed
+
+      - name: Verify portable signal cancellation
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v "$GITHUB_WORKSPACE/dist/smoke/x86_64/DiskInventoryZed:/opt/DiskInventoryZed:ro" \
+            alpine:3.23 /bin/sh -c '
+              set -eu
+              mkdir -p /tmp/diz-input
+              index=0
+              while [ "$index" -lt 50000 ]; do
+                : > "/tmp/diz-input/file-$index"
+                index=$((index + 1))
+              done
+              probe_signal() {
+                signal_name="$1"
+                expected_status="$2"
+                output="/tmp/scan-$signal_name.json"
+                errors="/tmp/errors-$signal_name.txt"
+                /opt/DiskInventoryZed --json "$output" /tmp/diz-input \
+                  >/dev/null 2>"$errors" &
+                process_id=$!
+                sleep 0.2
+                kill -0 "$process_id"
+                kill -s "$signal_name" "$process_id"
+                set +e
+                wait "$process_id"
+                status=$?
+                set -e
+                test "$status" -eq "$expected_status"
+                test ! -e "$output"
+                grep -q "Scan cancelled" "$errors"
+              }
+              probe_signal INT 130
+              probe_signal TERM 143
+            '
+
+      - name: Generate Linux checksums
+        run: |
+          cd dist
+          sha256sum -- *.tar.gz > DiskInventoryZed-linux-checksums.txt
+
+      - name: Upload portable Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DiskInventoryZed-Linux
+          path: |
+            dist/*.tar.gz
+            dist/DiskInventoryZed-linux-checksums.txt
+          if-no-files-found: error
+
   release:
-    needs: [build, linux]
+    needs: [build, linux, linux-distributions, linux-portable]
     runs-on: macos-latest
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     environment: release
@@ -152,31 +305,44 @@ jobs:
           : "${APPLE_SIGNING_CERTIFICATE_BASE64:?APPLE_SIGNING_CERTIFICATE_BASE64 secret is required for tagged releases}"
           : "${APPLE_SIGNING_CERTIFICATE_PASSWORD:?APPLE_SIGNING_CERTIFICATE_PASSWORD secret is required for tagged releases}"
 
-      - name: Check whether release exists
+      - name: Check release state
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
           RESPONSE_PATH="$RUNNER_TEMP/release-lookup.json"
-          if ! HTTP_STATUS="$(curl --silent --show-error \
-            --output "$RESPONSE_PATH" \
-            --write-out '%{http_code}' \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header 'Accept: application/vnd.github+json' \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG_NAME")"; then
+          if ! gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 100 \
+            --json tagName,isDraft > "$RESPONSE_PATH"; then
             echo "Could not determine whether release '$TAG_NAME' exists." >&2
             exit 1
           fi
-          case "$HTTP_STATUS" in
-            404) ;;
-            200)
-              echo "Release '$TAG_NAME' already exists; refusing to replace its assets." >&2
-              exit 1
+          RELEASE_STATE="$(
+            python3 - "$RESPONSE_PATH" "$TAG_NAME" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              releases = json.load(source)
+          release = next((item for item in releases if item["tagName"] == sys.argv[2]), None)
+          if release is None:
+              print("missing")
+          elif release["isDraft"]:
+              print("draft")
+          else:
+              print("published")
+          PY
+          )"
+          case "$RELEASE_STATE" in
+            missing)
+              echo "REUSE_RELEASE_DRAFT=false" >> "$GITHUB_ENV"
               ;;
-            *)
-              echo "Release lookup failed with HTTP status $HTTP_STATUS." >&2
-              cat "$RESPONSE_PATH" >&2
+            draft)
+              echo "REUSE_RELEASE_DRAFT=true" >> "$GITHUB_ENV"
+              ;;
+            published)
+              echo "Published release '$TAG_NAME' already exists; refusing to replace its assets." >&2
               exit 1
               ;;
           esac
@@ -236,21 +402,40 @@ jobs:
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: ./scripts/notarize.sh DiskInventoryZed-*.dmg
 
+      - name: Download portable Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: DiskInventoryZed-Linux
+          path: linux-dist
+
+      - name: Prepare portable Linux artifacts
+        run: cp linux-dist/*.tar.gz .
+
       - name: Generate release checksums
-        run: shasum -a 256 DiskInventoryZed-*.dmg > DiskInventoryZed-checksums.txt
+        run: shasum -a 256 DiskInventoryZed-*.dmg DiskInventoryZed-*-linux-*.tar.gz > DiskInventoryZed-checksums.txt
       
-      - name: Create Release
+      - name: Create and publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG_NAME" \
+          if [ "${REUSE_RELEASE_DRAFT:-false}" != true ]; then
+            gh release create "$TAG_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --target "$GITHUB_SHA" \
+              --generate-notes \
+              --draft
+          fi
+          gh release upload "$TAG_NAME" \
             DiskInventoryZed-*.dmg \
+            DiskInventoryZed-*-linux-*.tar.gz \
             DiskInventoryZed-checksums.txt \
             --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --target "$GITHUB_SHA" \
-            --generate-notes
+            --clobber
+          gh release edit "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false
 
       - name: Remove signing keychain
         if: always()
