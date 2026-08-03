@@ -28,6 +28,7 @@ internal readonly record struct FileMetadata(
 internal static partial class WindowsFileMetadata
 {
     private const uint FileReadAttributes = 0x0080;
+    private const uint FileListDirectory = 0x0001;
     private const uint GenericRead = 0x80000000;
     private const uint FileShareRead = 0x00000001;
     private const uint FileShareWrite = 0x00000002;
@@ -226,7 +227,7 @@ internal static partial class WindowsFileMetadata
     {
         var entryHandle = CreateFileW(
             ToExtendedPath(path),
-            FileReadAttributes,
+            FileListDirectory | FileReadAttributes,
             FileShareRead,
             IntPtr.Zero,
             OpenExisting,
@@ -258,7 +259,7 @@ internal static partial class WindowsFileMetadata
             {
                 targetHandle = CreateFileW(
                     ToExtendedPath(path),
-                    FileReadAttributes,
+                    FileListDirectory | FileReadAttributes,
                     FileShareRead,
                     IntPtr.Zero,
                     OpenExisting,
