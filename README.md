@@ -47,7 +47,6 @@ Disk Inventory Zed visualizes disk usage on macOS with interactive treemaps and 
 | Release packaging (v1.2+) | Universal notarized DMG | Static x86_64 and ARM64 archives |
 
 Linux currently provides the same hardened scanning and export core, not a desktop GUI equivalent.
-Headless comparison and analysis commands are planned before any separate Linux desktop frontend.
 
 ## Requirements
 

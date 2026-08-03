@@ -7,6 +7,7 @@ import AppKit
 import Foundation
 import SwiftUI
 
+@MainActor
 struct UserSettings {
     private static let defaults = UserDefaults.standard
 

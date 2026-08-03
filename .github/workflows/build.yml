@@ -25,11 +25,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run unit tests
-        run: swift test -Xswiftc -strict-concurrency=complete
+      - name: Run Swift 6 unit tests
+        run: |
+          swift test \
+            -Xswiftc -swift-version -Xswiftc 6 \
+            -Xswiftc -strict-concurrency=complete \
+            -Xswiftc -warnings-as-errors
 
-      - name: Build debug with concurrency diagnostics
-        run: swift build -Xswiftc -strict-concurrency=complete
+      - name: Build debug in Swift 6 language mode
+        run: |
+          swift build \
+            -Xswiftc -swift-version -Xswiftc 6 \
+            -Xswiftc -strict-concurrency=complete \
+            -Xswiftc -warnings-as-errors
       
       - name: Build universal binary
         run: |
@@ -173,6 +181,8 @@ jobs:
 
       - name: Build portable Linux archives
         run: |
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
           ./scripts/package-linux.sh x86_64-swift-linux-musl dist
           ./scripts/package-linux.sh aarch64-swift-linux-musl dist
           mkdir -p dist/smoke/x86_64 dist/smoke/aarch64
@@ -232,8 +242,22 @@ jobs:
                 /opt/DiskInventoryZed --json "$output" /tmp/diz-input \
                   >/dev/null 2>"$errors" &
                 process_id=$!
-                sleep 0.2
-                kill -0 "$process_id"
+                handlers_ready=false
+                attempt=0
+                while [ "$attempt" -lt 500 ]; do
+                  if ! kill -0 "$process_id" 2>/dev/null; then
+                    break
+                  fi
+                  caught_mask="$(grep "^SigCgt:" "/proc/$process_id/status" 2>/dev/null | cut -f2 || true)"
+                  if printf "%s\n" "$caught_mask" |
+                    grep -Eq "[4567cdefCDEF][0-9a-fA-F]{2}[2367abefABEF]$"; then
+                    handlers_ready=true
+                    break
+                  fi
+                  attempt=$((attempt + 1))
+                  sleep 0.01
+                done
+                test "$handlers_ready" = true
                 kill -s "$signal_name" "$process_id"
                 set +e
                 wait "$process_id"
@@ -408,8 +432,38 @@ jobs:
           name: DiskInventoryZed-Linux
           path: linux-dist
 
-      - name: Prepare portable Linux artifacts
-        run: cp linux-dist/*.tar.gz .
+      - name: Verify and prepare portable Linux artifacts
+        run: |
+          python3 - linux-dist/DiskInventoryZed-linux-checksums.txt linux-dist/*.tar.gz <<'PY'
+          import hashlib
+          from pathlib import Path
+          import string
+          import sys
+
+          manifest_path = Path(sys.argv[1])
+          archives = {Path(value).name: Path(value) for value in sys.argv[2:]}
+          expected = {}
+          for line in manifest_path.read_text(encoding="utf-8").splitlines():
+              fields = line.split(maxsplit=1)
+              if len(fields) != 2 or len(fields[0]) != 64 or any(
+                  character not in string.hexdigits for character in fields[0]
+              ):
+                  raise SystemExit(f"Malformed checksum line: {line!r}")
+              if fields[1] in expected:
+                  raise SystemExit(f"Duplicate checksum entry: {fields[1]}")
+              expected[fields[1]] = fields[0].lower()
+
+          if set(expected) != set(archives):
+              raise SystemExit("Linux checksum manifest does not match downloaded archives")
+          for name, path in archives.items():
+              digest = hashlib.sha256()
+              with path.open("rb") as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              if digest.hexdigest() != expected[name]:
+                  raise SystemExit(f"Checksum mismatch: {name}")
+          PY
+          cp linux-dist/*.tar.gz .
 
       - name: Generate release checksums
         run: shasum -a 256 DiskInventoryZed-*.dmg DiskInventoryZed-*-linux-*.tar.gz > DiskInventoryZed-checksums.txt

@@ -20,6 +20,7 @@
 
 import SwiftUI
 
+@MainActor
 func showAboutWindow() {
     let aboutWindow = NSWindow(
         contentRect: NSRect(x: 0, y: 0, width: 420, height: 320),
@@ -35,6 +36,7 @@ func showAboutWindow() {
     aboutWindow.makeKeyAndOrderFront(nil)
 }
 
+@MainActor
 func showHelpWindow() {
     let helpWindow = NSWindow(
         contentRect: NSRect(x: 0, y: 0, width: 600, height: 700),
