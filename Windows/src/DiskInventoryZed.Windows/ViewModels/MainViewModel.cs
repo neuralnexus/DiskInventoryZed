@@ -25,9 +25,14 @@ public sealed record LocationItem(string Label, string Path, string Detail, bool
 
 public sealed class MainViewModel : ObservableObject, IDisposable
 {
-    private readonly AppSettingsStore _settingsStore = new();
+    private const int MaximumOutstandingScanWorkers = 2;
+    private readonly MainViewModelServices _services;
     private readonly AppSettings _settings;
+    private readonly SynchronizationContext? _synchronizationContext;
+    private readonly int? _ownerThreadId;
     private readonly List<FileNode> _navigation = [];
+    private readonly object _filterGate = new();
+    private readonly object _lifecycleGate = new();
     private CancellationTokenSource? _scanCancellation;
     private CancellationTokenSource? _filterCancellation;
     private CancellationTokenSource? _verificationCancellation;
@@ -53,11 +58,30 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool _followReparsePoints;
     private long _nextGeneration;
     private long _publishedGeneration;
+    private long _verificationEpoch;
     private string _visibleItemsStatus = string.Empty;
+    private TaskCompletionSource? _filterIdleCompletion;
+    private bool _filterRefreshPending;
+    private bool _pendingFilterImmediate;
+    private bool _filterPumpRunning;
+    private int _outstandingScanWorkers;
+    private int _outstandingVerificationWorkers;
+    private int _disposed;
 
-    public MainViewModel()
+    private bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+
+    public MainViewModel() : this(MainViewModelServices.CreateDefault())
     {
-        _settings = _settingsStore.Load();
+    }
+
+    internal MainViewModel(MainViewModelServices services)
+    {
+        _services = services;
+        _synchronizationContext = SynchronizationContext.Current;
+        _ownerThreadId = _synchronizationContext is System.Windows.Threading.DispatcherSynchronizationContext
+            ? Environment.CurrentManagedThreadId
+            : null;
+        _settings = services.LoadSettings();
         _minimumSize = _settings.MinimumSize;
         _skipDeveloperFolders = _settings.SkipDeveloperFolders;
         _showHiddenFiles = _settings.ShowHiddenFiles;
@@ -158,10 +182,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public DiskScanResult? ScanResult => _scanResult;
 
     public bool HasScan => RootNode is not null;
-    public bool CanRescan => RootNode is not null && !IsScanning;
-    public bool CanStartScan => !IsScanning;
-    public bool CanUseSnapshot => RootNode is not null && !IsScanning;
-    public bool CanVerifyDuplicates => CanUseSnapshot && DuplicateCandidates.Count > 0 && !IsVerifying;
+    public bool CanRescan => RootNode is not null && CanStartScan;
+    public bool CanStartScan => !IsDisposed && !IsScanning && Volatile.Read(ref _outstandingScanWorkers) < MaximumOutstandingScanWorkers;
+    public bool CanUseSnapshot => !IsDisposed && RootNode is not null && !IsScanning;
+    public bool CanVerifyDuplicates => CanUseSnapshot && DuplicateCandidates.Count > 0 && !IsVerifying &&
+        Volatile.Read(ref _outstandingVerificationWorkers) == 0;
     public bool CanNavigateBack => CanUseSnapshot && _navigationIndex > 0;
     public bool CanNavigateForward => CanUseSnapshot && _navigationIndex >= 0 && _navigationIndex < _navigation.Count - 1;
 
@@ -172,12 +197,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             if (SetProperty(ref _isScanning, value))
             {
-                OnPropertyChanged(nameof(CanRescan));
-                OnPropertyChanged(nameof(CanStartScan));
-                OnPropertyChanged(nameof(CanUseSnapshot));
-                OnPropertyChanged(nameof(CanVerifyDuplicates));
-                OnPropertyChanged(nameof(CanNavigateBack));
-                OnPropertyChanged(nameof(CanNavigateForward));
+                RaiseScanningProperties();
             }
         }
     }
@@ -345,6 +365,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (diagnostics.DuplicateHardLinks > 0) details.Add($"{diagnostics.DuplicateHardLinks:N0} hard-link aliases");
             if (diagnostics.UnverifiedHardLinks > 0) details.Add($"{diagnostics.UnverifiedHardLinks:N0} hard links unverified");
             if (diagnostics.ApproximateAllocatedSizes > 0) details.Add($"{diagnostics.ApproximateAllocatedSizes:N0} estimated sizes");
+            if (diagnostics.MetadataUnavailableItems > 0) details.Add($"{diagnostics.MetadataUnavailableItems:N0} metadata estimates");
             return details.Count == 0 ? "Complete for selected options" : string.Join("  |  ", details);
         }
     }
@@ -362,36 +383,67 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public async Task ScanAsync(string path)
     {
-        if (IsScanning)
-        {
-            ErrorRaised?.Invoke(this, "A scan is already active. Cancel it and wait for cancellation to finish before starting another location.");
-            return;
-        }
-
+        VerifyAccess();
         path = Environment.ExpandEnvironmentVariables(path.Trim().Trim('"'));
         if (string.IsNullOrWhiteSpace(path))
         {
-            ErrorRaised?.Invoke(this, "Enter a folder, mapped drive, or UNC path to scan.");
+            RaiseError("Enter a folder, mapped drive, or UNC path to scan.");
             return;
         }
 
+        CancellationTokenSource cancellation;
+        CancellationTokenSource? verificationToCancel = null;
+        string? rejection = null;
+        lock (_lifecycleGate)
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+            if (_isScanning)
+            {
+                rejection = "A scan is already active. Cancel it and wait for cancellation to finish before starting another location.";
+                cancellation = null!;
+            }
+            else if (Volatile.Read(ref _outstandingScanWorkers) >= MaximumOutstandingScanWorkers)
+            {
+                rejection = "Previous cancelled scans are still blocked by the filesystem. Wait for one to finish before starting another location.";
+                cancellation = null!;
+            }
+            else
+            {
+                cancellation = new CancellationTokenSource();
+                _scanCancellation = cancellation;
+                verificationToCancel = _verificationCancellation;
+                _isScanning = true;
+            }
+        }
+        if (rejection is not null)
+        {
+            RaiseError(rejection);
+            return;
+        }
+        OnPropertyChanged(nameof(IsScanning));
+        RaiseScanningProperties();
+
         var generation = Interlocked.Increment(ref _nextGeneration);
         var previousPath = RootNode?.FullPath ?? string.Empty;
-        _verificationCancellation?.Cancel();
-        VerifiedDuplicates.Clear();
-        VerificationStatus = string.Empty;
-        var cancellation = new CancellationTokenSource();
-        _scanCancellation = cancellation;
-        IsScanning = true;
+        Interlocked.Increment(ref _verificationEpoch);
+        if (verificationToCancel is not null)
+        {
+            CancelSafely(verificationToCancel);
+            VerificationStatus = "Verification cancelled by the new scan request.";
+        }
         IsAnalyzing = false;
         ScanProgressText = "Preparing scan...";
         ScanStatusPath = path;
         PathText = path;
         SelectedNode = null;
+        Task? backgroundOperation = null;
 
         var progress = new Progress<ScanProgress>(snapshot =>
         {
-            if (!ReferenceEquals(_scanCancellation, cancellation))
+            if (IsDisposed || !ReferenceEquals(_scanCancellation, cancellation))
             {
                 return;
             }
@@ -404,14 +456,25 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         try
         {
             var options = new ScanOptions(SkipDeveloperFolders, ShowHiddenFiles, FollowReparsePoints);
-            var scanner = new DiskScanner();
-            var result = await Task.Run(() => scanner.ScanAsync(path, options, progress, cancellation.Token), cancellation.Token);
+            var scanTask = Task.Run(
+                () => _services.ScanAsync(path, options, progress, cancellation.Token),
+                CancellationToken.None);
+            TrackScanWorker(scanTask);
+            backgroundOperation = scanTask;
+            ObserveFault(scanTask);
+            var result = await scanTask.WaitAsync(cancellation.Token);
             cancellation.Token.ThrowIfCancellationRequested();
             IsAnalyzing = true;
             ScanProgressText = "Building file type and duplicate indexes...";
-            var analysis = await Task.Run(() => ScanAnalyzer.Analyze(result.Root, cancellation.Token), cancellation.Token);
+            var analysisTask = Task.Run(
+                () => _services.AnalyzeAsync(result.Root, cancellation.Token),
+                CancellationToken.None);
+            TrackScanWorker(analysisTask);
+            backgroundOperation = analysisTask;
+            ObserveFault(analysisTask);
+            var analysis = await analysisTask.WaitAsync(cancellation.Token);
             cancellation.Token.ThrowIfCancellationRequested();
-            if (!ReferenceEquals(_scanCancellation, cancellation))
+            if (IsDisposed || !ReferenceEquals(_scanCancellation, cancellation))
             {
                 return;
             }
@@ -427,8 +490,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             Replace(LargestFiles, analysis.LargestFiles);
             Replace(OldLargeFiles, analysis.OldLargeFiles);
             Replace(DuplicateCandidates, analysis.DuplicateCandidates);
-            VerifiedDuplicates.Clear();
+            Replace(VerifiedDuplicates, []);
             VerificationStatus = string.Empty;
+
+            if (IsDisposed)
+            {
+                return;
+            }
 
             _navigation.Clear();
             _navigation.Add(result.Root);
@@ -441,33 +509,53 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         catch (OperationCanceledException)
         {
-            // Cancellation leaves the previous completed snapshot visible.
-            PathText = previousPath;
-            ScanStatusPath = previousPath;
+            if (!IsDisposed)
+            {
+                // Cancellation leaves the previous completed snapshot visible.
+                PathText = previousPath;
+                ScanStatusPath = previousPath;
+            }
         }
         catch (Exception error)
         {
-            if (ReferenceEquals(_scanCancellation, cancellation))
+            if (!IsDisposed && ReferenceEquals(_scanCancellation, cancellation))
             {
                 PathText = previousPath;
                 ScanStatusPath = previousPath;
-                ErrorRaised?.Invoke(this, error.Message);
+                RaiseError(error.Message);
             }
         }
         finally
         {
-            if (ReferenceEquals(_scanCancellation, cancellation))
+            var ownsScan = false;
+            lock (_lifecycleGate)
+            {
+                ownsScan = ReferenceEquals(_scanCancellation, cancellation);
+                if (ownsScan)
+                {
+                    _scanCancellation = null;
+                }
+            }
+            if (ownsScan)
             {
                 IsScanning = false;
                 IsAnalyzing = false;
-                _scanCancellation = null;
             }
 
-            cancellation.Dispose();
+            DisposeWhenComplete(cancellation, backgroundOperation);
         }
     }
 
-    public void CancelScan() => _scanCancellation?.Cancel();
+    public void CancelScan()
+    {
+        VerifyAccess();
+        CancellationTokenSource? cancellation;
+        lock (_lifecycleGate)
+        {
+            cancellation = _scanCancellation;
+        }
+        CancelSafely(cancellation);
+    }
 
     public Task RescanAsync() => !CanRescan || RootNode is null ? Task.CompletedTask : ScanAsync(RootNode.FullPath);
 
@@ -557,21 +645,34 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public async Task VerifyDuplicatesAsync()
     {
-        if (!CanVerifyDuplicates || RootNode is not { } verificationRoot)
+        VerifyAccess();
+        FileNode verificationRoot;
+        CancellationTokenSource cancellation;
+        CancellationTokenSource? previousCancellation;
+        long verificationGeneration;
+        long verificationEpoch;
+        lock (_lifecycleGate)
         {
-            return;
+            if (IsDisposed || !CanVerifyDuplicates || RootNode is not { } root)
+            {
+                return;
+            }
+            verificationRoot = root;
+            verificationGeneration = _publishedGeneration;
+            verificationEpoch = Interlocked.Increment(ref _verificationEpoch);
+            previousCancellation = _verificationCancellation;
+            cancellation = new CancellationTokenSource();
+            _verificationCancellation = cancellation;
+            _isVerifying = true;
         }
-
-        var verificationGeneration = _publishedGeneration;
-
-        _verificationCancellation?.Cancel();
-        var cancellation = new CancellationTokenSource();
-        _verificationCancellation = cancellation;
-        IsVerifying = true;
-        VerifiedDuplicates.Clear();
+        OnPropertyChanged(nameof(IsVerifying));
+        OnPropertyChanged(nameof(CanVerifyDuplicates));
+        Replace(VerifiedDuplicates, []);
+        CancelSafely(previousCancellation);
+        Task? backgroundOperation = null;
         var progress = new Progress<DuplicateVerificationProgress>(item =>
         {
-            if (!IsVerificationCurrent(cancellation, verificationGeneration, verificationRoot))
+            if (!IsVerificationCurrent(cancellation, verificationGeneration, verificationEpoch, verificationRoot))
             {
                 return;
             }
@@ -582,11 +683,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         try
         {
-            var result = await Task.Run(
-                () => DuplicateVerifier.VerifyAsync(DuplicateCandidates.ToArray(), progress, cancellation.Token),
-                cancellation.Token);
+            var candidates = DuplicateCandidates.ToArray();
+            var verificationTask = Task.Run(
+                () => _services.VerifyDuplicatesAsync(candidates, progress, cancellation.Token),
+                CancellationToken.None);
+            TrackVerificationWorker(verificationTask);
+            backgroundOperation = verificationTask;
+            ObserveFault(verificationTask);
+            var result = await verificationTask.WaitAsync(cancellation.Token);
             cancellation.Token.ThrowIfCancellationRequested();
-            if (!IsVerificationCurrent(cancellation, verificationGeneration, verificationRoot))
+            if (!IsVerificationCurrent(cancellation, verificationGeneration, verificationEpoch, verificationRoot))
             {
                 return;
             }
@@ -595,38 +701,59 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             VerificationStatus = result.Groups.Count == 0
                 ? "No content-identical groups were found."
                 : $"{result.Groups.Count:N0} verified groups";
-            if (result.UnreadablePaths.Count > 0)
+            if (result.TotalUnreadableFiles > 0)
             {
-                VerificationStatus += $"; {result.UnreadablePaths.Count:N0} files could not be verified";
+                VerificationStatus += $"; {result.TotalUnreadableFiles:N0} files could not be verified";
+                if (result.TotalUnreadableFiles > result.UnreadablePaths.Count)
+                {
+                    VerificationStatus += $" (showing first {result.UnreadablePaths.Count:N0})";
+                }
             }
         }
         catch (OperationCanceledException)
         {
-            if (OwnsVerification(cancellation, verificationGeneration, verificationRoot))
+            if (OwnsVerification(cancellation, verificationGeneration, verificationEpoch, verificationRoot))
             {
                 VerificationStatus = "Verification cancelled.";
             }
         }
         catch (Exception error)
         {
-            if (IsVerificationCurrent(cancellation, verificationGeneration, verificationRoot))
+            if (IsVerificationCurrent(cancellation, verificationGeneration, verificationEpoch, verificationRoot))
             {
-                ErrorRaised?.Invoke(this, $"Duplicate verification failed: {error.Message}");
+                RaiseError($"Duplicate verification failed: {error.Message}");
             }
         }
         finally
         {
-            if (ReferenceEquals(_verificationCancellation, cancellation))
+            var ownsVerification = false;
+            lock (_lifecycleGate)
+            {
+                ownsVerification = ReferenceEquals(_verificationCancellation, cancellation);
+                if (ownsVerification)
+                {
+                    _verificationCancellation = null;
+                }
+            }
+            if (ownsVerification)
             {
                 IsVerifying = false;
-                _verificationCancellation = null;
             }
 
-            cancellation.Dispose();
+            DisposeWhenComplete(cancellation, backgroundOperation);
         }
     }
 
-    public void CancelDuplicateVerification() => _verificationCancellation?.Cancel();
+    public void CancelDuplicateVerification()
+    {
+        VerifyAccess();
+        CancellationTokenSource? cancellation;
+        lock (_lifecycleGate)
+        {
+            cancellation = _verificationCancellation;
+        }
+        CancelSafely(cancellation);
+    }
 
     public bool TryGetActiveNode(FileNode? candidate, out FileNode node)
     {
@@ -645,29 +772,51 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public async Task RefreshDrivesAsync()
     {
-        try
+        VerifyAccess();
+        if (IsDisposed)
         {
-            var drives = await Task.Run(ReadDrives);
-            Replace(Drives, drives);
+            return;
         }
-        catch (Exception error)
+        var drives = await Task.Run(ReadDrives);
+        if (!IsDisposed)
         {
-            ErrorRaised?.Invoke(this, $"Drive discovery failed: {error.Message}");
+            Replace(Drives, drives);
         }
     }
 
     public void Dispose()
     {
-        _scanCancellation?.Cancel();
-        _filterCancellation?.Cancel();
-        _verificationCancellation?.Cancel();
+        VerifyAccess();
+        CancellationTokenSource? scanCancellation;
+        CancellationTokenSource? verificationCancellation;
+        lock (_lifecycleGate)
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+            scanCancellation = _scanCancellation;
+            verificationCancellation = _verificationCancellation;
+        }
+
+        DisableNotifications();
+        CancelSafely(scanCancellation);
+        CancelSafely(verificationCancellation);
+        CancellationTokenSource? filterCancellation;
+        lock (_filterGate)
+        {
+            _filterRefreshPending = false;
+            filterCancellation = _filterCancellation;
+            _filterCancellation = null;
+        }
+        CancelSafely(filterCancellation);
     }
 
     private void SetCurrentNode(FileNode node)
     {
         CurrentNode = node;
         SelectedNode = null;
-        VisibleItems.Clear();
+        Replace(VisibleItems, []);
         VisibleItemsStatus = string.Empty;
         Replace(Breadcrumb, IndexedPathTo(node));
         OnPropertyChanged(nameof(CanNavigateBack));
@@ -675,24 +824,124 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ScheduleVisibleItemsRefresh(immediate: true);
     }
 
-    private async void ScheduleVisibleItemsRefresh(bool immediate = false)
+    internal Task WaitForFilterAsync()
     {
-        _filterCancellation?.Cancel();
-        var cancellation = new CancellationTokenSource();
-        _filterCancellation = cancellation;
+        lock (_filterGate)
+        {
+            return _filterIdleCompletion?.Task ?? Task.CompletedTask;
+        }
+    }
+
+    private void ScheduleVisibleItemsRefresh(bool immediate = false)
+    {
+        VerifyAccess();
+        var startPump = false;
+        CancellationTokenSource? previousCancellation;
+        lock (_filterGate)
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+
+            previousCancellation = _filterCancellation;
+            _filterCancellation = null;
+            _filterRefreshPending = true;
+            _pendingFilterImmediate = immediate;
+            _filterIdleCompletion ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (!_filterPumpRunning)
+            {
+                _filterPumpRunning = true;
+                startPump = true;
+            }
+        }
+        CancelSafely(previousCancellation);
+
+        if (startPump)
+        {
+            ObserveFault(RunFilterPumpAsync());
+        }
+    }
+
+    private async Task RunFilterPumpAsync()
+    {
+        TaskCompletionSource? completed = null;
+        try
+        {
+            while (true)
+            {
+                CancellationTokenSource cancellation;
+                bool immediate;
+                lock (_filterGate)
+                {
+                    if (IsDisposed || !_filterRefreshPending)
+                    {
+                        _filterPumpRunning = false;
+                        completed = _filterIdleCompletion;
+                        _filterIdleCompletion = null;
+                        break;
+                    }
+
+                    _filterRefreshPending = false;
+                    immediate = _pendingFilterImmediate;
+                    cancellation = new CancellationTokenSource();
+                    _filterCancellation = cancellation;
+                }
+
+                try
+                {
+                    await RefreshVisibleItemsAsync(immediate, cancellation);
+                }
+                finally
+                {
+                    lock (_filterGate)
+                    {
+                        if (ReferenceEquals(_filterCancellation, cancellation))
+                        {
+                            _filterCancellation = null;
+                        }
+                    }
+                    cancellation.Dispose();
+                }
+            }
+        }
+        finally
+        {
+            if (completed is null)
+            {
+                lock (_filterGate)
+                {
+                    _filterPumpRunning = false;
+                    completed = _filterIdleCompletion;
+                    _filterIdleCompletion = null;
+                }
+            }
+            completed?.TrySetResult();
+        }
+    }
+
+    private async Task RefreshVisibleItemsAsync(bool immediate, CancellationTokenSource cancellation)
+    {
         try
         {
             if (!immediate)
             {
-                await Task.Delay(160, cancellation.Token);
+                await _services.DelayAsync(TimeSpan.FromMilliseconds(160), cancellation.Token);
             }
 
             var current = CurrentNode;
             var analysis = _analysis;
+            if (IsDisposed)
+            {
+                return;
+            }
             if (current is null)
             {
-                VisibleItems.Clear();
-                VisibleItemsStatus = string.Empty;
+                if (!IsDisposed)
+                {
+                    Replace(VisibleItems, []);
+                    VisibleItemsStatus = string.Empty;
+                }
                 return;
             }
 
@@ -700,43 +949,24 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             var extension = SelectedExtension;
             var minimumSize = MinimumSize;
             var sortOrder = SortOrder;
-            var filtered = await Task.Run(() =>
-            {
-                cancellation.Token.ThrowIfCancellationRequested();
-                IEnumerable<FileNode> source = string.IsNullOrEmpty(query)
-                    ? current.Children
-                    : analysis?.AllNodes ?? [];
-                var visited = 0;
-                source = source.Where(node =>
-                {
-                    if ((visited++ & 255) == 0)
-                    {
-                        cancellation.Token.ThrowIfCancellationRequested();
-                    }
-
-                    return node.AllocatedSize >= minimumSize &&
-                           (string.IsNullOrEmpty(query) ||
-                            node.DisplayName.Contains(query, StringComparison.CurrentCultureIgnoreCase) ||
-                            node.FullPath.Contains(query, StringComparison.CurrentCultureIgnoreCase)) &&
-                           (string.IsNullOrEmpty(extension) ||
-                            !node.IsDirectory && (node.Extension ?? "unknown").Equals(extension, StringComparison.OrdinalIgnoreCase));
-                });
-                source = sortOrder switch
-                {
-                    FileSortOrder.SizeAscending => source.OrderBy(node => node.AllocatedSize).ThenBy(node => node.DisplayName, StringComparer.CurrentCultureIgnoreCase),
-                    FileSortOrder.NameAscending => source.OrderBy(node => node.DisplayName, StringComparer.CurrentCultureIgnoreCase),
-                    FileSortOrder.NameDescending => source.OrderByDescending(node => node.DisplayName, StringComparer.CurrentCultureIgnoreCase),
-                    _ => source.OrderByDescending(node => node.AllocatedSize).ThenBy(node => node.DisplayName, StringComparer.CurrentCultureIgnoreCase)
-                };
-                var matches = source.ToArray();
-                return (Items: matches.Take(2_000).ToArray(), Total: matches.Length);
-            }, cancellation.Token);
+            var filterTask = Task.Run(
+                () => _services.FilterVisibleItems(
+                    current,
+                    analysis,
+                    query,
+                    extension,
+                    minimumSize,
+                    sortOrder,
+                    cancellation.Token),
+                CancellationToken.None);
+            ObserveFault(filterTask);
+            var filtered = await filterTask;
             cancellation.Token.ThrowIfCancellationRequested();
-            if (ReferenceEquals(_filterCancellation, cancellation))
+            if (!IsDisposed && ReferenceEquals(_filterCancellation, cancellation))
             {
                 Replace(VisibleItems, filtered.Items);
-                VisibleItemsStatus = filtered.Total > filtered.Items.Length
-                    ? $"Showing {filtered.Items.Length:N0} of {filtered.Total:N0} matches"
+                VisibleItemsStatus = filtered.Total > filtered.Items.Count
+                    ? $"Showing {filtered.Items.Count:N0} of {filtered.Total:N0} matches"
                     : $"{filtered.Total:N0} items";
             }
         }
@@ -746,19 +976,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         catch (Exception error)
         {
-            if (ReferenceEquals(_filterCancellation, cancellation))
+            if (!IsDisposed && ReferenceEquals(_filterCancellation, cancellation))
             {
-                ErrorRaised?.Invoke(this, $"The file filter failed: {error.Message}");
+                RaiseError($"The file filter failed: {error.Message}");
             }
-        }
-        finally
-        {
-            if (ReferenceEquals(_filterCancellation, cancellation))
-            {
-                _filterCancellation = null;
-            }
-
-            cancellation.Dispose();
         }
     }
 
@@ -843,23 +1064,150 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         return result.OrderBy(item => item.Path, StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
-    private void SaveSettings() => _settingsStore.Save(_settings);
+    private void SaveSettings() => _services.SaveSettings(_settings);
+
+    private void RaiseError(string message)
+    {
+        lock (_lifecycleGate)
+        {
+            if (!IsDisposed)
+            {
+                ErrorRaised?.Invoke(this, message);
+            }
+        }
+    }
+
+    private void VerifyAccess()
+    {
+        if (_ownerThreadId is { } ownerThreadId && Environment.CurrentManagedThreadId != ownerThreadId)
+        {
+            throw new InvalidOperationException("MainViewModel operations must run on the WPF dispatcher thread.");
+        }
+    }
+
+    private static void CancelSafely(CancellationTokenSource? cancellation)
+    {
+        try
+        {
+            cancellation?.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // The owning controller completed between capture and cancellation.
+        }
+    }
 
     private bool IsVerificationCurrent(
         CancellationTokenSource cancellation,
         long generation,
+        long epoch,
         FileNode root) =>
-        OwnsVerification(cancellation, generation, root) &&
+        !IsDisposed && OwnsVerification(cancellation, generation, epoch, root) &&
         !cancellation.IsCancellationRequested;
 
     private bool OwnsVerification(
         CancellationTokenSource cancellation,
         long generation,
+        long epoch,
         FileNode root) =>
+        !IsDisposed &&
         ReferenceEquals(_verificationCancellation, cancellation) &&
         !IsScanning &&
         generation == _publishedGeneration &&
+        epoch == Volatile.Read(ref _verificationEpoch) &&
         ReferenceEquals(root, RootNode);
+
+    private static void ObserveFault(Task task) =>
+        _ = task.ContinueWith(
+            completed => _ = completed.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
+    private static void DisposeWhenComplete(CancellationTokenSource cancellation, Task? operation)
+    {
+        if (operation is null || operation.IsCompleted)
+        {
+            cancellation.Dispose();
+            return;
+        }
+
+        _ = operation.ContinueWith(
+            _ => cancellation.Dispose(),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private void TrackScanWorker(Task operation)
+    {
+        Interlocked.Increment(ref _outstandingScanWorkers);
+        RaiseScanAvailability();
+        _ = operation.ContinueWith(
+            _ =>
+            {
+                Interlocked.Decrement(ref _outstandingScanWorkers);
+                if (IsDisposed)
+                {
+                    return;
+                }
+                if (_synchronizationContext is null)
+                {
+                    RaiseScanAvailability();
+                }
+                else
+                {
+                    _synchronizationContext.Post(static state =>
+                        ((MainViewModel)state!).RaiseScanAvailability(), this);
+                }
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private void TrackVerificationWorker(Task operation)
+    {
+        Interlocked.Increment(ref _outstandingVerificationWorkers);
+        OnPropertyChanged(nameof(CanVerifyDuplicates));
+        _ = operation.ContinueWith(
+            _ =>
+            {
+                Interlocked.Decrement(ref _outstandingVerificationWorkers);
+                if (IsDisposed)
+                {
+                    return;
+                }
+                if (_synchronizationContext is null)
+                {
+                    OnPropertyChanged(nameof(CanVerifyDuplicates));
+                }
+                else
+                {
+                    _synchronizationContext.Post(static state =>
+                        ((MainViewModel)state!).OnPropertyChanged(nameof(CanVerifyDuplicates)), this);
+                }
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private void RaiseScanAvailability()
+    {
+        OnPropertyChanged(nameof(CanStartScan));
+        OnPropertyChanged(nameof(CanRescan));
+    }
+
+    private void RaiseScanningProperties()
+    {
+        OnPropertyChanged(nameof(CanRescan));
+        OnPropertyChanged(nameof(CanStartScan));
+        OnPropertyChanged(nameof(CanUseSnapshot));
+        OnPropertyChanged(nameof(CanVerifyDuplicates));
+        OnPropertyChanged(nameof(CanNavigateBack));
+        OnPropertyChanged(nameof(CanNavigateForward));
+    }
 
     private void RaiseScanSummaryProperties()
     {
@@ -871,11 +1219,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(StatusText));
     }
 
-    private static void Replace<T>(ObservableCollection<T> collection, IEnumerable<T> values)
+    private void Replace<T>(ObservableCollection<T> collection, IEnumerable<T> values)
     {
+        if (IsDisposed)
+        {
+            return;
+        }
         collection.Clear();
         foreach (var value in values)
         {
+            if (IsDisposed)
+            {
+                return;
+            }
             collection.Add(value);
         }
     }

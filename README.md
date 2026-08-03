@@ -74,7 +74,7 @@ This will create `DiskInventoryZed.app` in the current directory, built as a uni
 
 ```powershell
 dotnet restore Windows\DiskInventoryZed.Windows.sln
-dotnet test Windows\tests\DiskInventoryZed.Core.Tests\DiskInventoryZed.Core.Tests.csproj -c Release
+dotnet test Windows\DiskInventoryZed.Windows.sln -c Release
 dotnet run --project Windows\src\DiskInventoryZed.Windows\DiskInventoryZed.Windows.csproj
 ```
 
@@ -154,7 +154,8 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 ## Accuracy Notes
 
 - “On disk” uses allocated size when macOS provides it; “logical” is the apparent file length.
-- Windows uses allocation size reported by the filesystem and marks logical-size fallbacks in scan diagnostics.
+- Windows uses allocation size reported by the filesystem and reports metadata estimates separately
+  from entries that could not be read or enumerated.
 - Multiple hard links to the same file are shown and counted once when the filesystem supplies stable identity metadata; uncertain cases are reported.
 - APFS clones can share physical blocks without exposing enough public per-file metadata to measure
   exact exclusive ownership. Disk Inventory Zed does not claim clone-level reclaimable bytes.
@@ -168,14 +169,23 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 ## Release Integrity
 
 - A release tag must exactly match the version in both platform manifests and point to a commit on `main`.
+- Automation re-resolves the remote tag immediately before draft mutation and publication, and aborts
+  if it no longer points to the commit that produced the artifacts.
 - Tagged macOS artifacts require Developer ID signing and successful Apple notarization and stapling.
 - Tagged builds fail closed unless all `APPLE_SIGNING_*`, `APPLE_KEYCHAIN_PASSWORD`, `APPLE_ID`,
   `APPLE_TEAM_ID`, and `APPLE_APP_PASSWORD` Actions secrets are configured.
 - The publication job targets the `release` environment; configure required reviewers on that
   environment before enabling tagged releases.
 - CI creates a draft release, downloads every uploaded asset, verifies the platform checksums, and only
-  then publishes the release. Published releases are never overwritten; a failed workflow may resume
-  only a draft carrying that same workflow run's ownership marker.
+  then publishes the same release and asset identities it verified. Published releases are never
+  overwritten; a failed workflow may resume only a draft carrying that same workflow run's ownership
+  marker, while an already-published rerun fails explicitly.
+- The standard-library validator in `scripts/release_integrity.py` is unit-tested on every workflow run
+  and rejects malformed manifests, prereleases, ownership changes, and release/asset identity changes.
+- GitHub's legacy version/date selection determines the **Latest** release, so publishing an older
+  maintenance tag does not unconditionally displace a newer release.
+- Protect `v*` tags from update/deletion and enable GitHub immutable releases before production use;
+  workflow checks narrow races but cannot make separate GitHub API calls transactional.
 - Windows dependencies are restored from committed lock files with the repository-pinned .NET SDK.
 - Windows release zips are currently unsigned and include the .NET license and third-party notices;
   users should verify the published SHA-256 checksums before running them.

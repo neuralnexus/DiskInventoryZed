@@ -5,6 +5,12 @@ using DiskInventoryZed.Core.Models;
 
 namespace DiskInventoryZed.Core.Scanning;
 
+internal delegate FileMetadata FileMetadataReader(
+    string path,
+    bool isDirectory,
+    bool isReparsePoint,
+    long logicalSize);
+
 /// <summary>A fixed-worker, cancellable scanner that publishes only a completed immutable tree.</summary>
 public sealed class DiskScanner
 {
@@ -12,6 +18,27 @@ public sealed class DiskScanner
     {
         "node_modules", ".git", ".svn", ".hg", ".vs", "DerivedData", ".build", "bin", "obj"
     };
+    private readonly FileMetadataReader _readMetadata;
+    private readonly Func<string, FileAttributes> _getAttributes;
+    private readonly Func<string, EnumerationOptions, IEnumerable<string>> _enumerateEntries;
+
+    public DiskScanner() : this(
+        WindowsFileMetadata.Read,
+        File.GetAttributes,
+        (path, options) => Directory.EnumerateFileSystemEntries(path, "*", options))
+    {
+    }
+
+    internal DiskScanner(
+        FileMetadataReader readMetadata,
+        Func<string, FileAttributes>? getAttributes = null,
+        Func<string, EnumerationOptions, IEnumerable<string>>? enumerateEntries = null)
+    {
+        _readMetadata = readMetadata;
+        _getAttributes = getAttributes ?? File.GetAttributes;
+        _enumerateEntries = enumerateEntries ??
+            ((path, options) => Directory.EnumerateFileSystemEntries(path, "*", options));
+    }
 
     public async Task<DiskScanResult> ScanAsync(
         string path,
@@ -29,7 +56,7 @@ public sealed class DiskScanner
         FileAttributes rootAttributes;
         try
         {
-            rootAttributes = File.GetAttributes(rootPath);
+            rootAttributes = _getAttributes(rootPath);
             if (!rootAttributes.HasFlag(FileAttributes.Directory))
             {
                 throw new DiskScanException("The selected location is not a folder.");
@@ -53,7 +80,7 @@ public sealed class DiskScanner
 
         cancellationToken.ThrowIfCancellationRequested();
         var stopwatch = Stopwatch.StartNew();
-        var rootMetadata = WindowsFileMetadata.Read(
+        var rootMetadata = _readMetadata(
             rootPath,
             true,
             rootAttributes.HasFlag(FileAttributes.ReparsePoint),
@@ -74,8 +101,19 @@ public sealed class DiskScanner
             throw new DiskScanException("The selected link target has no stable filesystem identity and cannot be followed safely.");
         }
 
-        var state = new ScanState(rootPath, options, progress);
+        var state = new ScanState(
+            rootPath,
+            options,
+            progress,
+            _readMetadata,
+            _getAttributes,
+            _enumerateEntries);
         var rootRecord = state.CreateRootRecord(rootIsLink, rootMetadata);
+        if (rootMetadata.MetadataUnavailable)
+        {
+            rootRecord.Issue = "Filesystem metadata for the selected root could not be read; the scan may be incomplete.";
+            state.Diagnostics.IncrementMetadataUnavailableItems();
+        }
 
         state.Records[rootPath] = rootRecord;
         if (rootMetadata.Identity is { } rootIdentity)
@@ -140,7 +178,7 @@ public sealed class DiskScanner
         DeduplicateHardLinks(state, cancellationToken);
         var root = BuildTree(rootPath, state.Records, state.PathComparer, cancellationToken)
             ?? throw new DiskScanException("The scan did not produce a root folder.");
-        if (root.IsUnreadable && root.Children.Count == 0)
+        if (rootRecord.EnumerationFailed && root.Children.Count == 0)
         {
             throw new DiskScanException($"Disk Inventory Zed could not read {rootPath}. Check the current user's permissions.");
         }
@@ -165,6 +203,12 @@ public sealed class DiskScanner
 
         try
         {
+            using var directoryGuard = OperatingSystem.IsWindows()
+                ? WindowsFileMetadata.OpenDirectoryGuard(
+                    work.Path,
+                    state.Options.FollowReparsePoints,
+                    work.Record.Identity)
+                : null;
             var enumerationOptions = new EnumerationOptions
             {
                 AttributesToSkip = 0,
@@ -173,7 +217,7 @@ public sealed class DiskScanner
                 ReturnSpecialDirectories = false
             };
 
-            foreach (var childPath in Directory.EnumerateFileSystemEntries(work.Path, "*", enumerationOptions))
+            foreach (var childPath in state.EnumerateEntries(work.Path, enumerationOptions))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 Volatile.Write(ref state.CurrentPath, childPath);
@@ -181,7 +225,7 @@ public sealed class DiskScanner
                 FileAttributes attributes;
                 try
                 {
-                    attributes = File.GetAttributes(childPath);
+                    attributes = state.GetAttributes(childPath);
                 }
                 catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Security.SecurityException)
                 {
@@ -210,7 +254,7 @@ public sealed class DiskScanner
                 }
 
                 var apparentLogicalSize = isDirectory ? 0 : TryGetLogicalSize(childPath);
-                var metadata = WindowsFileMetadata.Read(childPath, isDirectory, isReparsePoint, apparentLogicalSize);
+                var metadata = state.ReadMetadata(childPath, isDirectory, isReparsePoint, apparentLogicalSize);
                 var isLink = metadata.ReparsePointClassification == ReparsePointClassification.NameSurrogate;
                 var isUnknownReparse = isReparsePoint &&
                     metadata.ReparsePointClassification == ReparsePointClassification.Unknown;
@@ -236,6 +280,12 @@ public sealed class DiskScanner
                     metadata.Identity,
                     metadata.HardLinkCount);
 
+                if (metadata.MetadataUnavailable && !isLink && !isUnknownReparse)
+                {
+                    record.Issue = "Filesystem metadata changed or could not be read; size and identity may be estimates.";
+                    state.Diagnostics.IncrementMetadataUnavailableItems();
+                }
+
                 if (!isDirectory && !isLink && metadata.HardLinkCount > 1 && metadata.Identity is null)
                 {
                     record.HasUnverifiedHardLinks = true;
@@ -251,6 +301,7 @@ public sealed class DiskScanner
                 if (isUnknownReparse)
                 {
                     record.Issue = "The reparse-point type could not be identified, so this item was not resolved or followed.";
+                    record.IsUnreadable = true;
                     state.Diagnostics.RecordUnreadable(childPath);
                 }
 
@@ -269,6 +320,7 @@ public sealed class DiskScanner
                     {
                         record.Kind = FileNodeKind.SymbolicLink;
                         record.Issue = "The reparse-point target identity could not be read, so it was not followed.";
+                        record.IsUnreadable = true;
                         Interlocked.Increment(ref state.FileCount);
                         state.Diagnostics.RecordUnreadable(childPath);
                         continue;
@@ -302,6 +354,8 @@ public sealed class DiskScanner
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Security.SecurityException)
         {
             work.Record.Issue = error.Message;
+            work.Record.EnumerationFailed = true;
+            work.Record.IsUnreadable = true;
             state.Diagnostics.RecordUnreadable(work.Path);
         }
         finally
@@ -407,7 +461,8 @@ public sealed class DiskScanner
                 record.HasUnverifiedHardLinks,
                 record.Issue,
                 isContainer ? children.Sum(child => child.TotalFileCount) : 1,
-                isContainer ? 1 + children.Sum(child => child.TotalDirectoryCount) : 0);
+                isContainer ? 1 + children.Sum(child => child.TotalDirectoryCount) : 0,
+                record.IsUnreadable);
         }
 
         return built.GetValueOrDefault(rootPath);
@@ -485,7 +540,13 @@ public sealed class DiskScanner
 
     private sealed class ScanState
     {
-        public ScanState(string rootPath, ScanOptions options, IProgress<ScanProgress>? progress)
+        public ScanState(
+            string rootPath,
+            ScanOptions options,
+            IProgress<ScanProgress>? progress,
+            FileMetadataReader readMetadata,
+            Func<string, FileAttributes> getAttributes,
+            Func<string, EnumerationOptions, IEnumerable<string>> enumerateEntries)
         {
             RootPath = rootPath;
             Options = options;
@@ -493,6 +554,9 @@ public sealed class DiskScanner
             CurrentPath = rootPath;
             PathComparer = StringComparer.Ordinal;
             Records = new ConcurrentDictionary<string, ScanRecord>(PathComparer);
+            ReadMetadata = readMetadata;
+            GetAttributes = getAttributes;
+            EnumerateEntries = enumerateEntries;
         }
 
         public string RootPath { get; }
@@ -502,6 +566,9 @@ public sealed class DiskScanner
         public ConcurrentDictionary<string, ScanRecord> Records { get; }
         public ConcurrentDictionary<FileIdentity, string> VisitedDirectories { get; } = new();
         public MutableDiagnostics Diagnostics { get; } = new();
+        public FileMetadataReader ReadMetadata { get; }
+        public Func<string, FileAttributes> GetAttributes { get; }
+        public Func<string, EnumerationOptions, IEnumerable<string>> EnumerateEntries { get; }
         public string CurrentPath;
         public int FileCount;
         public int DirectoryCount;
@@ -547,6 +614,8 @@ public sealed class DiskScanner
         public uint HardLinkCount { get; } = hardLinkCount;
         public bool IsHardLinkDuplicate { get; set; }
         public bool HasUnverifiedHardLinks { get; set; }
+        public bool EnumerationFailed { get; set; }
+        public bool IsUnreadable { get; set; }
         public string? Issue { get; set; }
         public IReadOnlyList<string> ChildPaths { get; set; } = [];
 
@@ -562,7 +631,8 @@ public sealed class DiskScanner
             null,
             1)
         {
-            Issue = issue
+            Issue = issue,
+            IsUnreadable = true
         };
     }
 
@@ -577,6 +647,7 @@ public sealed class DiskScanner
         private int _unverifiedHardLinks;
         private int _revisitedDirectories;
         private int _approximateAllocatedSizes;
+        private int _metadataUnavailableItems;
         private int _storedUnreadablePaths;
 
         public int UnreadableItems => Volatile.Read(ref _unreadableItems);
@@ -596,6 +667,7 @@ public sealed class DiskScanner
         public void IncrementUnverifiedHardLinks() => Interlocked.Increment(ref _unverifiedHardLinks);
         public void IncrementRevisitedDirectories() => Interlocked.Increment(ref _revisitedDirectories);
         public void IncrementApproximateAllocatedSizes() => Interlocked.Increment(ref _approximateAllocatedSizes);
+        public void IncrementMetadataUnavailableItems() => Interlocked.Increment(ref _metadataUnavailableItems);
         public void SetDuplicateHardLinks(int count) => Volatile.Write(ref _duplicateHardLinks, count);
 
         public ScanDiagnostics Snapshot() => new(
@@ -608,6 +680,7 @@ public sealed class DiskScanner
             Volatile.Read(ref _unverifiedHardLinks),
             Volatile.Read(ref _revisitedDirectories),
             Volatile.Read(ref _approximateAllocatedSizes),
+            Volatile.Read(ref _metadataUnavailableItems),
             _firstUnreadablePaths.ToArray());
     }
 }

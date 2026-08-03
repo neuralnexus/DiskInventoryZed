@@ -32,7 +32,8 @@ public sealed class FileNode : IEquatable<FileNode>
         bool hasUnverifiedHardLinks = false,
         string? issue = null,
         int? totalFileCount = null,
-        int? totalDirectoryCount = null)
+        int? totalDirectoryCount = null,
+        bool isUnreadable = false)
     {
         FullPath = fullPath;
         Id = fullPath;
@@ -45,6 +46,7 @@ public sealed class FileNode : IEquatable<FileNode>
         IsSymbolicLink = isSymbolicLink || kind == FileNodeKind.SymbolicLink;
         IsHardLinkDuplicate = isHardLinkDuplicate;
         HasUnverifiedHardLinks = hasUnverifiedHardLinks;
+        IsUnreadable = isUnreadable;
         Issue = issue;
 
         var childArray = children?.ToArray() ?? [];
@@ -65,7 +67,7 @@ public sealed class FileNode : IEquatable<FileNode>
     public bool IsSymbolicLink { get; }
     public bool IsHardLinkDuplicate { get; }
     public bool HasUnverifiedHardLinks { get; }
-    public bool IsUnreadable => Issue is not null;
+    public bool IsUnreadable { get; }
     public string? Issue { get; }
     public string? Extension => IsDirectory
         ? null

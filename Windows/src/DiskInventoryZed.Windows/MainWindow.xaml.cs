@@ -1,4 +1,3 @@
-using System.ComponentModel;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
@@ -16,11 +15,20 @@ namespace DiskInventoryZed.Windows;
 
 public partial class MainWindow : Window
 {
-    private readonly MainViewModel _viewModel = new();
+    private readonly MainViewModel _viewModel;
     private bool _isShellActionRunning;
+    private bool _isClosing;
 
-    public MainWindow()
+    internal Task StartupTask { get; private set; } = Task.CompletedTask;
+    internal bool SuppressStartupErrors { get; set; }
+
+    public MainWindow() : this(new MainViewModel())
     {
+    }
+
+    internal MainWindow(MainViewModel viewModel)
+    {
+        _viewModel = viewModel;
         InitializeComponent();
         DataContext = _viewModel;
         _viewModel.ErrorRaised += ViewModel_ErrorRaised;
@@ -28,23 +36,41 @@ public partial class MainWindow : Window
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
     {
-        await _viewModel.RefreshDrivesAsync();
+        StartupTask = _viewModel.RefreshDrivesAsync();
+        try
+        {
+            await StartupTask;
+        }
+        catch (Exception error)
+        {
+            if (!SuppressStartupErrors && !_isClosing)
+            {
+                ViewModel_ErrorRaised(this, $"Drive discovery failed: {error.Message}");
+            }
+        }
     }
 
-    private void Window_Closing(object? sender, CancelEventArgs e)
+    private void Window_Closed(object? sender, EventArgs e)
     {
+        _isClosing = true;
         _viewModel.ErrorRaised -= ViewModel_ErrorRaised;
         _viewModel.Dispose();
     }
 
     private void ViewModel_ErrorRaised(object? sender, string message)
     {
-        Dispatcher.InvokeAsync(() => MessageBox.Show(
-            this,
-            message,
-            "Disk Inventory Zed",
-            MessageBoxButton.OK,
-            MessageBoxImage.Error));
+        _ = Dispatcher.InvokeAsync(() =>
+        {
+            if (!_isClosing)
+            {
+                MessageBox.Show(
+                    this,
+                    message,
+                    "Disk Inventory Zed",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+        });
     }
 
     private async void ScanPath_Click(object sender, RoutedEventArgs e) =>

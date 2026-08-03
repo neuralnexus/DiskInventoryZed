@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Diagnostics;
+using DiskInventoryZed.Core.Analysis;
 using DiskInventoryZed.Core.Models;
 using DiskInventoryZed.Core.Scanning;
 
@@ -43,14 +44,9 @@ public sealed partial class DiskScannerTests
             new DiskScanner().ScanAsync(fixture.Path, cancellationToken: cancellation.Token));
     }
 
-    [Fact]
+    [WindowsFact]
     public async Task WindowsHardLinksAreCountedOnceOnDisk()
     {
-        if (!OperatingSystem.IsWindows())
-        {
-            return;
-        }
-
         using var fixture = new TemporaryDirectory();
         var original = Path.Combine(fixture.Path, "original.bin");
         var linked = Path.Combine(fixture.Path, "linked.bin");
@@ -67,14 +63,9 @@ public sealed partial class DiskScannerTests
         Assert.Equal(32_768, result.Root.LogicalSize);
     }
 
-    [Fact]
+    [WindowsFact]
     public async Task WindowsAllocationComesFromHandleMetadata()
     {
-        if (!OperatingSystem.IsWindows())
-        {
-            return;
-        }
-
         using var fixture = new TemporaryDirectory();
         await File.WriteAllBytesAsync(Path.Combine(fixture.Path, "one-byte.bin"), [0x2A]);
 
@@ -86,28 +77,14 @@ public sealed partial class DiskScannerTests
         Assert.Equal(0, result.Diagnostics.ApproximateAllocatedSizes);
     }
 
-    [Fact]
+    [WindowsFact]
     public async Task WindowsJunctionsAreNotFollowedByDefault()
     {
-        if (!OperatingSystem.IsWindows())
-        {
-            return;
-        }
-
         using var fixture = new TemporaryDirectory();
         var target = Directory.CreateDirectory(Path.Combine(fixture.Path, "target"));
         await File.WriteAllBytesAsync(Path.Combine(target.FullName, "inside.bin"), new byte[1024]);
         var junction = Path.Combine(fixture.Path, "junction");
-        using var process = Process.Start(new ProcessStartInfo
-        {
-            FileName = "cmd.exe",
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            ArgumentList = { "/d", "/c", "mklink", "/J", junction, target.FullName }
-        });
-        Assert.NotNull(process);
-        await process.WaitForExitAsync();
-        Assert.Equal(0, process.ExitCode);
+        await CreateJunctionAsync(junction, target.FullName);
 
         var result = await new DiskScanner().ScanAsync(fixture.Path, new ScanOptions(ShowHiddenFiles: true));
         var junctionNode = result.Root.Children.Single(node => node.DisplayName == "junction");
@@ -118,41 +95,22 @@ public sealed partial class DiskScannerTests
         Assert.True(result.Diagnostics.SymbolicLinks >= 1);
     }
 
-    [Fact]
+    [WindowsFact]
     public async Task WindowsJunctionCannotBypassRootLinkPolicy()
     {
-        if (!OperatingSystem.IsWindows())
-        {
-            return;
-        }
-
         using var fixture = new TemporaryDirectory();
         var target = Directory.CreateDirectory(Path.Combine(fixture.Path, "target"));
         var junction = Path.Combine(fixture.Path, "junction");
-        using var process = Process.Start(new ProcessStartInfo
-        {
-            FileName = "cmd.exe",
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            ArgumentList = { "/d", "/c", "mklink", "/J", junction, target.FullName }
-        });
-        Assert.NotNull(process);
-        await process.WaitForExitAsync();
-        Assert.Equal(0, process.ExitCode);
+        await CreateJunctionAsync(junction, target.FullName);
 
         var error = await Assert.ThrowsAsync<DiskScanException>(() => new DiskScanner().ScanAsync(junction));
 
         Assert.Contains("Enable Follow links", error.Message, StringComparison.Ordinal);
     }
 
-    [Fact]
+    [WindowsFact]
     public async Task WindowsHiddenAttributeControlsEnumeration()
     {
-        if (!OperatingSystem.IsWindows())
-        {
-            return;
-        }
-
         using var fixture = new TemporaryDirectory();
         var hiddenPath = Path.Combine(fixture.Path, "hidden.bin");
         await File.WriteAllBytesAsync(hiddenPath, new byte[64]);
@@ -165,6 +123,150 @@ public sealed partial class DiskScannerTests
         Assert.Equal(1, hiddenExcluded.Diagnostics.HiddenItemsExcluded);
         Assert.Contains(hiddenIncluded.Root.Children, node => node.DisplayName == "hidden.bin");
         Assert.Equal(0, hiddenIncluded.Diagnostics.HiddenItemsExcluded);
+    }
+
+    [WindowsFact]
+    public async Task WindowsHiddenDirectoryExcludesItsDescendantsAsOneEncounteredEntry()
+    {
+        using var fixture = new TemporaryDirectory();
+        var hidden = Directory.CreateDirectory(Path.Combine(fixture.Path, "hidden"));
+        await File.WriteAllBytesAsync(Path.Combine(hidden.FullName, "inside.bin"), [1]);
+        File.SetAttributes(hidden.FullName, File.GetAttributes(hidden.FullName) | FileAttributes.Hidden);
+
+        var result = await new DiskScanner().ScanAsync(fixture.Path);
+
+        Assert.DoesNotContain(result.Root.Children, node => node.DisplayName == "hidden");
+        Assert.Equal(1, result.Diagnostics.HiddenItemsExcluded);
+        Assert.Equal(0, result.TotalFiles);
+    }
+
+    [WindowsFact]
+    public async Task WindowsFollowedJunctionCycleIsVisitedOnlyOnce()
+    {
+        using var fixture = new TemporaryDirectory();
+        var target = Directory.CreateDirectory(Path.Combine(fixture.Path, "target"));
+        await File.WriteAllBytesAsync(Path.Combine(target.FullName, "inside.bin"), [1]);
+        var backLink = Path.Combine(target.FullName, "back-to-root");
+        await CreateJunctionAsync(backLink, fixture.Path);
+
+        var result = await new DiskScanner().ScanAsync(
+            fixture.Path,
+            new ScanOptions(ShowHiddenFiles: true, FollowReparsePoints: true));
+        var targetNode = result.Root.Children.Single(node => node.DisplayName == "target");
+        var cycleNode = targetNode.Children.Single(node => node.DisplayName == "back-to-root");
+
+        Assert.Equal(FileNodeKind.SymbolicLink, cycleNode.Kind);
+        Assert.Empty(cycleNode.Children);
+        Assert.Equal(1, result.Diagnostics.RevisitedDirectories);
+        Assert.NotNull(targetNode.FindById(Path.Combine(target.FullName, "inside.bin")));
+    }
+
+    [WindowsFact]
+    public void WindowsDuplicateReadHandlePreventsPathReplacement()
+    {
+        using var fixture = new TemporaryDirectory();
+        var path = Path.Combine(fixture.Path, "open.bin");
+        var replacement = Path.Combine(fixture.Path, "renamed.bin");
+        File.WriteAllBytes(path, [1, 2, 3]);
+
+        using var stream = DuplicateVerifier.OpenRead(path);
+
+        Assert.True(stream.IsAsync);
+        Assert.Throws<IOException>(() => File.Move(path, replacement));
+        Assert.True(File.Exists(path));
+        Assert.False(File.Exists(replacement));
+    }
+
+    [WindowsFact]
+    public void WindowsDirectoryGuardBlocksRenameAndReleasesItOnDispose()
+    {
+        using var fixture = new TemporaryDirectory();
+        var path = Directory.CreateDirectory(Path.Combine(fixture.Path, "guarded")).FullName;
+        var moved = Path.Combine(fixture.Path, "moved");
+        var identity = WindowsFileMetadata.Read(path, true, false, 0).Identity;
+        Assert.NotNull(identity);
+
+        using (WindowsFileMetadata.OpenDirectoryGuard(path, false, identity))
+        {
+            Assert.Throws<IOException>(() => Directory.Move(path, moved));
+        }
+
+        Directory.Move(path, moved);
+        Assert.True(Directory.Exists(moved));
+    }
+
+    [WindowsFact]
+    public async Task WindowsDirectoryGuardRejectsAChangedJunctionIdentityAndReleasesHandles()
+    {
+        using var fixture = new TemporaryDirectory();
+        var expectedPath = Directory.CreateDirectory(Path.Combine(fixture.Path, "expected-target")).FullName;
+        var actualPath = Directory.CreateDirectory(Path.Combine(fixture.Path, "actual-target")).FullName;
+        var movedActual = Path.Combine(fixture.Path, "moved-actual");
+        var junction = Path.Combine(fixture.Path, "junction");
+        await CreateJunctionAsync(junction, actualPath);
+        var expectedIdentity = WindowsFileMetadata.Read(expectedPath, true, false, 0).Identity;
+        Assert.NotNull(expectedIdentity);
+
+        Assert.Throws<IOException>(() =>
+            WindowsFileMetadata.OpenDirectoryGuard(junction, true, expectedIdentity));
+
+        Directory.Delete(junction);
+        Directory.Move(actualPath, movedActual);
+        Assert.True(Directory.Exists(movedActual));
+    }
+
+    [WindowsFact]
+    public async Task WindowsDirectoryGuardRetainsFollowedJunctionEntryAndTarget()
+    {
+        using var fixture = new TemporaryDirectory();
+        var target = Directory.CreateDirectory(Path.Combine(fixture.Path, "target"));
+        var movedTarget = Path.Combine(fixture.Path, "moved-target");
+        var junction = Path.Combine(fixture.Path, "junction");
+        await CreateJunctionAsync(junction, target.FullName);
+        var metadata = WindowsFileMetadata.Read(junction, true, true, 0);
+        Assert.NotNull(metadata.Identity);
+
+        using (WindowsFileMetadata.OpenDirectoryGuard(junction, true, metadata.Identity))
+        {
+            Assert.Throws<IOException>(() => Directory.Delete(junction));
+            Assert.Throws<IOException>(() => Directory.Move(target.FullName, movedTarget));
+        }
+
+        Directory.Delete(junction);
+        Directory.Move(target.FullName, movedTarget);
+        Assert.True(Directory.Exists(movedTarget));
+    }
+
+    private static async Task CreateJunctionAsync(string junction, string target)
+    {
+        using var process = Process.Start(new ProcessStartInfo
+        {
+            FileName = "cmd.exe",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            ArgumentList = { "/d", "/c", "mklink", "/J", junction, target }
+        });
+        Assert.NotNull(process);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token);
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch (InvalidOperationException)
+            {
+                // The process exited after the timeout was observed.
+            }
+
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            throw new TimeoutException("Creating the test junction did not finish within 10 seconds.");
+        }
+        Assert.Equal(0, process.ExitCode);
     }
 
     [LibraryImport("kernel32.dll", EntryPoint = "CreateHardLinkW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]

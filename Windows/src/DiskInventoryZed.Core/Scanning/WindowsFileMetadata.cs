@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.ComponentModel;
 using Microsoft.Win32.SafeHandles;
 
 namespace DiskInventoryZed.Core.Scanning;
@@ -21,17 +22,29 @@ internal readonly record struct FileMetadata(
     bool AllocatedSizeIsApproximate,
     DateTimeOffset? CreationDate,
     DateTimeOffset? ModificationDate,
-    ReparsePointClassification ReparsePointClassification);
+    ReparsePointClassification ReparsePointClassification,
+    bool MetadataUnavailable);
 
 internal static partial class WindowsFileMetadata
 {
     private const uint FileReadAttributes = 0x0080;
+    private const uint GenericRead = 0x80000000;
     private const uint FileShareRead = 0x00000001;
     private const uint FileShareWrite = 0x00000002;
     private const uint FileShareDelete = 0x00000004;
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileFlagOpenReparsePoint = 0x00200000;
+    private const uint FileFlagOpenNoRecall = 0x00100000;
+    private const uint FileFlagSequentialScan = 0x08000000;
+    private const uint FileFlagOverlapped = 0x40000000;
+    private const uint FileAttributeDirectory = 0x00000010;
+    private const uint FileAttributeReparsePoint = 0x00000400;
+    private const uint FileAttributeOffline = 0x00001000;
+    private const uint FileAttributeRecallOnDataAccess = 0x00400000;
+    private const uint CfPlaceholderStatePartial = 0x00000010;
+    private const uint CfPlaceholderStatePartiallyOnDisk = 0x00000020;
+    private const uint CfPlaceholderStateInvalid = 0xffffffff;
     private const uint IoReparseTagNameSurrogate = 0x20000000;
     private const int FileBasicInfoClass = 0;
     private const int FileStandardInfoClass = 1;
@@ -56,7 +69,8 @@ internal static partial class WindowsFileMetadata
                 null,
                 isReparsePoint
                     ? ReparsePointClassification.NameSurrogate
-                    : ReparsePointClassification.NotReparsePoint);
+                    : ReparsePointClassification.NotReparsePoint,
+                false);
         }
 
         var nativePath = ToExtendedPath(path);
@@ -73,7 +87,8 @@ internal static partial class WindowsFileMetadata
                 false,
                 null,
                 null,
-                reparseClassification);
+                reparseClassification,
+                false);
         }
 
         using var handle = CreateFileW(
@@ -94,7 +109,8 @@ internal static partial class WindowsFileMetadata
                 true,
                 null,
                 null,
-                reparseClassification);
+                reparseClassification,
+                true);
         }
 
         var hasStandardInfo = GetFileStandardInformationByHandle(
@@ -144,7 +160,138 @@ internal static partial class WindowsFileMetadata
             !hasStandardInfo,
             creationDate,
             modificationDate,
-            reparseClassification);
+            reparseClassification,
+            false);
+    }
+
+    internal static unsafe FileStream OpenLocallyAvailableRead(string path, int bufferSize)
+    {
+        var handle = CreateFileW(
+            ToExtendedPath(path),
+            GenericRead,
+            FileShareRead,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagOpenNoRecall | FileFlagSequentialScan | FileFlagOverlapped,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw NativeIOException("The file could not be inspected without recalling remote content.", error);
+        }
+
+        try
+        {
+            if (!GetFileAttributeTagInformationByHandle(
+                    handle,
+                    FileAttributeTagInfoClass,
+                    out var tagInformation,
+                    (uint)sizeof(FileAttributeTagInfo)))
+            {
+                throw NativeIOException("The file availability could not be inspected.");
+            }
+
+            var placeholderState = CfGetPlaceholderStateFromAttributeTag(
+                tagInformation.FileAttributes,
+                tagInformation.ReparseTag);
+            if ((tagInformation.ReparseTag & IoReparseTagNameSurrogate) != 0 ||
+                !IsLocallyAvailableRegularFile(tagInformation.FileAttributes, placeholderState))
+            {
+                throw new IOException("Only locally available regular files can be verified.");
+            }
+
+            return new FileStream(handle, FileAccess.Read, bufferSize, isAsync: true);
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    internal static bool IsLocallyAvailableRegularFile(uint attributes, uint placeholderState)
+    {
+        var unavailableAttributes = FileAttributeDirectory | FileAttributeOffline | FileAttributeRecallOnDataAccess;
+        var unavailablePlaceholderStates = CfPlaceholderStatePartial | CfPlaceholderStatePartiallyOnDisk;
+        return (attributes & unavailableAttributes) == 0 &&
+               placeholderState != CfPlaceholderStateInvalid &&
+               (placeholderState & unavailablePlaceholderStates) == 0;
+    }
+
+    internal static unsafe IDisposable OpenDirectoryGuard(
+        string path,
+        bool followReparsePoints,
+        FileIdentity? expectedIdentity)
+    {
+        var entryHandle = CreateFileW(
+            ToExtendedPath(path),
+            FileReadAttributes,
+            FileShareRead,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (entryHandle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            entryHandle.Dispose();
+            throw NativeIOException("The directory changed or could not be locked for safe enumeration.", error);
+        }
+
+        SafeFileHandle? targetHandle = null;
+        try
+        {
+            if (!GetFileAttributeTagInformationByHandle(
+                    entryHandle,
+                    FileAttributeTagInfoClass,
+                    out var tagInformation,
+                    (uint)sizeof(FileAttributeTagInfo)))
+            {
+                throw NativeIOException("The directory type could not be revalidated before enumeration.");
+            }
+            if (!followReparsePoints && (tagInformation.ReparseTag & IoReparseTagNameSurrogate) != 0)
+            {
+                throw new IOException("The directory became a link or junction before it could be scanned safely.");
+            }
+            if ((tagInformation.FileAttributes & FileAttributeReparsePoint) != 0)
+            {
+                targetHandle = CreateFileW(
+                    ToExtendedPath(path),
+                    FileReadAttributes,
+                    FileShareRead,
+                    IntPtr.Zero,
+                    OpenExisting,
+                    FileFlagBackupSemantics,
+                    IntPtr.Zero);
+                if (targetHandle.IsInvalid)
+                {
+                    var error = Marshal.GetLastPInvokeError();
+                    throw NativeIOException("The directory target changed or could not be locked for safe enumeration.", error);
+                }
+            }
+
+            var identityHandle = targetHandle ?? entryHandle;
+            if (expectedIdentity is { } expected &&
+                (!GetFileIdInformationByHandle(
+                    identityHandle,
+                    FileIdInfoClass,
+                    out var actual,
+                    (uint)sizeof(FileIdInfo)) ||
+                 actual.VolumeSerialNumber != expected.VolumeSerialNumber ||
+                 actual.FileId != expected.FileId))
+            {
+                throw new IOException("The directory identity changed before it could be scanned safely.");
+            }
+
+            return new DirectoryGuard(entryHandle, targetHandle);
+        }
+        catch
+        {
+            targetHandle?.Dispose();
+            entryHandle.Dispose();
+            throw;
+        }
     }
 
     private static unsafe ReparsePointClassification ReadReparsePointClassification(
@@ -205,6 +352,9 @@ internal static partial class WindowsFileMetadata
             : "\\\\?\\" + fullPath;
     }
 
+    private static IOException NativeIOException(string message, int? error = null) =>
+        new(message, new Win32Exception(error ?? Marshal.GetLastPInvokeError()));
+
     [LibraryImport("kernel32.dll", EntryPoint = "CreateFileW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
     private static partial SafeFileHandle CreateFileW(
         string fileName,
@@ -214,6 +364,9 @@ internal static partial class WindowsFileMetadata
         uint creationDisposition,
         uint flagsAndAttributes,
         IntPtr templateFile);
+
+    [LibraryImport("cldapi.dll")]
+    private static partial uint CfGetPlaceholderStateFromAttributeTag(uint fileAttributes, uint reparseTag);
 
     [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -300,5 +453,14 @@ internal static partial class WindowsFileMetadata
     {
         public uint FileAttributes;
         public uint ReparseTag;
+    }
+
+    private sealed class DirectoryGuard(SafeFileHandle entryHandle, SafeFileHandle? targetHandle) : IDisposable
+    {
+        public void Dispose()
+        {
+            targetHandle?.Dispose();
+            entryHandle.Dispose();
+        }
     }
 }

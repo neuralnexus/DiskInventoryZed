@@ -34,6 +34,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Test release integrity tooling
+        run: python3 -m unittest discover -s scripts/tests -p 'test_release_integrity.py'
+
       - name: Validate tagged release source
         id: release
         shell: bash
@@ -194,6 +197,7 @@ jobs:
   windows:
     needs: validate
     runs-on: windows-2025
+    timeout-minutes: 30
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -212,9 +216,118 @@ jobs:
         shell: pwsh
         run: dotnet restore Windows/DiskInventoryZed.Windows.sln --locked-mode
 
-      - name: Run Windows core and NTFS tests
+      - name: Run Windows reliability tests with coverage
         shell: pwsh
-        run: dotnet test Windows/tests/DiskInventoryZed.Core.Tests/DiskInventoryZed.Core.Tests.csproj -c Release --no-restore
+        run: |
+          $projects = @(
+            @{
+              Name = "Core"
+              Path = "Windows/tests/DiskInventoryZed.Core.Tests/DiskInventoryZed.Core.Tests.csproj"
+            },
+            @{
+              Name = "Windows"
+              Path = "Windows/tests/DiskInventoryZed.Windows.Tests/DiskInventoryZed.Windows.Tests.csproj"
+            }
+          )
+          foreach ($project in $projects) {
+            dotnet test $project.Path `
+              -c Release `
+              --no-restore `
+              --settings Windows/coverage.runsettings `
+              --collect "Code Coverage" `
+              --blame-hang-timeout 2m `
+              --logger "trx;LogFileName=$($project.Name).trx" `
+              --results-directory "artifacts/test-results/$($project.Name)"
+            if ($LASTEXITCODE -ne 0) {
+              throw "$($project.Name) tests failed."
+            }
+          }
+
+      - name: Validate Windows test and coverage reports
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          foreach ($suite in @("Core", "Windows")) {
+            $resultRoot = "artifacts/test-results/$suite"
+            $trxReport = Get-ChildItem $resultRoot -Recurse -Filter "$suite.trx" |
+                Select-Object -First 1
+            if ($null -eq $trxReport) {
+              throw "$suite did not produce a TRX report."
+            }
+
+            [xml]$testResults = Get-Content $trxReport.FullName -Raw
+            $counters = $testResults.TestRun.ResultSummary.Counters
+            if ($null -eq $counters -or
+                [int]$counters.total -le 0 -or
+                [int]$counters.failed -ne 0 -or
+                [int]$counters.executed -ne [int]$counters.total -or
+                [int]$counters.passed -ne [int]$counters.total) {
+              throw "$suite has failed, skipped, or not-executed tests."
+            }
+
+            $coverageReport = Get-ChildItem $resultRoot -Recurse -Filter *.cobertura.xml |
+                Select-Object -First 1
+            if ($null -eq $coverageReport) {
+              throw "$suite did not produce a Cobertura report."
+            }
+
+            [xml]$coverage = Get-Content $coverageReport.FullName -Raw
+            $linesValid = [int]$coverage.coverage.GetAttribute("lines-valid")
+            if ($linesValid -eq 0) {
+              throw "$suite coverage contains no owned production lines."
+            }
+            $unexpectedPackages = @(
+              $coverage.coverage.packages.package |
+                  ForEach-Object { $_.GetAttribute("name") } |
+                  Where-Object { $_ -notin @("DiskInventoryZed", "DiskInventoryZed.Core", "DiskInventoryZed.Windows") }
+            )
+            if ($unexpectedPackages.Count -ne 0) {
+              throw "$suite coverage contains unexpected packages: $($unexpectedPackages -join ', ')"
+            }
+            $requiredPackage = if ($suite -eq "Core") { "DiskInventoryZed.Core" } else { "DiskInventoryZed" }
+            $requiredPackageNode = $coverage.coverage.packages.package |
+                Where-Object { $_.GetAttribute("name") -eq $requiredPackage } |
+                Select-Object -First 1
+            if ($null -eq $requiredPackageNode) {
+              throw "$suite coverage does not contain required package $requiredPackage."
+            }
+
+            $rawLineRate = [double]$requiredPackageNode.GetAttribute("line-rate")
+            $rawBranchRate = [double]$requiredPackageNode.GetAttribute("branch-rate")
+            if ([double]::IsNaN($rawLineRate) -or [double]::IsInfinity($rawLineRate) -or
+                [double]::IsNaN($rawBranchRate) -or [double]::IsInfinity($rawBranchRate) -or
+                $rawLineRate -lt 0 -or $rawLineRate -gt 1 -or
+                $rawBranchRate -lt 0 -or $rawBranchRate -gt 1) {
+              throw "$suite coverage contains invalid rates for $requiredPackage."
+            }
+            $lineRate = [math]::Round(100 * $rawLineRate, 1)
+            $branchRate = [math]::Round(100 * $rawBranchRate, 1)
+            if ($suite -eq "Core" -and ($rawLineRate -lt 0.65 -or $rawBranchRate -lt 0.60)) {
+              throw "Core coverage regressed below 65% line / 60% branch: $lineRate% / $branchRate%."
+            }
+            if ($suite -eq "Windows" -and ($rawLineRate -lt 0.10 -or $rawBranchRate -lt 0.05)) {
+              throw "Windows coverage regressed below 10% line / 5% branch: $lineRate% / $branchRate%."
+            }
+            $skipped = [int]$counters.total - [int]$counters.passed - [int]$counters.failed
+            @(
+              "### $suite tests ($env:RUNNER_ARCH)"
+              ""
+              "| Total | Passed | Failed | Skipped/not executed | Line coverage | Branch coverage |"
+              "| ---: | ---: | ---: | ---: | ---: | ---: |"
+              "| $($counters.total) | $($counters.passed) | $($counters.failed) | $skipped | $lineRate% | $branchRate% |"
+              ""
+            ) | Add-Content $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Upload Windows test reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: DiskInventoryZed-Windows-TestReports-${{ runner.arch }}
+          path: artifacts/test-results/
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
 
       - name: Build Windows desktop application
         shell: pwsh
@@ -256,6 +369,12 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     
     steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
       - name: Download artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -271,45 +390,61 @@ jobs:
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          test -s "DiskInventoryZed-$VERSION.dmg"
-          test -s DiskInventoryZed-checksums.txt
-          test -s "windows-release/DiskInventoryZed-Windows-v$VERSION-win-x64.zip"
-          test -s "windows-release/DiskInventoryZed-Windows-v$VERSION-win-arm64.zip"
-          test -s windows-release/DiskInventoryZed-Windows-checksums.txt
-          test "$(wc -l < DiskInventoryZed-checksums.txt)" -eq 1
-          test "$(wc -l < windows-release/DiskInventoryZed-Windows-checksums.txt)" -eq 2
-          sha256sum --check DiskInventoryZed-checksums.txt
-          (cd windows-release && sha256sum --check DiskInventoryZed-Windows-checksums.txt)
+          python3 scripts/release_integrity.py verify-local --version "$VERSION"
+          sha256sum --check --strict DiskInventoryZed-checksums.txt
+          (cd windows-release && sha256sum --check --strict DiskInventoryZed-Windows-checksums.txt)
 
       - name: Create and verify draft release
         env:
           TAG_NAME: ${{ needs.validate.outputs.tag }}
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
+          resolve_tag_commit() {
+            local object_type object_sha
+            read -r object_type object_sha <<< "$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG_NAME" \
+              --jq '.object.type + " " + .object.sha')"
+            for _ in {1..5}; do
+              if [ "$object_type" = "commit" ]; then
+                printf '%s\n' "$object_sha"
+                return 0
+              fi
+              if [ "$object_type" != "tag" ]; then
+                echo "Unsupported release tag target type: $object_type" >&2
+                return 1
+              fi
+              read -r object_type object_sha <<< "$(gh api \
+                "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
+                --jq '.object.type + " " + .object.sha')"
+            done
+            echo "Release tag nesting exceeds the supported depth." >&2
+            return 1
+          }
+          TAG_COMMIT="$(resolve_tag_commit)"
+          if [ "$TAG_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "Release tag moved from validated commit $GITHUB_SHA to $TAG_COMMIT." >&2
+            exit 1
+          fi
           MARKER="<!-- disk-inventory-zed-workflow-run:$GITHUB_RUN_ID -->"
           RELEASE_JSON="$RUNNER_TEMP/disk-inventory-zed-release.json"
           REPOSITORY_NAME="${GITHUB_REPOSITORY#*/}"
+          # shellcheck disable=SC2016
           gh api graphql \
-            -f query='query($owner:String!, $name:String!, $tag:String!) { repository(owner:$owner, name:$name) { release(tagName:$tag) { databaseId isDraft description tagName } } }' \
+            -f query='query($owner:String!, $name:String!, $tag:String!) { repository(owner:$owner, name:$name) { release(tagName:$tag) { databaseId isDraft isPrerelease description tagName } } }' \
             -f owner="$GITHUB_REPOSITORY_OWNER" \
             -f name="$REPOSITORY_NAME" \
             -f tag="$TAG_NAME" > "$RELEASE_JSON"
-          EXISTING_DRAFT="$(MARKER="$MARKER" RELEASE_JSON="$RELEASE_JSON" python3 - <<'PY'
-          import json
-          import os
-
-          with open(os.environ["RELEASE_JSON"], encoding="utf-8") as source:
-              release = json.load(source)["data"]["repository"]["release"]
-          if release is None:
-              print("false")
-              raise SystemExit
-          if not release.get("isDraft"):
-              raise SystemExit("A published release already exists; refusing to modify it.")
-          if os.environ["MARKER"] not in (release.get("description") or ""):
-              raise SystemExit("The existing draft is not owned by this workflow run.")
-          print("true")
-          PY
-          )"
+          RELEASE_STATE="$(python3 scripts/release_integrity.py classify-release \
+            --json "$RELEASE_JSON" \
+            --tag "$TAG_NAME" \
+            --marker "$MARKER")"
+          EXPECTED_RELEASE_ID=""
+          if [ "$RELEASE_STATE" = "draft" ]; then
+            EXPECTED_RELEASE_ID="$(python3 scripts/release_integrity.py uploaded-draft-id \
+              --json "$RELEASE_JSON" \
+              --tag "$TAG_NAME" \
+              --marker "$MARKER")"
+          fi
           ASSETS=(
             "DiskInventoryZed-$VERSION.dmg"
             DiskInventoryZed-checksums.txt
@@ -317,9 +452,9 @@ jobs:
             "windows-release/DiskInventoryZed-Windows-v$VERSION-win-arm64.zip"
             windows-release/DiskInventoryZed-Windows-checksums.txt
           )
-          if [ "$EXISTING_DRAFT" = true ]; then
+          if [ "$RELEASE_STATE" = "draft" ]; then
             gh release upload "$TAG_NAME" "${ASSETS[@]}" --repo "$GITHUB_REPOSITORY" --clobber
-          else
+          elif [ "$RELEASE_STATE" = "missing" ]; then
             gh release create "$TAG_NAME" "${ASSETS[@]}" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
@@ -328,54 +463,97 @@ jobs:
               --notes "$MARKER" \
               --title "Disk Inventory Zed $VERSION"
           fi
+          RELEASE_AFTER_UPLOAD="$RUNNER_TEMP/disk-inventory-zed-release-after-upload.json"
+          # shellcheck disable=SC2016
+          gh api graphql \
+            -f query='query($owner:String!, $name:String!, $tag:String!) { repository(owner:$owner, name:$name) { release(tagName:$tag) { databaseId isDraft isPrerelease description tagName } } }' \
+            -f owner="$GITHUB_REPOSITORY_OWNER" \
+            -f name="$REPOSITORY_NAME" \
+            -f tag="$TAG_NAME" > "$RELEASE_AFTER_UPLOAD"
+          RELEASE_ID="$(python3 scripts/release_integrity.py uploaded-draft-id \
+            --json "$RELEASE_AFTER_UPLOAD" \
+            --tag "$TAG_NAME" \
+            --marker "$MARKER")"
+          test "$RELEASE_ID" -gt 0
+          if [ -n "$EXPECTED_RELEASE_ID" ] && [ "$RELEASE_ID" != "$EXPECTED_RELEASE_ID" ]; then
+            echo "The draft release identity changed during asset upload." >&2
+            exit 1
+          fi
+          RELEASE_BEFORE_DOWNLOAD="$RUNNER_TEMP/disk-inventory-zed-release-before-download.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RELEASE_BEFORE_DOWNLOAD"
           mkdir release-download
           gh release download "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --dir release-download
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-
-          version = os.environ["VERSION"]
-          expected = {
-              f"DiskInventoryZed-{version}.dmg",
-              "DiskInventoryZed-checksums.txt",
-              f"DiskInventoryZed-Windows-v{version}-win-x64.zip",
-              f"DiskInventoryZed-Windows-v{version}-win-arm64.zip",
-              "DiskInventoryZed-Windows-checksums.txt",
-          }
-          actual = {path.name for path in Path("release-download").iterdir() if path.is_file()}
-          if actual != expected:
-              raise SystemExit(f"Draft release assets differ: expected={sorted(expected)}, actual={sorted(actual)}")
-          for path in Path("release-download").iterdir():
-              if path.is_file() and path.stat().st_size == 0:
-                  raise SystemExit(f"Draft release asset is empty: {path.name}")
-          PY
-          (cd release-download && sha256sum --check DiskInventoryZed-checksums.txt)
-          (cd release-download && sha256sum --check DiskInventoryZed-Windows-checksums.txt)
+          RELEASE_AFTER_DOWNLOAD="$RUNNER_TEMP/disk-inventory-zed-release-after-download.json"
+          VERIFIED_RELEASE_STATE="$RUNNER_TEMP/disk-inventory-zed-verified-release-state.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RELEASE_AFTER_DOWNLOAD"
+          python3 scripts/release_integrity.py verify-download \
+            --version "$VERSION" \
+            --download-dir release-download \
+            --before-json "$RELEASE_BEFORE_DOWNLOAD" \
+            --after-json "$RELEASE_AFTER_DOWNLOAD" \
+            --tag "$TAG_NAME" \
+            --marker "$MARKER" \
+            --state-out "$VERIFIED_RELEASE_STATE"
+          (cd release-download && sha256sum --check --strict DiskInventoryZed-checksums.txt)
+          (cd release-download && sha256sum --check --strict DiskInventoryZed-Windows-checksums.txt)
 
       - name: Publish verified release
         env:
           TAG_NAME: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
+          resolve_tag_commit() {
+            local object_type object_sha
+            read -r object_type object_sha <<< "$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG_NAME" \
+              --jq '.object.type + " " + .object.sha')"
+            for _ in {1..5}; do
+              if [ "$object_type" = "commit" ]; then
+                printf '%s\n' "$object_sha"
+                return 0
+              fi
+              if [ "$object_type" != "tag" ]; then
+                echo "Unsupported release tag target type: $object_type" >&2
+                return 1
+              fi
+              read -r object_type object_sha <<< "$(gh api \
+                "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
+                --jq '.object.type + " " + .object.sha')"
+            done
+            echo "Release tag nesting exceeds the supported depth." >&2
+            return 1
+          }
+          TAG_COMMIT="$(resolve_tag_commit)"
+          if [ "$TAG_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "Release tag moved from validated commit $GITHUB_SHA to $TAG_COMMIT." >&2
+            exit 1
+          fi
           MARKER="<!-- disk-inventory-zed-workflow-run:$GITHUB_RUN_ID -->"
           RELEASE_JSON="$RUNNER_TEMP/disk-inventory-zed-release-before-publish.json"
-          REPOSITORY_NAME="${GITHUB_REPOSITORY#*/}"
-          gh api graphql \
-            -f query='query($owner:String!, $name:String!, $tag:String!) { repository(owner:$owner, name:$name) { release(tagName:$tag) { databaseId isDraft description tagName } } }' \
-            -f owner="$GITHUB_REPOSITORY_OWNER" \
-            -f name="$REPOSITORY_NAME" \
-            -f tag="$TAG_NAME" > "$RELEASE_JSON"
-          MARKER="$MARKER" RELEASE_JSON="$RELEASE_JSON" python3 - <<'PY'
-          import json
-          import os
-
-          with open(os.environ["RELEASE_JSON"], encoding="utf-8") as source:
-              release = json.load(source)["data"]["repository"]["release"]
-          if release is None:
-              raise SystemExit("The draft disappeared before publication; refusing to continue.")
-          if not release.get("isDraft"):
-              raise SystemExit("Release state changed before publication; refusing to continue.")
-          if os.environ["MARKER"] not in (release.get("description") or ""):
-              raise SystemExit("Draft ownership changed before publication; refusing to continue.")
-          PY
-          gh release edit "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
-          test "$(gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = "false"
+          VERIFIED_RELEASE_STATE="$RUNNER_TEMP/disk-inventory-zed-verified-release-state.json"
+          RELEASE_ID="$(jq -r '.id' "$VERIFIED_RELEASE_STATE")"
+          test "$RELEASE_ID" -gt 0
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RELEASE_JSON"
+          python3 scripts/release_integrity.py verify-draft \
+            --json "$RELEASE_JSON" \
+            --state "$VERIFIED_RELEASE_STATE" \
+            --version "$VERSION" \
+            --tag "$TAG_NAME" \
+            --marker "$MARKER"
+          TAG_COMMIT="$(resolve_tag_commit)"
+          if [ "$TAG_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "Release tag moved immediately before publication." >&2
+            exit 1
+          fi
+          PUBLISHED_RELEASE="$RUNNER_TEMP/disk-inventory-zed-published-release.json"
+          gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false \
+            -F prerelease=false \
+            -f make_latest=legacy > "$PUBLISHED_RELEASE"
+          python3 scripts/release_integrity.py verify-published \
+            --json "$PUBLISHED_RELEASE" \
+            --state "$VERIFIED_RELEASE_STATE" \
+            --version "$VERSION" \
+            --tag "$TAG_NAME" \
+            --marker "$MARKER"

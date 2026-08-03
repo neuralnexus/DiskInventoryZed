@@ -134,7 +134,10 @@ final class ScanExporterTests: XCTestCase {
     }
 
     func testCSVNeutralizesSpreadsheetFormulas() throws {
-        let names = ["=2+2.txt", "+cmd.txt", "-2+3.txt", "@SUM.txt", "  =2+2.txt"]
+        let names = [
+            "=2+2.txt", "+cmd.txt", "-2+3.txt", "@SUM.txt", "  =2+2.txt",
+            "\tplain.txt", "\rplain.txt", "\nplain.txt", "\u{FEFF}plain.txt"
+        ]
         let files = names.map {
             FileNode(
                 url: URL(fileURLWithPath: "/tmp/\($0)"),

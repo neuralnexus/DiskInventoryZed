@@ -23,9 +23,10 @@ public sealed record ScanDiagnostics(
     int UnverifiedHardLinks,
     int RevisitedDirectories,
     int ApproximateAllocatedSizes,
+    int MetadataUnavailableItems,
     IReadOnlyList<string> FirstUnreadablePaths)
 {
-    public static readonly ScanDiagnostics Empty = new(0, 0, 0, 0, 0, 0, 0, 0, 0, []);
+    public static readonly ScanDiagnostics Empty = new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, []);
 }
 
 public sealed record DiskScanResult(

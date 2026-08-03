@@ -35,6 +35,7 @@ public sealed class ExporterAndDuplicateTests
         Assert.Equal(3, jsonRoot.GetProperty("schemaVersion").GetInt32());
         Assert.Matches("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$", jsonRoot.GetProperty("exportedAt").GetString()!);
         Assert.Equal(1, jsonRoot.GetProperty("diagnostics").GetProperty("approximateAllocatedSizes").GetInt32());
+        Assert.Equal(0, jsonRoot.GetProperty("diagnostics").GetProperty("metadataUnavailableItems").GetInt32());
         Assert.True(jsonRoot.GetProperty("scanOptions").GetProperty("skipDeveloperFolders").GetBoolean());
         Assert.True(jsonRoot.GetProperty("scanOptions").GetProperty("showHiddenFiles").GetBoolean());
         Assert.False(jsonRoot.GetProperty("scanOptions").GetProperty("followReparsePoints").GetBoolean());
@@ -75,6 +76,50 @@ public sealed class ExporterAndDuplicateTests
         {
             Assert.Contains($"\"'{name}\"", csv, StringComparison.Ordinal);
         }
+    }
+
+    [Fact]
+    public async Task ExportsDistinguishWarningsFromUnreadableEntries()
+    {
+        using var fixture = new TemporaryDirectory();
+        var warning = new FileNode(
+            Path.Combine(fixture.Path, "estimated.bin"),
+            "estimated.bin",
+            FileNodeKind.File,
+            1,
+            1,
+            issue: "Metadata is estimated.");
+        var unreadable = new FileNode(
+            Path.Combine(fixture.Path, "unreadable.bin"),
+            "unreadable.bin",
+            FileNodeKind.File,
+            0,
+            0,
+            issue: "Access denied.",
+            isUnreadable: true);
+        var root = new FileNode(fixture.Path, "fixture", FileNodeKind.Directory, 1, 1, [warning, unreadable]);
+        var jsonPath = Path.Combine(fixture.Path, "snapshot.json");
+        var csvPath = Path.Combine(fixture.Path, "inventory.csv");
+
+        await ScanExporter.ExportJsonAsync(root, ScanDiagnostics.Empty, jsonPath);
+        await ScanExporter.ExportCsvAsync(root, csvPath);
+
+        using var document = JsonDocument.Parse(await File.ReadAllTextAsync(jsonPath));
+        var entries = document.RootElement.GetProperty("entries");
+        Assert.False(entries[1].GetProperty("isUnreadable").GetBoolean());
+        Assert.True(entries[2].GetProperty("isUnreadable").GetBoolean());
+        var csvLines = await File.ReadAllLinesAsync(csvPath);
+        Assert.Equal(
+            "path,parent_path,name,kind,is_package,is_symbolic_link,allocated_bytes,logical_bytes,child_count,total_file_count,total_directory_count,created_at,modified_at,hard_link_duplicate,hard_link_identity_unavailable,issue,is_unreadable",
+            csvLines[0]);
+        var warningFields = csvLines[2].Split(',');
+        var unreadableFields = csvLines[3].Split(',');
+        Assert.Equal(17, warningFields.Length);
+        Assert.Equal(17, unreadableFields.Length);
+        Assert.Equal("\"Metadata is estimated.\"", warningFields[15]);
+        Assert.Equal("false", warningFields[16]);
+        Assert.Equal("\"Access denied.\"", unreadableFields[15]);
+        Assert.Equal("true", unreadableFields[16]);
     }
 
     [Fact]

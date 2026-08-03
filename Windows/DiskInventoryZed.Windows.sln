@@ -8,6 +8,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DiskInventoryZed.Windows", 
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DiskInventoryZed.Core.Tests", "tests\DiskInventoryZed.Core.Tests\DiskInventoryZed.Core.Tests.csproj", "{2B6A0122-D41D-42BD-B1F8-A901343B66AF}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DiskInventoryZed.Windows.Tests", "tests\DiskInventoryZed.Windows.Tests\DiskInventoryZed.Windows.Tests.csproj", "{8E564501-C696-45CB-BB57-954B325A1ACF}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -26,5 +28,9 @@ Global
 		{2B6A0122-D41D-42BD-B1F8-A901343B66AF}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{2B6A0122-D41D-42BD-B1F8-A901343B66AF}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{2B6A0122-D41D-42BD-B1F8-A901343B66AF}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8E564501-C696-45CB-BB57-954B325A1ACF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8E564501-C696-45CB-BB57-954B325A1ACF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8E564501-C696-45CB-BB57-954B325A1ACF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8E564501-C696-45CB-BB57-954B325A1ACF}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

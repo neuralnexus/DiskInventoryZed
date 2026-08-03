@@ -13,9 +13,12 @@ Mapped drives appear in the Drives panel. A UNC path can be pasted directly into
 field even when the share is not mapped to a drive letter. Scans use the permissions of the
 current Windows user and do not require administrator access.
 
-Windows network APIs can block while an unavailable server times out. The Cancel button stops
-cooperatively, but Windows may need to return from an in-progress SMB request before the scan can
-fully exit. Network scans use fewer concurrent workers to avoid overloading a share.
+Windows network APIs can block while an unavailable server times out. Cancel immediately restores
+the last completed snapshot and prevents the abandoned generation from publishing, although its
+background worker may remain blocked until Windows returns from the in-progress SMB request. The UI
+allows one retry and then refuses additional scans while two generations remain blocked, preventing
+unbounded thread-pool exhaustion. Network scans use fewer concurrent workers to avoid overloading a
+share.
 
 ## Features
 
@@ -61,9 +64,21 @@ The repository-root `global.json` and committed NuGet lock files define the buil
 
 ```powershell
 dotnet restore Windows\DiskInventoryZed.Windows.sln
-dotnet test Windows\tests\DiskInventoryZed.Core.Tests\DiskInventoryZed.Core.Tests.csproj -c Release
+dotnet test Windows\DiskInventoryZed.Windows.sln -c Release
 dotnet run --project Windows\src\DiskInventoryZed.Windows\DiskInventoryZed.Windows.csproj
 ```
+
+CI runs the cross-platform Core suite and the Windows/WPF reliability suite with zero skipped tests.
+It retains TRX and Cobertura reports and enforces package-level floors of 65% line / 60% branch for
+Core and 10% line / 5% branch for the Windows application. Native Windows tests cover allocation
+metadata, hard links, hidden entries, junction cycles, atomic export replacement, WPF resources,
+directory-guard identity/handle release, scan-generation races, dispatcher affinity, disposal, and
+packaged x64 startup through asynchronous drive discovery. ARM64 packages
+are structurally verified; native ARM64 execution remains a gate for the planned self-hosted runner.
+
+Do not attach a persistent self-hosted runner to untrusted fork pull requests. Prefer an ephemeral,
+isolated runner using local NTFS storage, and label it by architecture so CI can reject a mismatched
+host before running filesystem tests.
 
 Create a self-contained release zip:
 
@@ -87,7 +102,8 @@ Artifacts are written to `artifacts\windows`.
 ## Accuracy Notes
 
 - **On disk** uses Windows allocation size when available and reports a logical-size estimate when
-  the filesystem or server does not expose allocation data.
+  the filesystem or server does not expose allocation data. Metadata estimates are diagnosed
+  separately from entries that could not be read or enumerated.
 - Hard-linked files are shown at every path and counted once only when stable file identity is
   available. The scan reports files whose hard-link identity could not be verified.
 - Hidden entries are excluded by default. Diagnostics report encountered exclusions, but cannot
@@ -95,8 +111,10 @@ Artifacts are written to `artifacts\windows`.
 - NTFS alternate data streams are not enumerated in this initial Windows release.
 - ReFS block cloning, Windows Server Data Deduplication, cloud placeholders, and shared extents can
   prevent exact per-file reclaimable-byte accounting.
-- Cloud placeholders are scanned from metadata without intentional hydration. Offline files are
-  skipped during content-based duplicate verification.
+- Cloud placeholders are scanned from metadata without intentional hydration. Content-based duplicate
+  verification opens one no-recall read handle and skips offline, partial, or indeterminate placeholders.
+- JSON and CSV exports preserve whether an issue is a non-fatal estimate or an unreadable entry; the
+  CSV field is appended so existing column positions remain stable.
 - Reparse points that cannot be classified safely are shown but not traversed.
 - A selected root that is a link or junction is rejected unless **Follow links and junctions** is
   enabled; a root whose reparse type or target identity is unknown is rejected.
@@ -106,4 +124,5 @@ Artifacts are written to `artifacts\windows`.
 - `src/DiskInventoryZed.Core`: platform-neutral models, scanner, analysis, layouts, and export
 - `src/DiskInventoryZed.Windows`: WPF shell, custom drawing controls, and Windows integration
 - `tests/DiskInventoryZed.Core.Tests`: scanner, model, layout, export, and duplicate tests
+- `tests/DiskInventoryZed.Windows.Tests`: ViewModel races, settings, WPF resources, and shell boundaries
 - `scripts/package.ps1`: self-contained Windows zip packaging

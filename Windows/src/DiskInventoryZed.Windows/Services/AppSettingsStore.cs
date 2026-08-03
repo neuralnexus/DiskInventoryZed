@@ -25,6 +25,11 @@ public sealed class AppSettingsStore
         _settingsPath = Path.Combine(directory, "settings.json");
     }
 
+    internal AppSettingsStore(string settingsPath)
+    {
+        _settingsPath = settingsPath;
+    }
+
     public AppSettings Load()
     {
         try

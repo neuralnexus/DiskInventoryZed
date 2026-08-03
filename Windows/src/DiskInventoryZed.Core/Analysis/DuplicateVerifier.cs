@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using DiskInventoryZed.Core.Models;
+using DiskInventoryZed.Core.Scanning;
 using DiskInventoryZed.Core.Utilities;
 
 namespace DiskInventoryZed.Core.Analysis;
@@ -28,12 +29,14 @@ public sealed record VerifiedDuplicateGroup(string Digest, long FileSize, IReadO
 
 public sealed record DuplicateVerificationResult(
     IReadOnlyList<VerifiedDuplicateGroup> Groups,
-    IReadOnlyList<string> UnreadablePaths);
+    IReadOnlyList<string> UnreadablePaths,
+    int TotalUnreadableFiles);
 
 public static class DuplicateVerifier
 {
     private const int SampleSize = 64 * 1024;
     private const int ReadBufferSize = 1024 * 1024;
+    private const FileAttributes RecallOnDataAccess = (FileAttributes)0x00400000;
 
     public static async Task<DuplicateVerificationResult> VerifyAsync(
         IReadOnlyList<DuplicateCandidate> candidates,
@@ -46,6 +49,7 @@ public static class DuplicateVerifier
             .OrderBy(file => file.FullPath, StringComparer.OrdinalIgnoreCase)
             .ToArray();
         var unreadable = new List<string>();
+        var unreadableFiles = new HashSet<string>(StringComparer.Ordinal);
         var samples = new Dictionary<string, List<FileNode>>(StringComparer.Ordinal);
 
         for (var index = 0; index < files.Length; index++)
@@ -64,10 +68,7 @@ public static class DuplicateVerifier
             }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException or CryptographicException)
             {
-                if (unreadable.Count < 100)
-                {
-                    unreadable.Add(file.FullPath);
-                }
+                RecordUnreadable(file.FullPath);
             }
         }
 
@@ -92,10 +93,7 @@ public static class DuplicateVerifier
             }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException or CryptographicException)
             {
-                if (unreadable.Count < 100 && !unreadable.Contains(file.FullPath, StringComparer.OrdinalIgnoreCase))
-                {
-                    unreadable.Add(file.FullPath);
-                }
+                RecordUnreadable(file.FullPath);
             }
         }
 
@@ -108,7 +106,15 @@ public static class DuplicateVerifier
             .OrderByDescending(group => group.PotentialSavings)
             .ThenBy(group => group.Digest, StringComparer.Ordinal)
             .ToArray();
-        return new DuplicateVerificationResult(groups, unreadable);
+        return new DuplicateVerificationResult(groups, unreadable, unreadableFiles.Count);
+
+        void RecordUnreadable(string path)
+        {
+            if (unreadableFiles.Add(path) && unreadable.Count < 100)
+            {
+                unreadable.Add(path);
+            }
+        }
     }
 
     private static async Task<string> SampleDigestAsync(FileNode node, CancellationToken cancellationToken)
@@ -175,10 +181,17 @@ public static class DuplicateVerifier
         return digest;
     }
 
-    private static FileStream OpenRead(string path)
+    internal static FileStream OpenRead(string path)
     {
+        if (OperatingSystem.IsWindows())
+        {
+            return WindowsFileMetadata.OpenLocallyAvailableRead(path, ReadBufferSize);
+        }
+
         var attributes = File.GetAttributes(path);
-        if (attributes.HasFlag(FileAttributes.Directory) || attributes.HasFlag(FileAttributes.Offline))
+        if (attributes.HasFlag(FileAttributes.Directory) ||
+            attributes.HasFlag(FileAttributes.Offline) ||
+            attributes.HasFlag(RecallOnDataAccess))
         {
             throw new IOException("Only locally available regular files can be verified.");
         }
@@ -187,7 +200,7 @@ public static class DuplicateVerifier
             path,
             FileMode.Open,
             FileAccess.Read,
-            FileShare.Read | FileShare.Delete,
+            FileShare.Read,
             ReadBufferSize,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
     }
