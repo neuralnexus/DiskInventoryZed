@@ -232,16 +232,19 @@ public sealed class WindowsStartupAndShellBoundaryTests
             {
                 var dispatcher = Dispatcher.CurrentDispatcher;
                 SynchronizationContext.SetSynchronizationContext(new DispatcherSynchronizationContext(dispatcher));
-                Exception? failure = null;
-                _ = dispatcher.BeginInvoke(async () =>
+                var operation = ExecuteAsync();
+                if (!operation.IsCompleted)
+                {
+                    Dispatcher.Run();
+                }
+                operation.GetAwaiter().GetResult();
+                completion.SetResult(null);
+
+                async Task ExecuteAsync()
                 {
                     try
                     {
                         await action();
-                    }
-                    catch (Exception error)
-                    {
-                        failure = error;
                     }
                     finally
                     {
@@ -250,13 +253,7 @@ public sealed class WindowsStartupAndShellBoundaryTests
                             dispatcher.BeginInvokeShutdown(DispatcherPriority.Background);
                         }
                     }
-                });
-                Dispatcher.Run();
-                if (failure is not null)
-                {
-                    throw failure;
                 }
-                completion.SetResult(null);
             }
             catch (Exception error)
             {
