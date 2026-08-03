@@ -110,12 +110,12 @@ final class FileNode: Identifiable, Hashable, @unchecked Sendable {
         self.isHardLinkDuplicate = isHardLinkDuplicate
         self.totalFileCount = totalFileCount ?? (
             kind == .directory
-                ? children.reduce(0) { $0 + $1.totalFileCount }
+                ? children.reduce(0) { Self.saturatingAdd($0, $1.totalFileCount) }
                 : 1
         )
         self.totalDirectoryCount = totalDirectoryCount ?? (
             kind == .directory
-                ? 1 + children.reduce(0) { $0 + $1.totalDirectoryCount }
+                ? children.reduce(1) { Self.saturatingAdd($0, $1.totalDirectoryCount) }
                 : 0
         )
     }
@@ -193,8 +193,12 @@ final class FileNode: Identifiable, Hashable, @unchecked Sendable {
     }
 
     private func replacingChildren(_ updatedChildren: [FileNode]) -> FileNode {
-        let newLogicalSize = updatedChildren.reduce(Int64(0)) { $0 + $1.logicalSize }
-        let newAllocatedSize = updatedChildren.reduce(Int64(0)) { $0 + $1.allocatedSize }
+        let newLogicalSize = updatedChildren.reduce(Int64(0)) {
+            Self.saturatingAdd($0, $1.logicalSize)
+        }
+        let newAllocatedSize = updatedChildren.reduce(Int64(0)) {
+            Self.saturatingAdd($0, $1.allocatedSize)
+        }
 
         return FileNode(
             id: id,
@@ -211,8 +215,22 @@ final class FileNode: Identifiable, Hashable, @unchecked Sendable {
             children: updatedChildren,
             errorDescription: errorDescription,
             isHardLinkDuplicate: isHardLinkDuplicate,
-            totalFileCount: updatedChildren.reduce(0) { $0 + $1.totalFileCount },
-            totalDirectoryCount: 1 + updatedChildren.reduce(0) { $0 + $1.totalDirectoryCount }
+            totalFileCount: updatedChildren.reduce(0) {
+                Self.saturatingAdd($0, $1.totalFileCount)
+            },
+            totalDirectoryCount: updatedChildren.reduce(1) {
+                Self.saturatingAdd($0, $1.totalDirectoryCount)
+            }
         )
+    }
+
+    private static func saturatingAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+        let (result, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? (rhs >= 0 ? .max : .min) : result
+    }
+
+    private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (result, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? (rhs >= 0 ? .max : .min) : result
     }
 }

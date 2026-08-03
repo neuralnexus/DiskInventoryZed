@@ -10,6 +10,9 @@ import Glibc
 private let linuxOPath = Int32(0o10000000)
 #endif
 
+private let maximumScanEntries = 1_000_000
+private let maximumDirectoryEntries = 100_000
+
 struct ScanDiagnostics: Sendable, Equatable {
     var unreadableItems = 0
     var skippedDirectories = 0
@@ -38,7 +41,7 @@ struct DiskScanResult: Sendable {
     let scannedDirectoryIdentities: Set<String>
 }
 
-struct ScanOptions: Sendable {
+struct ScanOptions: Codable, Equatable, Sendable {
     let skipDeveloperFolders: Bool
     let showHiddenFiles: Bool
     let showPackageContents: Bool
@@ -58,6 +61,8 @@ final class DiskScanner: Sendable {
         case invalidURL
         case accessDenied(String)
         case directoryChanged(String)
+        case directoryEntryLimitExceeded(String, Int)
+        case scanEntryLimitExceeded(Int)
 
         var errorDescription: String? {
             switch self {
@@ -71,6 +76,10 @@ final class DiskScanner: Sendable {
 #endif
             case .directoryChanged(let path):
                 return "The directory changed while it was being scanned: \(path)"
+            case .directoryEntryLimitExceeded(let path, let limit):
+                return "The directory contains more than \(limit) entries and could not be scanned safely: \(path)"
+            case .scanEntryLimitExceeded(let limit):
+                return "The scan contains more than \(limit) entries and could not be completed safely."
             }
         }
     }
@@ -100,7 +109,9 @@ final class DiskScanner: Sendable {
     ) async throws -> DiskScanResult {
         let startTime = Date()
 #if os(Linux)
-        let rootURL = Self.linuxLexicallyStandardizedURL(url)
+        guard let rootURL = Self.linuxLexicallyStandardizedURL(url) else {
+            throw ScanError.invalidURL
+        }
         let rootMetadata = try? Self.linuxDirectoryMetadata(for: rootURL)
         guard rootMetadata?.isDirectory == true,
               rootMetadata?.isSymbolicLink == false else {
@@ -145,7 +156,8 @@ final class DiskScanner: Sendable {
                     for: rootURL,
                     metadata: rootMetadata
                 )
-            )
+            ),
+            rootDirectoryIdentity: rootMetadata?.directoryIdentity
         )
 
         let progressTask = Task {
@@ -172,22 +184,47 @@ final class DiskScanner: Sendable {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 for _ in 0..<workerCount {
                     group.addTask { [resourceKeys] in
-                        while let work = await queue.next() {
-                            do {
-                                try Task.checkCancellation()
-                                let output = try Self.readDirectory(
-                                    work,
-                                    options: options,
-                                    resourceKeys: resourceKeys
-                                )
-                                try Task.checkCancellation()
-                                await queue.complete(output)
-                            } catch is CancellationError {
-                                await queue.cancel()
-                                throw CancellationError()
-                            } catch {
-                                await queue.completeFailure(work, error: error)
+                        do {
+                            while let work = await queue.next() {
+                                var examinedEntryCount = 0
+                                do {
+                                    try Task.checkCancellation()
+                                    let output = try Self.readDirectory(
+                                        work,
+                                        options: options,
+                                        resourceKeys: resourceKeys,
+                                        examinedEntryCount: &examinedEntryCount
+                                    )
+                                    try Task.checkCancellation()
+                                    try await queue.complete(
+                                        output,
+                                        examinedEntryCount: examinedEntryCount
+                                    )
+                                } catch is CancellationError {
+                                    throw CancellationError()
+                                } catch let error as ScanError {
+                                    if work.record.id == rootRecord.id {
+                                        throw error
+                                    }
+                                    if case .scanEntryLimitExceeded = error {
+                                        throw error
+                                    }
+                                    try await queue.completeFailure(
+                                        work,
+                                        error: error,
+                                        examinedEntryCount: examinedEntryCount
+                                    )
+                                } catch {
+                                    try await queue.completeFailure(
+                                        work,
+                                        error: error,
+                                        examinedEntryCount: examinedEntryCount
+                                    )
+                                }
                             }
+                        } catch {
+                            await queue.cancel()
+                            throw error
                         }
                     }
                 }
@@ -204,8 +241,8 @@ final class DiskScanner: Sendable {
         await progressTask.value
         try Task.checkCancellation()
 
-        let completed = await queue.completedScan()
-        guard let root = Self.buildTree(id: rootRecord.id, records: completed.records) else {
+        let completed = try await queue.completedScan()
+        guard let root = try Self.buildTree(id: rootRecord.id, records: completed.records) else {
             throw ScanError.invalidURL
         }
         if root.isUnreadable && root.children.isEmpty {
@@ -220,6 +257,7 @@ final class DiskScanner: Sendable {
         )
         await progressHandler(finalProgress)
 
+        try Task.checkCancellation()
         return DiskScanResult(
             root: root,
             totalFiles: completed.fileCount,
@@ -233,24 +271,56 @@ final class DiskScanner: Sendable {
     private static func readDirectory(
         _ work: WorkItem,
         options: ScanOptions,
-        resourceKeys: Set<URLResourceKey>
+        resourceKeys: Set<URLResourceKey>,
+        examinedEntryCount: inout Int
     ) throws -> DirectoryOutput {
 #if os(Linux)
-        let listing = try linuxDirectoryEntries(for: work, options: options)
+        let listing = try linuxDirectoryEntries(
+            for: work,
+            options: options,
+            examinedEntryCount: &examinedEntryCount
+        )
         let entries = listing.entries
 #else
-        let directoryOptions: FileManager.DirectoryEnumerationOptions =
-            options.showHiddenFiles ? [] : [.skipsHiddenFiles]
-        let urls = try FileManager().contentsOfDirectory(
+        let directoryOptions: FileManager.DirectoryEnumerationOptions = [
+            .skipsSubdirectoryDescendants
+        ]
+        var enumerationError: Error?
+        guard let enumerator = FileManager().enumerator(
             at: work.record.url,
             includingPropertiesForKeys: Array(resourceKeys),
-            options: directoryOptions
-        )
-        let entries = urls.map { url in
-            ScannedDirectoryEntry(
+            options: directoryOptions,
+            errorHandler: { _, error in
+                enumerationError = error
+                return false
+            }
+        ) else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        var entries: [ScannedDirectoryEntry] = []
+        while let value = enumerator.nextObject() {
+            try Task.checkCancellation()
+            guard let url = value as? URL else { continue }
+            guard examinedEntryCount < maximumDirectoryEntries else {
+                throw ScanError.directoryEntryLimitExceeded(
+                    work.record.url.path,
+                    maximumDirectoryEntries
+                )
+            }
+            examinedEntryCount += 1
+            if !options.showHiddenFiles {
+                let isHidden = (try? url.resourceValues(forKeys: [.isHiddenKey]).isHidden) == true
+                if isHidden || url.lastPathComponent.hasPrefix(".") {
+                    continue
+                }
+            }
+            entries.append(ScannedDirectoryEntry(
                 url: url,
                 metadata: nil
-            )
+            ))
+        }
+        if let enumerationError {
+            throw enumerationError
         }
 #endif
 
@@ -260,7 +330,7 @@ final class DiskScanner: Sendable {
 #if os(Linux)
         var observedDirectoryIdentities = listing.observedDirectoryIdentities
 #else
-        let observedDirectoryIdentities: Set<String> = []
+        var observedDirectoryIdentities: Set<String> = []
 #endif
         let orderedURLs = options.followSymlinks
             ? entries.sorted { $0.url.path.utf8.lexicographicallyPrecedes($1.url.path.utf8) }
@@ -269,6 +339,8 @@ final class DiskScanner: Sendable {
         for entry in orderedURLs {
             try Task.checkCancellation()
             let childURL = entry.url
+            let childID = entry.id ?? fileNodeIdentity(for: childURL)
+            let childName = entry.name ?? childURL.lastPathComponent
 
 #if os(Linux)
             let childMetadata = entry.metadata
@@ -280,71 +352,85 @@ final class DiskScanner: Sendable {
             )
 #endif
             guard let metadata = childMetadata else {
-                let inaccessible = NodeRecord.inaccessible(url: childURL)
+                let inaccessible = NodeRecord.inaccessible(
+                    url: childURL,
+                    id: childID,
+                    name: childName,
+                    errorDescription: entry.errorDescription
+                )
                 children.append(ChildRecord(record: inaccessible, shouldTraverse: false, canonicalDirectoryPath: nil, fileIdentity: nil))
                 continue
             }
 
-#if os(Linux)
             if let directoryIdentity = metadata.directoryIdentity {
                 observedDirectoryIdentities.insert(directoryIdentity)
             }
-#endif
 
             let childIsDirectory = metadata.isDirectory
             let childIsSymlink = metadata.isSymbolicLink
             let childIsPackage = metadata.isPackage
-            let lowercasedName = childURL.lastPathComponent.lowercased()
+            let lowercasedName = childName.lowercased()
 
             if options.skipDeveloperFolders,
                childIsDirectory,
                developerFolderNames.contains(lowercasedName) {
-                skippedDirectories += 1
+                skippedDirectories = saturatingAdd(skippedDirectories, 1)
                 continue
             }
 
-            let shouldFollowDirectory = childIsDirectory && (!childIsSymlink || metadata.followedSymbolicLink)
-            let shouldTraverse = shouldFollowDirectory
-            let exposesChildren = shouldFollowDirectory && (!childIsPackage || options.showPackageContents)
+            let isTraversableDirectory = childIsDirectory && (!childIsSymlink || metadata.followedSymbolicLink)
+            let shouldTraverse = isTraversableDirectory && entry.errorDescription == nil
+            let exposesChildren = shouldTraverse && (!childIsPackage || options.showPackageContents)
 
             let kind: FileNode.Kind
             if childIsSymlink && !metadata.followedSymbolicLink {
                 kind = .symbolicLink
             } else if childIsPackage && !options.showPackageContents {
                 kind = .package
-            } else if shouldFollowDirectory {
+            } else if childIsDirectory {
                 kind = .directory
             } else {
                 kind = .file
             }
 
-            let logicalSize = shouldTraverse ? 0 : metadata.logicalSize
-            let allocatedSize = shouldTraverse ? 0 : metadata.allocatedSize
+            let omitsDirectoryMetadataSize = childIsDirectory && entry.errorDescription != nil
+            let logicalSize = shouldTraverse || omitsDirectoryMetadataSize ? 0 : metadata.logicalSize
+            let allocatedSize = shouldTraverse || omitsDirectoryMetadataSize ? 0 : metadata.allocatedSize
 
             let record = NodeRecord(
-                id: fileNodeIdentity(for: childURL),
+                id: childID,
                 url: childURL,
-                name: childURL.lastPathComponent,
+                name: childName,
                 kind: kind,
                 isPackage: childIsPackage,
                 isSymbolicLink: childIsSymlink,
                 modificationDate: metadata.modificationDate,
                 creationDate: metadata.creationDate,
-                extension: childURL.pathExtension.isEmpty ? nil : childURL.pathExtension,
+                extension: entry.errorDescription == nil && !childURL.pathExtension.isEmpty
+                    ? childURL.pathExtension
+                    : nil,
                 logicalSize: logicalSize,
                 allocatedSize: allocatedSize,
                 childIDs: [],
                 exposesChildren: exposesChildren,
-                errorDescription: metadata.errorDescription,
+                errorDescription: entry.errorDescription ?? metadata.errorDescription,
                 isHardLinkDuplicate: false
             )
 
-            let fileIdentity: String?
+            let fileIdentity: FileIdentity?
+#if os(Linux)
+            if shouldTraverse {
+                fileIdentity = nil
+            } else {
+                fileIdentity = metadata.fileIdentity
+            }
+#else
             if shouldTraverse || kind == .symbolicLink {
                 fileIdentity = nil
             } else {
                 fileIdentity = metadata.fileIdentity
             }
+#endif
 
             children.append(ChildRecord(
                 record: record,
@@ -358,19 +444,10 @@ final class DiskScanner: Sendable {
 
         var parent = work.record
         parent.childIDs = children.map(\.record.id)
-#if os(Linux)
-        let unrepresentableNameCount = listing.unrepresentableNameCount
-        let firstUnrepresentablePaths = listing.firstUnrepresentablePaths
-#else
-        let unrepresentableNameCount = 0
-        let firstUnrepresentablePaths: [String] = []
-#endif
         return DirectoryOutput(
             directory: parent,
             children: children,
             skippedDirectories: skippedDirectories,
-            unrepresentableNameCount: unrepresentableNameCount,
-            firstUnrepresentablePaths: firstUnrepresentablePaths,
             observedDirectoryIdentities: observedDirectoryIdentities
         )
     }
@@ -380,16 +457,22 @@ final class DiskScanner: Sendable {
         metadata: FileSystemMetadata?
     ) -> String {
 #if os(Linux)
-        metadata?.directoryIdentity ?? fileNodeIdentity(for: url)
+        if let identity = metadata?.directoryIdentity,
+           let generation = metadata?.directoryGeneration {
+            return "\(identity)|\(generation)"
+        }
+        return fileNodeIdentity(for: url)
 #else
         url.resolvingSymlinksInPath().standardizedFileURL.path
 #endif
     }
 
 #if os(Linux)
+    // Bounds transient URL/metadata materialization while still accommodating unusually large directories.
     private static func linuxDirectoryEntries(
         for work: WorkItem,
-        options: ScanOptions
+        options: ScanOptions,
+        examinedEntryCount: inout Int
     ) throws -> LinuxDirectoryListing {
         let descriptor = try openDirectoryWithoutFollowingSymlinks(at: work.record.url)
         guard let directory = Glibc.fdopendir(descriptor) else {
@@ -405,13 +488,13 @@ final class DiskScanner: Sendable {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         guard fileType(of: openedStatus.st_mode) == mode_t(S_IFDIR),
-              linuxFileIdentity(openedStatus) == work.canonicalDirectoryPath else {
+              linuxCanonicalDirectoryIdentity(openedStatus) == work.canonicalDirectoryPath else {
             throw ScanError.directoryChanged(work.record.url.path)
         }
 
         var entries: [ScannedDirectoryEntry] = []
-        var unrepresentableNameCount = 0
-        var firstUnrepresentablePaths: [String] = []
+        var opaqueEntries: [(nameBytes: [UInt8], metadata: FileSystemMetadata?)] = []
+        var representedNames: Set<String> = []
         var observedDirectoryIdentities: Set<String> = []
 
         while true {
@@ -432,6 +515,17 @@ final class DiskScanner: Sendable {
                 nameBytes == [UInt8(ascii: "."), UInt8(ascii: ".")] {
                 continue
             }
+            guard examinedEntryCount < maximumDirectoryEntries else {
+                throw ScanError.directoryEntryLimitExceeded(
+                    work.record.url.path,
+                    maximumDirectoryEntries
+                )
+            }
+            examinedEntryCount += 1
+            if !options.showHiddenFiles, nameBytes.first == UInt8(ascii: ".") {
+                continue
+            }
+
             var childStatus = stat()
             var fileSystemName = nameBytes.map { CChar(bitPattern: $0) }
             fileSystemName.append(0)
@@ -447,21 +541,13 @@ final class DiskScanner: Sendable {
             if let directoryIdentity = childMetadata?.directoryIdentity {
                 observedDirectoryIdentities.insert(directoryIdentity)
             }
-            if !options.showHiddenFiles, nameBytes.first == UInt8(ascii: ".") {
-                continue
-            }
 
             guard let name = String(bytes: nameBytes, encoding: .utf8) else {
-                unrepresentableNameCount += 1
-                if firstUnrepresentablePaths.count < 20 {
-                    let encodedName = Data(nameBytes).base64EncodedString()
-                    firstUnrepresentablePaths.append(
-                        "\(work.record.url.path)/<non-UTF-8:\(encodedName)>"
-                    )
-                }
+                opaqueEntries.append((nameBytes: nameBytes, metadata: childMetadata))
                 continue
             }
 
+            representedNames.insert(name)
             let childURL = appendingFileName(name, to: work.record.url)
             entries.append(ScannedDirectoryEntry(
                 url: childURL,
@@ -469,18 +555,45 @@ final class DiskScanner: Sendable {
             ))
         }
 
-        let verificationDescriptor = try openDirectoryWithoutFollowingSymlinks(at: work.record.url)
-        defer { Glibc.close(verificationDescriptor) }
+        for opaqueEntry in opaqueEntries {
+            let encodedName = linuxOpaqueName(
+                for: opaqueEntry.nameBytes,
+                avoiding: &representedNames
+            )
+            let childURL = appendingFileName(encodedName, to: work.record.url)
+            entries.append(ScannedDirectoryEntry(
+                url: childURL,
+                metadata: opaqueEntry.metadata,
+                id: linuxChildIdentity(nameBytes: opaqueEntry.nameBytes, in: work.record.url),
+                name: encodedName,
+                errorDescription: "The file name is not valid UTF-8, so this entry could not be traversed or exported."
+            ))
+        }
+
         var verificationStatus = stat()
-        guard Glibc.fstat(verificationDescriptor, &verificationStatus) == 0,
-              linuxFileIdentity(verificationStatus) == work.canonicalDirectoryPath else {
+        guard Glibc.fstat(directoryDescriptor, &verificationStatus) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard linuxCanonicalDirectoryIdentity(verificationStatus) == work.canonicalDirectoryPath,
+              openedStatus.st_ctim.tv_sec == verificationStatus.st_ctim.tv_sec,
+              openedStatus.st_ctim.tv_nsec == verificationStatus.st_ctim.tv_nsec,
+              openedStatus.st_mtim.tv_sec == verificationStatus.st_mtim.tv_sec,
+              openedStatus.st_mtim.tv_nsec == verificationStatus.st_mtim.tv_nsec else {
+            throw ScanError.directoryChanged(work.record.url.path)
+        }
+
+        let pathDescriptor = try openDirectoryWithoutFollowingSymlinks(at: work.record.url)
+        defer { Glibc.close(pathDescriptor) }
+        var pathStatus = stat()
+        guard Glibc.fstat(pathDescriptor, &pathStatus) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard linuxCanonicalDirectoryIdentity(pathStatus) == work.canonicalDirectoryPath else {
             throw ScanError.directoryChanged(work.record.url.path)
         }
 
         return LinuxDirectoryListing(
             entries: entries,
-            unrepresentableNameCount: unrepresentableNameCount,
-            firstUnrepresentablePaths: firstUnrepresentablePaths,
             observedDirectoryIdentities: observedDirectoryIdentities
         )
     }
@@ -495,14 +608,11 @@ final class DiskScanner: Sendable {
         return linuxMetadata(from: status)
     }
 
-    private static func linuxLexicallyStandardizedURL(_ url: URL) -> URL {
+    private static func linuxLexicallyStandardizedURL(_ url: URL) -> URL? {
         var components: [Substring] = []
         for component in url.path.split(separator: "/", omittingEmptySubsequences: true) {
             if component == "." { continue }
-            if component == ".." {
-                if !components.isEmpty { components.removeLast() }
-                continue
-            }
+            if component == ".." { return nil }
             components.append(component)
         }
         let path = "/" + components.joined(separator: "/")
@@ -568,6 +678,44 @@ final class DiskScanner: Sendable {
             }
         }
     }
+
+    private static func linuxOpaqueName(
+        for nameBytes: [UInt8],
+        avoiding representedNames: inout Set<String>
+    ) -> String {
+        let encoded = Data(nameBytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        let baseName = "<non-UTF-8:\(encoded)>"
+        var candidate = baseName
+        var suffix = 2
+        while !representedNames.insert(candidate).inserted {
+            candidate = "<non-UTF-8:\(encoded):\(suffix)>"
+            suffix += 1
+        }
+        return candidate
+    }
+
+    private static func linuxChildIdentity(nameBytes: [UInt8], in directoryURL: URL) -> String {
+        directoryURL.withUnsafeFileSystemRepresentation { directoryPath in
+            guard let directoryPath else {
+                return "\(fileNodeIdentity(for: directoryURL))|\(Data(nameBytes).base64EncodedString())"
+            }
+
+            var pathBytes: [UInt8] = []
+            var index = 0
+            while directoryPath[index] != 0 {
+                pathBytes.append(UInt8(bitPattern: directoryPath[index]))
+                index += 1
+            }
+            if pathBytes.last != UInt8(ascii: "/") {
+                pathBytes.append(UInt8(ascii: "/"))
+            }
+            pathBytes.append(contentsOf: nameBytes)
+            return Data(pathBytes).base64EncodedString()
+        }
+    }
 #endif
 
     private static func metadata(
@@ -603,8 +751,13 @@ final class DiskScanner: Sendable {
             ),
             modificationDate: values.contentModificationDate,
             creationDate: values.creationDate,
-            fileIdentity: identityString(values: values),
-            directoryIdentity: nil,
+            fileIdentity: identityString(values: values).map {
+                FileIdentity(key: $0, generation: nil)
+            },
+            directoryIdentity: values.isDirectory == true
+                ? identityString(values: values)
+                : nil,
+            directoryGeneration: nil,
             errorDescription: nil
         )
 #endif
@@ -631,16 +784,32 @@ final class DiskScanner: Sendable {
             allocatedSize: overflow ? Int64.max : allocatedBytes,
             modificationDate: modificationDate,
             creationDate: nil,
-            fileIdentity: isDirectory || isSymbolicLink
-                ? nil
-                : linuxFileIdentity(status),
-            directoryIdentity: isDirectory ? linuxFileIdentity(status) : nil,
+            fileIdentity: !isDirectory
+                ? linuxHardLinkIdentity(status)
+                : nil,
+            directoryIdentity: isDirectory ? linuxDirectoryIdentity(status) : nil,
+            directoryGeneration: isDirectory ? linuxDirectoryGeneration(status) : nil,
             errorDescription: nil
         )
     }
 
-    private static func linuxFileIdentity(_ status: stat) -> String {
+    private static func linuxDirectoryIdentity(_ status: stat) -> String {
         "\(status.st_dev)|\(status.st_ino)"
+    }
+
+    private static func linuxDirectoryGeneration(_ status: stat) -> String {
+        "\(status.st_ctim.tv_sec)|\(status.st_ctim.tv_nsec)"
+    }
+
+    private static func linuxCanonicalDirectoryIdentity(_ status: stat) -> String {
+        "\(linuxDirectoryIdentity(status))|\(linuxDirectoryGeneration(status))"
+    }
+
+    private static func linuxHardLinkIdentity(_ status: stat) -> FileIdentity {
+        FileIdentity(
+            key: "\(status.st_dev)|\(status.st_ino)",
+            generation: "\(status.st_ctim.tv_sec)|\(status.st_ctim.tv_nsec)"
+        )
     }
 
     private static func fileType(of mode: mode_t) -> mode_t {
@@ -656,7 +825,8 @@ final class DiskScanner: Sendable {
     }
 #endif
 
-    private static func buildTree(id: String, records: [String: NodeRecord]) -> FileNode? {
+    private static func buildTree(id: String, records: [String: NodeRecord]) throws -> FileNode? {
+        try Task.checkCancellation()
         guard records[id] != nil else { return nil }
 
         var stack: [(id: String, childrenVisited: Bool)] = [(id, false)]
@@ -664,6 +834,7 @@ final class DiskScanner: Sendable {
         builtNodes.reserveCapacity(records.count)
 
         while let item = stack.popLast() {
+            try Task.checkCancellation()
             guard let record = records[item.id] else { continue }
 
             if !item.childrenVisited {
@@ -680,16 +851,24 @@ final class DiskScanner: Sendable {
                 }
                 return $0.allocatedSize > $1.allocatedSize
             }
+            try Task.checkCancellation()
 
-            let aggregateLogicalSize = sortedChildren.reduce(Int64(0)) {
-                saturatingAdd($0, $1.logicalSize)
+            var aggregateLogicalSize: Int64 = 0
+            var aggregateAllocatedSize: Int64 = 0
+            var aggregateFileCount = 0
+            var aggregateDirectoryCount = 0
+            for child in sortedChildren {
+                try Task.checkCancellation()
+                aggregateLogicalSize = saturatingAdd(aggregateLogicalSize, child.logicalSize)
+                aggregateAllocatedSize = saturatingAdd(aggregateAllocatedSize, child.allocatedSize)
+                aggregateFileCount = saturatingAdd(aggregateFileCount, child.totalFileCount)
+                aggregateDirectoryCount = saturatingAdd(
+                    aggregateDirectoryCount,
+                    child.totalDirectoryCount
+                )
             }
-            let aggregateAllocatedSize = sortedChildren.reduce(Int64(0)) {
-                saturatingAdd($0, $1.allocatedSize)
-            }
-            let aggregateFileCount = sortedChildren.reduce(0) { $0 + $1.totalFileCount }
-            let aggregateDirectoryCount = sortedChildren.reduce(0) { $0 + $1.totalDirectoryCount }
             let isContainer = record.kind == .directory || record.kind == .package
+            let aggregatesChildSizes = isContainer && (record.exposesChildren || !record.childIDs.isEmpty)
 
             builtNodes[item.id] = FileNode(
                 id: record.id,
@@ -701,22 +880,20 @@ final class DiskScanner: Sendable {
                 modificationDate: record.modificationDate,
                 creationDate: record.creationDate,
                 extension: record.extension,
-                logicalSize: isContainer ? aggregateLogicalSize : record.logicalSize,
-                allocatedSize: isContainer ? aggregateAllocatedSize : record.allocatedSize,
+                logicalSize: aggregatesChildSizes ? aggregateLogicalSize : record.logicalSize,
+                allocatedSize: aggregatesChildSizes ? aggregateAllocatedSize : record.allocatedSize,
                 children: record.exposesChildren ? sortedChildren : [],
                 errorDescription: record.errorDescription,
                 isHardLinkDuplicate: record.isHardLinkDuplicate,
                 totalFileCount: isContainer ? aggregateFileCount : 1,
-                totalDirectoryCount: isContainer ? 1 + aggregateDirectoryCount : 0
+                totalDirectoryCount: isContainer
+                    ? saturatingAdd(1, aggregateDirectoryCount)
+                    : 0
             )
         }
 
+        try Task.checkCancellation()
         return builtNodes[id]
-    }
-
-    private static func saturatingAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
-        let (result, overflow) = lhs.addingReportingOverflow(rhs)
-        return overflow ? .max : result
     }
 
     private static let developerFolderNames: Set<String> = [
@@ -729,6 +906,21 @@ final class DiskScanner: Sendable {
     ]
 }
 
+private func saturatingAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+    let (result, overflow) = lhs.addingReportingOverflow(rhs)
+    return overflow ? (rhs >= 0 ? .max : .min) : result
+}
+
+private func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+    let (result, overflow) = lhs.addingReportingOverflow(rhs)
+    return overflow ? (rhs >= 0 ? .max : .min) : result
+}
+
+private struct FileIdentity: Sendable {
+    let key: String
+    let generation: String?
+}
+
 private struct FileSystemMetadata {
     let isDirectory: Bool
     let isPackage: Bool
@@ -738,8 +930,9 @@ private struct FileSystemMetadata {
     let allocatedSize: Int64
     let modificationDate: Date?
     let creationDate: Date?
-    let fileIdentity: String?
+    let fileIdentity: FileIdentity?
     let directoryIdentity: String?
+    let directoryGeneration: String?
     let errorDescription: String?
 }
 
@@ -748,13 +941,28 @@ private struct FileSystemMetadata {
 private struct ScannedDirectoryEntry {
     let url: URL
     let metadata: FileSystemMetadata?
+    let id: String?
+    let name: String?
+    let errorDescription: String?
+
+    init(
+        url: URL,
+        metadata: FileSystemMetadata?,
+        id: String? = nil,
+        name: String? = nil,
+        errorDescription: String? = nil
+    ) {
+        self.url = url
+        self.metadata = metadata
+        self.id = id
+        self.name = name
+        self.errorDescription = errorDescription
+    }
 }
 
 #if os(Linux)
 private struct LinuxDirectoryListing {
     let entries: [ScannedDirectoryEntry]
-    let unrepresentableNameCount: Int
-    let firstUnrepresentablePaths: [String]
     let observedDirectoryIdentities: Set<String>
 }
 #endif
@@ -768,15 +976,13 @@ private struct ChildRecord: Sendable {
     var record: NodeRecord
     let shouldTraverse: Bool
     let canonicalDirectoryPath: String?
-    let fileIdentity: String?
+    let fileIdentity: FileIdentity?
 }
 
 private struct DirectoryOutput: Sendable {
     let directory: NodeRecord
     let children: [ChildRecord]
     let skippedDirectories: Int
-    let unrepresentableNameCount: Int
-    let firstUnrepresentablePaths: [String]
     let observedDirectoryIdentities: Set<String>
 }
 
@@ -797,11 +1003,16 @@ private struct NodeRecord: Sendable {
     var errorDescription: String?
     var isHardLinkDuplicate: Bool
 
-    static func inaccessible(url: URL) -> NodeRecord {
+    static func inaccessible(
+        url: URL,
+        id: String? = nil,
+        name: String? = nil,
+        errorDescription: String? = nil
+    ) -> NodeRecord {
         NodeRecord(
-            id: fileNodeIdentity(for: url),
+            id: id ?? fileNodeIdentity(for: url),
             url: url,
-            name: url.lastPathComponent,
+            name: name ?? url.lastPathComponent,
             kind: .file,
             isPackage: false,
             isSymbolicLink: false,
@@ -812,7 +1023,7 @@ private struct NodeRecord: Sendable {
             allocatedSize: 0,
             childIDs: [],
             exposesChildren: false,
-            errorDescription: "Metadata could not be read.",
+            errorDescription: errorDescription ?? "Metadata could not be read.",
             isHardLinkDuplicate: false
         )
     }
@@ -834,27 +1045,26 @@ private actor ScanWorkQueue {
     private var records: [String: NodeRecord]
     private var visitedDirectoryPaths: Set<String>
     private var knownDirectoryIdentities: Set<String>
-    private var ownerByFileIdentity: [String: String] = [:]
+    private var ownerByFileIdentity: [String: (id: String, generation: String?)] = [:]
+    private var examinedEntryCount = 1
     private var fileCount = 0
     private var directoryCount = 0
     private var diagnostics = ScanDiagnostics.empty
     private var currentPath: String
     private var isCancelled = false
 
-    init(root: WorkItem) {
+    init(root: WorkItem, rootDirectoryIdentity: String?) {
         pending = [root]
         records = [root.record.id: root.record]
         visitedDirectoryPaths = [root.canonicalDirectoryPath]
-        knownDirectoryIdentities = [root.canonicalDirectoryPath]
+        knownDirectoryIdentities = rootDirectoryIdentity.map { Set([$0]) } ?? []
         currentPath = root.record.url.path
     }
 
     func next() async -> WorkItem? {
         if isCancelled { return nil }
-        if nextIndex < pending.count {
-            let item = pending[nextIndex]
-            nextIndex += 1
-            inFlight += 1
+        if let item = takeNextPendingItem() {
+            inFlight = saturatingAdd(inFlight, 1)
             currentPath = item.record.url.path
             return item
         }
@@ -865,31 +1075,35 @@ private actor ScanWorkQueue {
         }
     }
 
-    func complete(_ output: DirectoryOutput) {
+    func complete(_ output: DirectoryOutput, examinedEntryCount newEntryCount: Int) throws {
+        try Task.checkCancellation()
         guard !isCancelled else {
             finishOneItem()
             return
         }
+        guard newEntryCount <= maximumScanEntries - examinedEntryCount else {
+            throw DiskScanner.ScanError.scanEntryLimitExceeded(maximumScanEntries)
+        }
+        examinedEntryCount += newEntryCount
 
         records[output.directory.id] = output.directory
-        directoryCount += 1
-        diagnostics.skippedDirectories += output.skippedDirectories
+        directoryCount = saturatingAdd(directoryCount, 1)
+        diagnostics.skippedDirectories = saturatingAdd(
+            diagnostics.skippedDirectories,
+            output.skippedDirectories
+        )
         knownDirectoryIdentities.formUnion(output.observedDirectoryIdentities)
-        diagnostics.unreadableItems += output.unrepresentableNameCount
-        for path in output.firstUnrepresentablePaths
-            where diagnostics.firstUnreadablePaths.count < 20 {
-            diagnostics.firstUnreadablePaths.append(path)
-        }
 
         for var child in output.children {
+            try Task.checkCancellation()
             if child.record.errorDescription != nil {
                 recordUnreadable(path: child.record.url.path)
             }
             if child.record.isSymbolicLink {
-                diagnostics.symbolicLinks += 1
+                diagnostics.symbolicLinks = saturatingAdd(diagnostics.symbolicLinks, 1)
             }
             if child.record.isPackage {
-                diagnostics.packages += 1
+                diagnostics.packages = saturatingAdd(diagnostics.packages, 1)
             }
 
             if child.shouldTraverse,
@@ -903,43 +1117,87 @@ private actor ScanWorkQueue {
                     child.record.allocatedSize = 0
                     child.record.errorDescription = "Directory target was already scanned; it was not followed again."
                     records[child.record.id] = child.record
-                    diagnostics.revisitedDirectories += 1
+                    directoryCount = saturatingAdd(directoryCount, 1)
+                    diagnostics.revisitedDirectories = saturatingAdd(
+                        diagnostics.revisitedDirectories,
+                        1
+                    )
                 }
             } else {
                 if let identity = child.fileIdentity {
-                    if let ownerID = ownerByFileIdentity[identity] {
-                        diagnostics.duplicateHardLinks += 1
-                        if child.record.id < ownerID {
-                            if var previousOwner = records[ownerID] {
+                    if let owner = ownerByFileIdentity[identity.key],
+                       owner.generation == identity.generation {
+                        diagnostics.duplicateHardLinks = saturatingAdd(
+                            diagnostics.duplicateHardLinks,
+                            1
+                        )
+                        if child.record.id < owner.id {
+                            if var previousOwner = records[owner.id] {
                                 previousOwner.allocatedSize = 0
                                 previousOwner.isHardLinkDuplicate = true
-                                records[ownerID] = previousOwner
+                                records[owner.id] = previousOwner
                             }
-                            ownerByFileIdentity[identity] = child.record.id
+                            ownerByFileIdentity[identity.key] = (
+                                id: child.record.id,
+                                generation: identity.generation
+                            )
                         } else {
                             child.record.allocatedSize = 0
                             child.record.isHardLinkDuplicate = true
                         }
+                    } else if ownerByFileIdentity[identity.key] != nil {
+                        if child.record.errorDescription == nil {
+                            child.record.errorDescription = "The file identity changed while it was being scanned; its storage may be counted more than once."
+                            recordUnreadable(path: child.record.url.path)
+                        }
+                        ownerByFileIdentity[identity.key] = (
+                            id: child.record.id,
+                            generation: identity.generation
+                        )
                     } else {
-                        ownerByFileIdentity[identity] = child.record.id
+                        ownerByFileIdentity[identity.key] = (
+                            id: child.record.id,
+                            generation: identity.generation
+                        )
                     }
                 }
                 records[child.record.id] = child.record
-                fileCount += 1
+                if child.record.kind == .directory || child.record.kind == .package {
+                    directoryCount = saturatingAdd(directoryCount, 1)
+                } else {
+                    fileCount = saturatingAdd(fileCount, 1)
+                }
             }
         }
 
+        try Task.checkCancellation()
         finishOneItem()
+        try Task.checkCancellation()
     }
 
-    func completeFailure(_ work: WorkItem, error: Error) {
+    func completeFailure(
+        _ work: WorkItem,
+        error: Error,
+        examinedEntryCount newEntryCount: Int
+    ) throws {
+        try Task.checkCancellation()
+        guard !isCancelled else {
+            finishOneItem()
+            return
+        }
+        guard newEntryCount <= maximumScanEntries - examinedEntryCount else {
+            throw DiskScanner.ScanError.scanEntryLimitExceeded(maximumScanEntries)
+        }
+        examinedEntryCount += newEntryCount
         var failed = work.record
         failed.childIDs = []
         failed.errorDescription = error.localizedDescription
         records[failed.id] = failed
-        directoryCount += 1
+        directoryCount = saturatingAdd(directoryCount, 1)
         recordUnreadable(path: failed.url.path)
+        try Task.checkCancellation()
         finishOneItem()
+        try Task.checkCancellation()
     }
 
     func cancel() {
@@ -961,14 +1219,17 @@ private actor ScanWorkQueue {
         )
     }
 
-    func completedScan() -> CompletedScan {
-        CompletedScan(
+    func completedScan() throws -> CompletedScan {
+        try Task.checkCancellation()
+        let completed = CompletedScan(
             records: records,
             fileCount: fileCount,
             directoryCount: directoryCount,
             diagnostics: diagnostics,
             directoryIdentities: knownDirectoryIdentities
         )
+        try Task.checkCancellation()
+        return completed
     }
 
     private func finishOneItem() {
@@ -977,24 +1238,39 @@ private actor ScanWorkQueue {
     }
 
     private func distributeAvailableWork() {
-        while !waiters.isEmpty && nextIndex < pending.count && !isCancelled {
+        while !waiters.isEmpty && !isCancelled,
+              let item = takeNextPendingItem() {
             let continuation = waiters.removeFirst()
-            let item = pending[nextIndex]
-            nextIndex += 1
-            inFlight += 1
+            inFlight = saturatingAdd(inFlight, 1)
             currentPath = item.record.url.path
             continuation.resume(returning: item)
         }
 
-        if inFlight == 0 && nextIndex >= pending.count {
+        if inFlight == 0 && pending.isEmpty {
             let continuations = waiters
             waiters.removeAll()
             continuations.forEach { $0.resume(returning: nil) }
         }
     }
 
+    private func takeNextPendingItem() -> WorkItem? {
+        guard nextIndex < pending.count else { return nil }
+        let item = pending[nextIndex]
+        nextIndex += 1
+
+        if nextIndex == pending.count {
+            pending.removeAll(keepingCapacity: false)
+            nextIndex = 0
+        } else if nextIndex >= 1_024,
+                  nextIndex >= pending.count - nextIndex {
+            pending.removeFirst(nextIndex)
+            nextIndex = 0
+        }
+        return item
+    }
+
     private func recordUnreadable(path: String) {
-        diagnostics.unreadableItems += 1
+        diagnostics.unreadableItems = saturatingAdd(diagnostics.unreadableItems, 1)
         if diagnostics.firstUnreadablePaths.count < 20 {
             diagnostics.firstUnreadablePaths.append(path)
         }

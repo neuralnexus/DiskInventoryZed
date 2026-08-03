@@ -48,6 +48,9 @@ Disk Inventory Zed visualizes disk usage on macOS with interactive treemaps and 
 - A Linux distribution supported by Swift 5.9 or later
 - Swift 5.9+ (for building from source)
 
+Linux support is source-build only. No prebuilt Linux binary is attached to GitHub Releases;
+install Swift and build the CLI from source using the steps below.
+
 ## Building
 
 ### Using Swift Package Manager
@@ -82,8 +85,9 @@ swift build -c release
 ## macOS First Launch
 
 Developer builds are ad-hoc signed, so macOS Gatekeeper may show a security warning when you first
-try to open one. Tagged releases can be Developer ID signed and notarized when the repository's
-Apple signing credentials are configured:
+try to open one. The release workflow requires a tag on the current `main` commit plus Developer ID
+and notarization credentials in a repository `release` environment. Maintainers should protect that
+environment with required reviewers before configuring its secrets:
 
 > **"Apple could not verify 'DiskInventoryZed' is free of malware that may harm your Mac or compromise your privacy."**
 
@@ -151,7 +155,9 @@ The Linux CLI lists symlinks but never follows them, and it never deletes or mov
 export option per scan and place the output outside the scanned directory. If any entry cannot be
 read or represented safely, the command exits nonzero and does not write the requested export.
 Linux exports are create-only, refuse to replace any existing path, and use owner-only permissions
-(`0600`). Do not route an export through a bind mount that aliases any part of the scan path.
+(`0600`). Export directory ancestry must be owned by the current user or root; group- or
+world-writable directories require the sticky bit. Do not route an export through a bind mount that
+aliases any part of the scan path.
 
 The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 
@@ -183,6 +189,7 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 - Totals sum file allocation and do not include filesystem directory-entry metadata.
 - Multiple hard links to the same file are shown, but their allocated storage is counted once.
 - Linux filenames that are not valid UTF-8 are reported as unreadable, and prevent export, because exported paths are UTF-8 strings.
+- Scans and exports are capped at 1,000,000 entries, individual Linux directories at 100,000 visible entries, and imported JSON snapshots at 256 MiB.
 - APFS clones can share physical blocks without exposing enough public per-file metadata to measure
   exact exclusive ownership. Disk Inventory Zed does not claim clone-level reclaimable bytes.
 - Unreadable or intentionally skipped directories are surfaced in scan diagnostics instead of

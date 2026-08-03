@@ -86,6 +86,27 @@ struct DuplicateCandidate: Identifiable, Hashable, Sendable {
     }
 }
 
+private actor SnapshotComparisonService {
+    func compare(
+        snapshotPath: String,
+        current root: FileNode,
+        options: ScanOptions,
+        diagnostics: ScanDiagnostics
+    ) throws -> ScanComparison {
+        try Task.checkCancellation()
+        let snapshot = try ScanExporter.importSnapshot(
+            from: URL(fileURLWithPath: snapshotPath)
+        )
+        try Task.checkCancellation()
+        return try ScanSnapshotComparator.compare(
+            current: root,
+            options: options,
+            diagnostics: diagnostics,
+            with: snapshot
+        )
+    }
+}
+
 @MainActor
 final class AppViewModel: ObservableObject {
     @Published private(set) var rootNode: FileNode?
@@ -152,9 +173,12 @@ final class AppViewModel: ObservableObject {
     private var analysisTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
     private var duplicateVerificationTask: Task<Void, Never>?
+    private var duplicateVerificationOperationID: UUID?
     private var comparisonTask: Task<Void, Never>?
     private var comparisonOperationID: UUID?
     private var searchIndex: [SearchIndexEntry] = []
+    private var currentScanOptions = ScanOptions.default
+    private let snapshotComparisonService = SnapshotComparisonService()
 
     var canNavigateBack: Bool { navigationIndex > 0 }
     var canNavigateForward: Bool { navigationIndex >= 0 && navigationIndex < navigationStack.count - 1 }
@@ -234,12 +258,7 @@ final class AppViewModel: ObservableObject {
 
     func scan(url: URL) {
         scanTask?.cancel()
-        analysisTask?.cancel()
-        searchTask?.cancel()
-        duplicateVerificationTask?.cancel()
-        comparisonTask?.cancel()
-        comparisonTask = nil
-        comparisonOperationID = nil
+        clearDerivedState()
 
         let scanID = UUID()
         activeScanID = scanID
@@ -250,10 +269,7 @@ final class AppViewModel: ObservableObject {
         scanStatusPath = url.path
         errorMessage = nil
         showError = false
-        duplicateVerificationProgress = nil
-        isAnalyzing = false
         pendingTrashNode = nil
-        isComparingSnapshot = false
 
         let options = ScanOptions(
             skipDeveloperFolders: skipDeveloperFolders,
@@ -289,6 +305,7 @@ final class AppViewModel: ObservableObject {
                 self.totalDirectories = result.totalDirectories
                 self.scanDuration = result.duration
                 self.scanDiagnostics = result.diagnostics
+                self.currentScanOptions = options
                 self.scanStatusPath = result.root.path
                 self.isScanning = false
                 self.scanProgressFiles = 0
@@ -427,6 +444,21 @@ final class AppViewModel: ObservableObject {
         do {
             try FileManager.default.trashItem(at: node.url, resultingItemURL: nil)
             guard let rootNode else { return }
+            clearDerivedState()
+
+            if scanDiagnostics.duplicateHardLinks > 0 {
+                self.rootNode = nil
+                currentNode = nil
+                selectedNode = nil
+                breadcrumb = []
+                navigationStack = []
+                navigationIndex = -1
+                totalFiles = 0
+                totalDirectories = 0
+                scanDiagnostics = .empty
+                scan(url: rootNode.url)
+                return
+            }
 
             let removedCounts = node.descendantCounts()
             let currentID = currentNode?.id
@@ -453,6 +485,8 @@ final class AppViewModel: ObservableObject {
     func verifyDuplicateCandidates() {
         duplicateVerificationTask?.cancel()
         guard !duplicateCandidates.isEmpty else {
+            duplicateVerificationTask = nil
+            duplicateVerificationOperationID = nil
             verifiedDuplicates = []
             duplicateVerificationUnreadablePaths = []
             duplicateVerificationProgress = nil
@@ -462,6 +496,8 @@ final class AppViewModel: ObservableObject {
 
         let candidates = duplicateCandidates
         let rootID = rootNode?.id
+        let operationID = UUID()
+        duplicateVerificationOperationID = operationID
         didVerifyDuplicates = false
         verifiedDuplicates = []
         duplicateVerificationUnreadablePaths = []
@@ -475,21 +511,31 @@ final class AppViewModel: ObservableObject {
         duplicateVerificationTask = Task { [weak self] in
             do {
                 let result = try await DuplicateVerifier.verify(candidates: candidates) { [weak self] progress in
-                    guard let self, self.rootNode?.id == rootID else { return }
+                    guard let self,
+                          self.duplicateVerificationOperationID == operationID,
+                          self.rootNode?.id == rootID else { return }
                     self.duplicateVerificationProgress = progress
                 }
                 try Task.checkCancellation()
-                guard let self, self.rootNode?.id == rootID else { return }
+                guard let self,
+                      self.duplicateVerificationOperationID == operationID,
+                      self.rootNode?.id == rootID else { return }
                 self.verifiedDuplicates = result.groups
                 self.duplicateVerificationUnreadablePaths = result.unreadablePaths
                 self.duplicateVerificationProgress = nil
                 self.didVerifyDuplicates = true
+                self.duplicateVerificationTask = nil
+                self.duplicateVerificationOperationID = nil
             } catch is CancellationError {
-                guard let self else { return }
+                guard let self, self.duplicateVerificationOperationID == operationID else { return }
                 self.duplicateVerificationProgress = nil
+                self.duplicateVerificationTask = nil
+                self.duplicateVerificationOperationID = nil
             } catch {
-                guard let self else { return }
+                guard let self, self.duplicateVerificationOperationID == operationID else { return }
                 self.duplicateVerificationProgress = nil
+                self.duplicateVerificationTask = nil
+                self.duplicateVerificationOperationID = nil
                 self.presentError("Duplicate verification failed: \(error.localizedDescription)")
             }
         }
@@ -498,21 +544,30 @@ final class AppViewModel: ObservableObject {
     func cancelDuplicateVerification() {
         duplicateVerificationTask?.cancel()
         duplicateVerificationTask = nil
+        duplicateVerificationOperationID = nil
         duplicateVerificationProgress = nil
     }
 
     func compareWithSnapshot(at url: URL) {
         comparisonTask?.cancel()
         guard let rootNode else { return }
+        let options = currentScanOptions
+        let diagnostics = scanDiagnostics
+        let snapshotPath = url.path
+        let comparisonService = snapshotComparisonService
         let operationID = UUID()
         comparisonOperationID = operationID
         isComparingSnapshot = true
         scanComparison = nil
 
         comparisonTask = Task { [weak self] in
-            let worker = Task.detached(priority: .userInitiated) {
-                let snapshot = try ScanExporter.importSnapshot(from: url)
-                return try ScanSnapshotComparator.compare(current: rootNode, with: snapshot)
+            let worker = Task(priority: .userInitiated) {
+                try await comparisonService.compare(
+                    snapshotPath: snapshotPath,
+                    current: rootNode,
+                    options: options,
+                    diagnostics: diagnostics
+                )
             }
             do {
                 let comparison = try await withTaskCancellationHandler {
@@ -555,11 +610,17 @@ final class AppViewModel: ObservableObject {
     func exportScanData(to url: URL) {
         guard let rootNode else { return }
         let diagnostics = scanDiagnostics
+        let options = currentScanOptions
 
         Task {
             do {
                 try await Task.detached(priority: .userInitiated) {
-                    try ScanExporter.exportJSON(root: rootNode, diagnostics: diagnostics, to: url)
+                    try ScanExporter.exportJSON(
+                        root: rootNode,
+                        diagnostics: diagnostics,
+                        options: options,
+                        to: url
+                    )
                 }.value
             } catch {
                 self.errorMessage = "Failed to export JSON: \(error.localizedDescription)"
@@ -596,6 +657,34 @@ final class AppViewModel: ObservableObject {
         selectedNode = nil
         breadcrumb = rootNode?.path(to: node.id) ?? [node]
         scheduleSearch()
+    }
+
+    private func clearDerivedState() {
+        analysisTask?.cancel()
+        analysisTask = nil
+        searchTask?.cancel()
+        searchTask = nil
+        duplicateVerificationTask?.cancel()
+        duplicateVerificationTask = nil
+        duplicateVerificationOperationID = nil
+        comparisonTask?.cancel()
+        comparisonTask = nil
+        comparisonOperationID = nil
+
+        searchResults = []
+        searchIndex = []
+        extensionStats = []
+        selectedExtension = nil
+        largestFiles = []
+        oldLargeFiles = []
+        duplicateCandidates = []
+        verifiedDuplicates = []
+        duplicateVerificationProgress = nil
+        duplicateVerificationUnreadablePaths = []
+        didVerifyDuplicates = false
+        scanComparison = nil
+        isAnalyzing = false
+        isComparingSnapshot = false
     }
 
     private func startAnalysis(for root: FileNode, scanID: UUID) {

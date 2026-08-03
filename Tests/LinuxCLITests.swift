@@ -131,6 +131,73 @@ final class LinuxCLITests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
     }
 
+    func testCLIJSONRecordsEffectiveScanOptions() async throws {
+        let workspace = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let source = workspace.appendingPathComponent("source", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let output = workspace.appendingPathComponent("scan.json")
+
+        let exitCode = await DiskInventoryZedCLI.execute(arguments: [
+            "--show-hidden",
+            "--skip-developer-folders",
+            "--json", output.path,
+            source.path
+        ])
+        let snapshot = try ScanExporter.importSnapshot(from: output)
+
+        XCTAssertEqual(exitCode, 0)
+        XCTAssertEqual(snapshot.schemaVersion, 4)
+        XCTAssertEqual(snapshot.options, ScanOptions(
+            skipDeveloperFolders: true,
+            showHiddenFiles: true,
+            showPackageContents: true,
+            followSymlinks: false
+        ))
+    }
+
+    func testCLIRefusesExistingDestinationBeforePublication() async throws {
+        let workspace = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let source = workspace.appendingPathComponent("source", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let output = workspace.appendingPathComponent("scan.json")
+        try Data("unchanged".utf8).write(to: output)
+
+        let exitCode = await DiskInventoryZedCLI.execute(arguments: [
+            "--json", output.path, source.path
+        ])
+
+        XCTAssertEqual(exitCode, 1)
+        XCTAssertEqual(try String(contentsOf: output, encoding: .utf8), "unchanged")
+    }
+
+    func testCLICancellationUsesInterruptExitCode() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootPath = root.path
+        let task = Task {
+            withUnsafeCurrentTask { currentTask in
+                currentTask?.cancel()
+            }
+            return await DiskInventoryZedCLI.execute(arguments: [rootPath])
+        }
+        let exitCode = await task.value
+
+        XCTAssertEqual(exitCode, 130)
+    }
+
+    func testTerminalOutputEscapesControlsAndBidirectionalOverrides() {
+        let unsafe = "safe\u{001B}[31m\nname\u{202E}txt"
+
+        let escaped = DiskInventoryZedCLI.terminalSafe(unsafe)
+
+        XCTAssertEqual(escaped, "safe\\u{001B}[31m\\u{000A}name\\u{202E}txt")
+        XCTAssertFalse(escaped.contains("\u{001B}"))
+        XCTAssertFalse(escaped.contains("\n"))
+        XCTAssertFalse(escaped.contains("\u{202E}"))
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("DiskInventoryZedCLITests-\(UUID().uuidString)", isDirectory: true)

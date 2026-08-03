@@ -1,7 +1,7 @@
 -- Disk Inventory Zed First Run Helper
 -- Opens System Settings to Security & Privacy to help users allow the app
 
-set theMessage to "Disk Inventory Zed is not notarized by Apple, so macOS Gatekeeper may block it from opening.
+set theMessage to "If macOS Gatekeeper blocks this build of Disk Inventory Zed from opening, follow these steps:
 
 To allow the app:
 

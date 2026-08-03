@@ -8,10 +8,16 @@ import Foundation
 #if os(Linux)
 import Glibc
 private let linuxOTemporaryFile = Int32(0o20200000)
+#else
+import Darwin
 #endif
 
 enum ScanExporter {
     private typealias AtomicWriter = (_ body: (FileHandle) throws -> Void) throws -> Void
+    static let maximumSnapshotBytes = 256 * 1_024 * 1_024
+    static let maximumSnapshotEntries = 1_000_000
+    static let maximumSnapshotPathBytes = 16 * 1_024
+    static let maximumSnapshotIssueBytes = 64 * 1_024
 
 #if os(Linux)
     private enum UnnamedTemporaryError: Error {
@@ -21,8 +27,13 @@ enum ScanExporter {
 
     /// Writes a reconstructable flat JSON document without first duplicating the entire
     /// in-memory tree. This keeps exports safe for scans containing millions of entries.
-    static func exportJSON(root: FileNode, diagnostics: ScanDiagnostics, to url: URL) throws {
-        try exportJSON(root: root, diagnostics: diagnostics) { body in
+    static func exportJSON(
+        root: FileNode,
+        diagnostics: ScanDiagnostics,
+        options: ScanOptions = .default,
+        to url: URL
+    ) throws {
+        try exportJSON(root: root, diagnostics: diagnostics, options: options) { body in
             try writeAtomically(to: url, body: body)
         }
     }
@@ -31,9 +42,10 @@ enum ScanExporter {
     static func exportJSON(
         root: FileNode,
         diagnostics: ScanDiagnostics,
+        options: ScanOptions = .default,
         to destination: LinuxExportDestination
     ) throws {
-        try exportJSON(root: root, diagnostics: diagnostics) { body in
+        try exportJSON(root: root, diagnostics: diagnostics, options: options) { body in
             try writeAtomicallyOnLinux(to: destination, body: body)
         }
     }
@@ -42,37 +54,59 @@ enum ScanExporter {
     private static func exportJSON(
         root: FileNode,
         diagnostics: ScanDiagnostics,
+        options: ScanOptions,
         writer: AtomicWriter
     ) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
+        guard diagnostics.firstUnreadablePaths.count <= 20 else {
+            throw SnapshotImportError.resourceLimitExceeded(
+                "snapshots may contain at most 20 unreadable-path examples"
+            )
+        }
+        for path in diagnostics.firstUnreadablePaths {
+            try validateSnapshotPathLength(path)
+        }
 
         try writer { handle in
+            var bytesWritten = 0
             let formatter = ISO8601DateFormatter()
             let encodedDiagnostics = try encoder.encode(JSONDiagnostics(diagnostics))
+            let encodedOptions = try encoder.encode(options)
             let prefix = """
-            {"schemaVersion":3,"exportedAt":\(jsonString(formatter.string(from: Date()))),"rootPath":\(jsonString(root.path)),"diagnostics":
+            {"schemaVersion":4,"exportedAt":\(jsonString(formatter.string(from: Date()))),"rootPath":\(jsonString(root.path)),"diagnostics":
             """
-            try write(prefix, to: handle)
-            try handle.write(contentsOf: encodedDiagnostics)
-            try write(",\"entries\":[", to: handle)
+            try writeSnapshot(prefix, to: handle, bytesWritten: &bytesWritten)
+            try writeSnapshot(encodedDiagnostics, to: handle, bytesWritten: &bytesWritten)
+            try writeSnapshot(",\"options\":", to: handle, bytesWritten: &bytesWritten)
+            try writeSnapshot(encodedOptions, to: handle, bytesWritten: &bytesWritten)
+            try writeSnapshot(",\"entries\":[", to: handle, bytesWritten: &bytesWritten)
 
-            var stack: [(node: FileNode, parentPath: String?)] = [(root, nil)]
             var isFirst = true
-            while let item = stack.popLast() {
-                try Task.checkCancellation()
-                if !isFirst { try write(",", to: handle) }
+            try traverse(root: root) { node, parentPath in
+                try validateSnapshotPathLength(node.path)
+                try validateSnapshotPathLength(node.displayName)
+                if let issue = node.errorDescription,
+                   issue.utf8.count > maximumSnapshotIssueBytes {
+                    throw SnapshotImportError.resourceLimitExceeded(
+                        "entry issue text may be at most \(maximumSnapshotIssueBytes) UTF-8 bytes"
+                    )
+                }
+                if !isFirst {
+                    try writeSnapshot(",", to: handle, bytesWritten: &bytesWritten)
+                }
                 isFirst = false
 
-                let entry = JSONExportEntry(node: item.node, parentPath: item.parentPath)
-                try handle.write(contentsOf: encoder.encode(entry))
-                stack.append(contentsOf: item.node.children.reversed().map {
-                    (node: $0, parentPath: item.node.path)
-                })
+                let entry = JSONExportEntry(node: node, parentPath: parentPath)
+                try writeSnapshot(
+                    encoder.encode(entry),
+                    to: handle,
+                    bytesWritten: &bytesWritten
+                )
             }
 
-            try write("]}", to: handle)
+            try writeSnapshot("]}", to: handle, bytesWritten: &bytesWritten)
         }
     }
 
@@ -80,12 +114,20 @@ enum ScanExporter {
         try Task.checkCancellation()
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let data = try Data(contentsOf: url)
+        let data = try readSnapshotData(from: url)
         try Task.checkCancellation()
         let document = try decoder.decode(JSONExportDocument.self, from: data)
         try Task.checkCancellation()
-        guard (2...3).contains(document.schemaVersion) else {
+        guard (2...4).contains(document.schemaVersion) else {
             throw SnapshotImportError.unsupportedSchema(document.schemaVersion)
+        }
+        guard document.entries.count <= maximumSnapshotEntries else {
+            throw SnapshotImportError.resourceLimitExceeded(
+                "snapshots may contain at most \(maximumSnapshotEntries) entries"
+            )
+        }
+        if document.schemaVersion == 4, document.options == nil {
+            throw SnapshotImportError.invalidSnapshot("schema 4 requires scan options")
         }
         let rootEntry = try ScanSnapshotValidator.validate(
             entries: document.entries,
@@ -98,7 +140,9 @@ enum ScanExporter {
             exportedAt: document.exportedAt,
             rootPath: document.rootPath ?? rootEntry.path,
             entries: document.entries,
-            diagnostics: document.diagnostics.scanDiagnostics
+            diagnostics: document.diagnostics.scanDiagnostics,
+            options: document.options,
+            isValidated: true
         )
     }
 
@@ -124,13 +168,10 @@ enum ScanExporter {
             )
 
             let formatter = ISO8601DateFormatter()
-            var stack: [(node: FileNode, parentPath: String?)] = [(root, nil)]
-            while let item = stack.popLast() {
-                try Task.checkCancellation()
-                let node = item.node
+            try traverse(root: root) { node, parentPath in
                 let fields = [
                     csvField(node.path),
-                    csvField(item.parentPath ?? ""),
+                    csvField(parentPath ?? ""),
                     csvField(node.displayName),
                     csvField(node.kind.rawValue),
                     node.isPackage ? "true" : "false",
@@ -146,9 +187,6 @@ enum ScanExporter {
                     csvField(node.errorDescription ?? "")
                 ]
                 try write(fields.joined(separator: ",") + "\n", to: handle)
-                stack.append(contentsOf: node.children.reversed().map {
-                    (node: $0, parentPath: node.path)
-                })
             }
         }
     }
@@ -217,6 +255,11 @@ enum ScanExporter {
                 excludes: excludedIdentities,
                 displayPath: destinationURL.path
             )
+            try validateDestinationAvailability(
+                parentDescriptor: parentDescriptor,
+                name: destinationName,
+                displayPath: destinationURL.path
+            )
             return LinuxExportDestination(
                 parentDescriptor: parentDescriptor,
                 name: destinationName,
@@ -227,6 +270,19 @@ enum ScanExporter {
             Glibc.close(parentDescriptor)
             throw error
         }
+    }
+
+    static func restrictLinuxDestination(
+        _ destination: LinuxExportDestination,
+        excludingDirectoryIdentities excludedIdentities: Set<String>
+    ) throws {
+        let combinedIdentities = destination.excludedDirectoryIdentities.union(excludedIdentities)
+        try validateDestinationParent(
+            destination.parentDescriptor,
+            excludes: combinedIdentities,
+            displayPath: destination.displayPath
+        )
+        destination.excludedDirectoryIdentities = combinedIdentities
     }
 
     private static func writeAtomicallyOnLinux(
@@ -540,7 +596,6 @@ enum ScanExporter {
         excludes excludedIdentities: Set<String>,
         displayPath: String
     ) throws {
-        guard !excludedIdentities.isEmpty else { return }
         var descriptor = Glibc.openat(
             parentDescriptor,
             ".",
@@ -555,6 +610,12 @@ enum ScanExporter {
             var status = stat()
             guard Glibc.fstat(descriptor, &status) == 0 else {
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            let ownerIsTrusted = status.st_uid == Glibc.geteuid() || status.st_uid == 0
+            let writableByOthers = status.st_mode & mode_t(S_IWGRP | S_IWOTH) != 0
+            let hasStickyBit = status.st_mode & mode_t(S_ISVTX) != 0
+            guard ownerIsTrusted, !writableByOthers || hasStickyBit else {
+                throw ScanExportError.untrustedDestinationParent(displayPath)
             }
             let identity = "\(status.st_dev)|\(status.st_ino)"
             if excludedIdentities.contains(identity) {
@@ -585,7 +646,134 @@ enum ScanExporter {
             descriptor = parent
         }
     }
+
+    private static func validateDestinationAvailability(
+        parentDescriptor: Int32,
+        name: String,
+        displayPath: String
+    ) throws {
+        var destinationStatus = stat()
+        let statusResult = name.withCString { path in
+            Glibc.fstatat(parentDescriptor, path, &destinationStatus, AT_SYMLINK_NOFOLLOW)
+        }
+        if statusResult == 0 {
+            if destinationStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFLNK) {
+                throw ScanExportError.symbolicLinkDestination(displayPath)
+            }
+            throw ScanExportError.destinationExists(displayPath)
+        }
+        guard errno == ENOENT else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
 #endif
+
+    private static func readSnapshotData(from url: URL) throws -> Data {
+        let descriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+#if os(Linux)
+            return Glibc.open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
+#else
+            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
+#endif
+        }
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer {
+#if os(Linux)
+            Glibc.close(descriptor)
+#else
+            Darwin.close(descriptor)
+#endif
+        }
+
+        var status = stat()
+#if os(Linux)
+        let statusResult = Glibc.fstat(descriptor, &status)
+#else
+        let statusResult = Darwin.fstat(descriptor, &status)
+#endif
+        guard statusResult == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard status.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else {
+            throw SnapshotImportError.invalidSnapshot("the snapshot must be a regular file")
+        }
+        guard status.st_size <= maximumSnapshotBytes else {
+            throw SnapshotImportError.resourceLimitExceeded(
+                "snapshot files may be at most \(maximumSnapshotBytes) bytes"
+            )
+        }
+
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        var data = Data()
+        while true {
+            try Task.checkCancellation()
+            let remaining = maximumSnapshotBytes - data.count
+            let chunk = try handle.read(upToCount: min(1_024 * 1_024, remaining + 1)) ?? Data()
+            guard !chunk.isEmpty else { break }
+            guard chunk.count <= remaining else {
+                throw SnapshotImportError.resourceLimitExceeded(
+                    "snapshot files may be at most \(maximumSnapshotBytes) bytes"
+                )
+            }
+            data.append(chunk)
+        }
+        try Task.checkCancellation()
+        return data
+    }
+
+    private static func traverse(
+        root: FileNode,
+        visit: (_ node: FileNode, _ parentPath: String?) throws -> Void
+    ) throws {
+        var stack = [TraversalFrame(node: root, parentPath: nil)]
+        var entryCount = 0
+
+        while !stack.isEmpty {
+            try Task.checkCancellation()
+            let frameIndex = stack.count - 1
+            if !stack[frameIndex].didVisitNode {
+                stack[frameIndex].didVisitNode = true
+                entryCount += 1
+                guard entryCount <= maximumSnapshotEntries else {
+                    throw SnapshotImportError.resourceLimitExceeded(
+                        "exports may contain at most \(maximumSnapshotEntries) entries"
+                    )
+                }
+                try visit(stack[frameIndex].node, stack[frameIndex].parentPath)
+                continue
+            }
+
+            let node = stack[frameIndex].node
+            let childIndex = stack[frameIndex].nextChildIndex
+            guard childIndex < node.children.count else {
+                stack.removeLast()
+                continue
+            }
+            stack[frameIndex].nextChildIndex += 1
+            stack.append(TraversalFrame(
+                node: node.children[childIndex],
+                parentPath: node.path
+            ))
+        }
+    }
+
+    private static func validateSnapshotPathLength(_ path: String) throws {
+        guard path.utf8.count <= maximumSnapshotPathBytes else {
+            throw SnapshotImportError.resourceLimitExceeded(
+                "entry paths may be at most \(maximumSnapshotPathBytes) UTF-8 bytes"
+            )
+        }
+    }
+
+    private struct TraversalFrame {
+        let node: FileNode
+        let parentPath: String?
+        var didVisitNode = false
+        var nextChildIndex = 0
+    }
 
     private static func write(_ string: String, to handle: FileHandle) throws {
         guard let data = string.data(using: .utf8) else {
@@ -594,8 +782,47 @@ enum ScanExporter {
         try handle.write(contentsOf: data)
     }
 
+    private static func writeSnapshot(
+        _ string: String,
+        to handle: FileHandle,
+        bytesWritten: inout Int
+    ) throws {
+        guard let data = string.data(using: .utf8) else {
+            throw CocoaError(.fileWriteInapplicableStringEncoding)
+        }
+        try writeSnapshot(data, to: handle, bytesWritten: &bytesWritten)
+    }
+
+    private static func writeSnapshot(
+        _ data: Data,
+        to handle: FileHandle,
+        bytesWritten: inout Int
+    ) throws {
+        guard data.count <= maximumSnapshotBytes - bytesWritten else {
+            throw SnapshotImportError.resourceLimitExceeded(
+                "snapshot files may be at most \(maximumSnapshotBytes) bytes"
+            )
+        }
+        try handle.write(contentsOf: data)
+        bytesWritten += data.count
+    }
+
     private static func csvField(_ value: String) -> String {
-        "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
+        let firstSignificantScalar = value.unicodeScalars.first { scalar in
+            scalar.value > 0x20 &&
+                scalar.value != 0x7F &&
+                !CharacterSet.whitespacesAndNewlines.contains(scalar)
+        }
+        let protectsSpreadsheetFormula: Bool
+        switch firstSignificantScalar?.value {
+        case 0x2B, 0x2D, 0x3D, 0x40,
+             0x2212, 0xFF0B, 0xFF0D, 0xFF1D, 0xFF20:
+            protectsSpreadsheetFormula = true
+        default:
+            protectsSpreadsheetFormula = false
+        }
+        let safeValue = protectsSpreadsheetFormula ? "'" + value : value
+        return "\"\(safeValue.replacingOccurrences(of: "\"", with: "\"\""))\""
     }
 
     private static func jsonString(_ value: String) -> String {
@@ -610,7 +837,7 @@ final class LinuxExportDestination {
     let parentDescriptor: Int32
     let name: String
     let displayPath: String
-    let excludedDirectoryIdentities: Set<String>
+    fileprivate var excludedDirectoryIdentities: Set<String>
 
     init(
         parentDescriptor: Int32,
@@ -636,6 +863,7 @@ enum ScanExportError: LocalizedError {
     case invalidDestination(String)
     case invalidTemporaryFile
     case outputInsideScan(String)
+    case untrustedDestinationParent(String)
 
     var errorDescription: String? {
         switch self {
@@ -649,6 +877,8 @@ enum ScanExportError: LocalizedError {
             return "The private export staging file could not be verified."
         case .outputInsideScan(let path):
             return "Export output must be outside the scanned directory: \(path)"
+        case .untrustedDestinationParent(let path):
+            return "Export destination ancestry is writable by an untrusted user: \(path)"
         }
     }
 }
@@ -657,6 +887,7 @@ enum SnapshotImportError: LocalizedError {
     case unsupportedSchema(Int)
     case missingRoot
     case invalidSnapshot(String)
+    case resourceLimitExceeded(String)
 
     var errorDescription: String? {
         switch self {
@@ -666,6 +897,8 @@ enum SnapshotImportError: LocalizedError {
             return "The snapshot does not contain a root entry."
         case .invalidSnapshot(let reason):
             return "The snapshot is invalid: \(reason)."
+        case .resourceLimitExceeded(let reason):
+            return "The snapshot exceeds a safety limit: \(reason)."
         }
     }
 }
@@ -675,7 +908,57 @@ struct JSONExportDocument: Codable {
     let exportedAt: Date
     let rootPath: String?
     let diagnostics: JSONDiagnostics
+    let options: ScanOptions?
     let entries: [JSONExportEntry]
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case exportedAt
+        case rootPath
+        case diagnostics
+        case options
+        case entries
+    }
+
+    init(from decoder: Decoder) throws {
+        try Task.checkCancellation()
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        exportedAt = try container.decode(Date.self, forKey: .exportedAt)
+        rootPath = try container.decodeIfPresent(String.self, forKey: .rootPath)
+        if let rootPath,
+           rootPath.utf8.count > ScanExporter.maximumSnapshotPathBytes {
+            throw SnapshotImportError.resourceLimitExceeded(
+                "root paths may be at most \(ScanExporter.maximumSnapshotPathBytes) UTF-8 bytes"
+            )
+        }
+        diagnostics = try container.decode(JSONDiagnostics.self, forKey: .diagnostics)
+        options = try container.decodeIfPresent(ScanOptions.self, forKey: .options)
+
+        var entriesContainer = try container.nestedUnkeyedContainer(forKey: .entries)
+        if let count = entriesContainer.count,
+           count > ScanExporter.maximumSnapshotEntries {
+            throw SnapshotImportError.resourceLimitExceeded(
+                "snapshots may contain at most \(ScanExporter.maximumSnapshotEntries) entries"
+            )
+        }
+        var decodedEntries: [JSONExportEntry] = []
+        decodedEntries.reserveCapacity(min(
+            entriesContainer.count ?? 0,
+            ScanExporter.maximumSnapshotEntries
+        ))
+        while !entriesContainer.isAtEnd {
+            try Task.checkCancellation()
+            guard decodedEntries.count < ScanExporter.maximumSnapshotEntries else {
+                throw SnapshotImportError.resourceLimitExceeded(
+                    "snapshots may contain at most \(ScanExporter.maximumSnapshotEntries) entries"
+                )
+            }
+            decodedEntries.append(try entriesContainer.decode(JSONExportEntry.self))
+        }
+        entries = decodedEntries
+        try Task.checkCancellation()
+    }
 }
 
 struct JSONDiagnostics: Codable {
@@ -687,6 +970,16 @@ struct JSONDiagnostics: Codable {
     let revisitedDirectories: Int
     let firstUnreadablePaths: [String]
 
+    private enum CodingKeys: String, CodingKey {
+        case unreadableItems
+        case skippedDirectories
+        case symbolicLinks
+        case packages
+        case duplicateHardLinks
+        case revisitedDirectories
+        case firstUnreadablePaths
+    }
+
     init(_ diagnostics: ScanDiagnostics) {
         unreadableItems = diagnostics.unreadableItems
         skippedDirectories = diagnostics.skippedDirectories
@@ -695,6 +988,46 @@ struct JSONDiagnostics: Codable {
         duplicateHardLinks = diagnostics.duplicateHardLinks
         revisitedDirectories = diagnostics.revisitedDirectories
         firstUnreadablePaths = diagnostics.firstUnreadablePaths
+    }
+
+    init(from decoder: Decoder) throws {
+        try Task.checkCancellation()
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        unreadableItems = try container.decodeIfPresent(Int.self, forKey: .unreadableItems) ?? 0
+        skippedDirectories = try container.decodeIfPresent(Int.self, forKey: .skippedDirectories) ?? 0
+        symbolicLinks = try container.decodeIfPresent(Int.self, forKey: .symbolicLinks) ?? 0
+        packages = try container.decodeIfPresent(Int.self, forKey: .packages) ?? 0
+        duplicateHardLinks = try container.decodeIfPresent(Int.self, forKey: .duplicateHardLinks) ?? 0
+        revisitedDirectories = try container.decodeIfPresent(Int.self, forKey: .revisitedDirectories) ?? 0
+
+        guard container.contains(.firstUnreadablePaths) else {
+            firstUnreadablePaths = []
+            return
+        }
+        var pathsContainer = try container.nestedUnkeyedContainer(forKey: .firstUnreadablePaths)
+        if let count = pathsContainer.count, count > 20 {
+            throw SnapshotImportError.resourceLimitExceeded(
+                "snapshots may contain at most 20 unreadable-path examples"
+            )
+        }
+        var paths: [String] = []
+        paths.reserveCapacity(min(pathsContainer.count ?? 0, 20))
+        while !pathsContainer.isAtEnd {
+            try Task.checkCancellation()
+            guard paths.count < 20 else {
+                throw SnapshotImportError.resourceLimitExceeded(
+                    "snapshots may contain at most 20 unreadable-path examples"
+                )
+            }
+            let path = try pathsContainer.decode(String.self)
+            guard path.utf8.count <= ScanExporter.maximumSnapshotPathBytes else {
+                throw SnapshotImportError.resourceLimitExceeded(
+                    "paths may be at most \(ScanExporter.maximumSnapshotPathBytes) UTF-8 bytes"
+                )
+            }
+            paths.append(path)
+        }
+        firstUnreadablePaths = paths
     }
 
     var scanDiagnostics: ScanDiagnostics {
@@ -727,6 +1060,58 @@ struct JSONExportEntry: Codable, Sendable {
     let modificationDate: Date?
     let isHardLinkDuplicate: Bool
     let issue: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case path
+        case parentPath
+        case name
+        case kind
+        case isPackage
+        case isSymbolicLink
+        case allocatedSize
+        case logicalSize
+        case childCount
+        case totalFileCount
+        case totalDirectoryCount
+        case creationDate
+        case modificationDate
+        case isHardLinkDuplicate
+        case issue
+    }
+
+    init(from decoder: Decoder) throws {
+        try Task.checkCancellation()
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        path = try container.decode(String.self, forKey: .path)
+        parentPath = try container.decodeIfPresent(String.self, forKey: .parentPath)
+        name = try container.decode(String.self, forKey: .name)
+        for value in [path, parentPath, name].compactMap({ $0 }) {
+            guard value.utf8.count <= ScanExporter.maximumSnapshotPathBytes else {
+                throw SnapshotImportError.resourceLimitExceeded(
+                    "entry paths and names may be at most \(ScanExporter.maximumSnapshotPathBytes) UTF-8 bytes"
+                )
+            }
+        }
+        kind = try container.decode(FileNode.Kind.self, forKey: .kind)
+        isPackage = try container.decode(Bool.self, forKey: .isPackage)
+        isSymbolicLink = try container.decode(Bool.self, forKey: .isSymbolicLink)
+        allocatedSize = try container.decode(Int64.self, forKey: .allocatedSize)
+        logicalSize = try container.decode(Int64.self, forKey: .logicalSize)
+        childCount = try container.decode(Int.self, forKey: .childCount)
+        totalFileCount = try container.decodeIfPresent(Int.self, forKey: .totalFileCount)
+        totalDirectoryCount = try container.decodeIfPresent(Int.self, forKey: .totalDirectoryCount)
+        creationDate = try container.decodeIfPresent(Date.self, forKey: .creationDate)
+        modificationDate = try container.decodeIfPresent(Date.self, forKey: .modificationDate)
+        isHardLinkDuplicate = try container.decode(Bool.self, forKey: .isHardLinkDuplicate)
+        issue = try container.decodeIfPresent(String.self, forKey: .issue)
+        if let issue,
+           issue.utf8.count > ScanExporter.maximumSnapshotIssueBytes {
+            throw SnapshotImportError.resourceLimitExceeded(
+                "entry issue text may be at most \(ScanExporter.maximumSnapshotIssueBytes) UTF-8 bytes"
+            )
+        }
+        try Task.checkCancellation()
+    }
 
     init(
         path: String,

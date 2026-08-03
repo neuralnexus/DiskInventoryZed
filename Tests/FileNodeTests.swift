@@ -122,4 +122,50 @@ final class FileNodeTests: XCTestCase {
         XCTAssertEqual(updated.descendantCounts().files, 0)
         XCTAssertEqual(updated.descendantCounts().directories, 1)
     }
+
+    func testSizeAndCountReductionsSaturateOnOverflow() {
+        let maximum = FileNode(
+            url: URL(fileURLWithPath: "/tmp/overflow/maximum"),
+            name: "maximum",
+            kind: .file,
+            logicalSize: .max,
+            allocatedSize: .max,
+            totalFileCount: .max,
+            totalDirectoryCount: .max
+        )
+        let overflow = FileNode(
+            url: URL(fileURLWithPath: "/tmp/overflow/overflow"),
+            name: "overflow",
+            kind: .file,
+            logicalSize: 1,
+            allocatedSize: 1,
+            totalFileCount: 1,
+            totalDirectoryCount: 1
+        )
+        let removable = FileNode(
+            url: URL(fileURLWithPath: "/tmp/overflow/removable"),
+            name: "removable",
+            kind: .file,
+            logicalSize: 1,
+            allocatedSize: 1
+        )
+        let root = FileNode(
+            url: URL(fileURLWithPath: "/tmp/overflow"),
+            name: "overflow",
+            kind: .directory,
+            logicalSize: .max,
+            allocatedSize: .max,
+            children: [maximum, overflow, removable]
+        )
+
+        XCTAssertEqual(root.totalFileCount, .max)
+        XCTAssertEqual(root.totalDirectoryCount, .max)
+
+        let updated = root.removingDescendant(withID: removable.id)
+
+        XCTAssertEqual(updated.logicalSize, .max)
+        XCTAssertEqual(updated.allocatedSize, .max)
+        XCTAssertEqual(updated.totalFileCount, .max)
+        XCTAssertEqual(updated.totalDirectoryCount, .max)
+    }
 }

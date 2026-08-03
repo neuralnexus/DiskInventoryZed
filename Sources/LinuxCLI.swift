@@ -4,6 +4,7 @@
 // Licensed under GPL-3.0-or-later.
 
 #if os(Linux)
+import Dispatch
 import Foundation
 import Glibc
 
@@ -132,6 +133,25 @@ private enum LinuxCLIRuntimeError: LocalizedError {
     }
 }
 
+private enum PreparedLinuxExport {
+    case json(path: String, destination: LinuxExportDestination)
+    case csv(path: String, destination: LinuxExportDestination)
+
+    var path: String {
+        switch self {
+        case .json(let path, _), .csv(let path, _):
+            return path
+        }
+    }
+
+    var destination: LinuxExportDestination {
+        switch self {
+        case .json(_, let destination), .csv(_, let destination):
+            return destination
+        }
+    }
+}
+
 @main
 struct DiskInventoryZedCLI {
     private static let usage = """
@@ -152,7 +172,22 @@ struct DiskInventoryZedCLI {
     """
 
     static func main() async {
-        let exitCode = await execute(arguments: linuxCommandLineArguments)
+        _ = Glibc.signal(SIGINT, SIG_IGN)
+        let commandTask = Task {
+            await execute(arguments: linuxCommandLineArguments)
+        }
+        let interruptSource = DispatchSource.makeSignalSource(
+            signal: SIGINT,
+            queue: DispatchQueue.global(qos: .userInitiated)
+        )
+        interruptSource.setEventHandler {
+            commandTask.cancel()
+            _ = Glibc.signal(SIGINT, SIG_DFL)
+        }
+        interruptSource.resume()
+        let exitCode = await commandTask.value
+        interruptSource.cancel()
+        _ = Glibc.signal(SIGINT, SIG_DFL)
         if exitCode != 0 {
             Glibc.exit(exitCode)
         }
@@ -163,13 +198,20 @@ struct DiskInventoryZedCLI {
         do {
             parseResult = try LinuxCLIParser.parse(arguments: arguments)
         } catch {
-            write("error: \(error.localizedDescription)\n\n\(usage)\n", to: .standardError)
+            try? write(
+                "error: \(terminalSafe(error.localizedDescription))\n\n\(usage)\n",
+                to: .standardError
+            )
             return 2
         }
 
         guard case .run(let configuration) = parseResult else {
-            write(usage + "\n", to: .standardOutput)
-            return 0
+            do {
+                try write(usage + "\n", to: .standardOutput)
+                return 0
+            } catch {
+                return 1
+            }
         }
 
         let displaysProgress = Glibc.isatty(STDERR_FILENO) == 1
@@ -177,6 +219,7 @@ struct DiskInventoryZedCLI {
             let sourceURL = fileURL(for: configuration.path)
             try validateOutputLocation(configuration.jsonOutput, relativeTo: sourceURL)
             try validateOutputLocation(configuration.csvOutput, relativeTo: sourceURL)
+            let preparedExport = try prepareExport(configuration)
             let options = ScanOptions(
                 skipDeveloperFolders: configuration.skipDeveloperFolders,
                 showHiddenFiles: configuration.showHiddenFiles,
@@ -188,66 +231,84 @@ struct DiskInventoryZedCLI {
                 options: options
             ) { snapshot in
                 guard displaysProgress else { return }
-                write(
+                try? write(
                     "\rScanning: \(snapshot.files) files, \(snapshot.directories) directories",
                     to: .standardError
                 )
             }
 
             if displaysProgress {
-                write("\n", to: .standardError)
+                try write("\n", to: .standardError)
             }
 
             guard result.diagnostics.unreadableItems == 0,
                   result.diagnostics.revisitedDirectories == 0 else {
-                printSummary(result)
-                write(
+                try printSummary(result)
+                try write(
                     "error: Scan was incomplete; no export was written.\n",
                     to: .standardError
                 )
                 return 1
             }
 
-            if let path = configuration.jsonOutput {
-                let destination = try ScanExporter.prepareLinuxDestination(
-                    for: fileURL(for: path),
+            if let preparedExport {
+                try ScanExporter.restrictLinuxDestination(
+                    preparedExport.destination,
                     excludingDirectoryIdentities: result.scannedDirectoryIdentities
                 )
+            }
+            switch preparedExport {
+            case .json(_, let destination):
                 try ScanExporter.exportJSON(
                     root: result.root,
                     diagnostics: result.diagnostics,
+                    options: options,
                     to: destination
                 )
-            }
-            if let path = configuration.csvOutput {
-                let destination = try ScanExporter.prepareLinuxDestination(
-                    for: fileURL(for: path),
-                    excludingDirectoryIdentities: result.scannedDirectoryIdentities
-                )
+            case .csv(_, let destination):
                 try ScanExporter.exportCSV(root: result.root, to: destination)
+            case nil:
+                break
             }
 
-            printSummary(result)
-            if let path = configuration.jsonOutput {
-                write("JSON snapshot: \(fileURL(for: path).path)\n", to: .standardOutput)
-            }
-            if let path = configuration.csvOutput {
-                write("CSV export: \(fileURL(for: path).path)\n", to: .standardOutput)
+            try printSummary(result)
+            switch preparedExport {
+            case .json(let path, _):
+                try write(
+                    "JSON snapshot: \(terminalSafe(fileURL(for: path).path))\n",
+                    to: .standardOutput
+                )
+            case .csv(let path, _):
+                try write(
+                    "CSV export: \(terminalSafe(fileURL(for: path).path))\n",
+                    to: .standardOutput
+                )
+            case nil:
+                break
             }
             return 0
+        } catch is CancellationError {
+            if displaysProgress {
+                try? write("\n", to: .standardError)
+            }
+            try? write("error: Scan cancelled.\n", to: .standardError)
+            return 130
         } catch {
             if displaysProgress {
-                write("\n", to: .standardError)
+                try? write("\n", to: .standardError)
             }
-            write("error: \(error.localizedDescription)\n", to: .standardError)
+            try? write(
+                "error: \(terminalSafe(error.localizedDescription))\n",
+                to: .standardError
+            )
             return 1
         }
     }
 
-    private static func printSummary(_ result: DiskScanResult) {
+    private static func printSummary(_ result: DiskScanResult) throws {
         let diagnostics = result.diagnostics
         let summary = """
-        Scanned: \(result.root.path)
+        Scanned: \(terminalSafe(result.root.path))
         Files: \(result.totalFiles)
         Directories: \(result.totalDirectories)
         Logical size: \(formattedBytes(result.root.logicalSize)) (\(result.root.logicalSize) bytes)
@@ -256,14 +317,38 @@ struct DiskInventoryZedCLI {
         Issues: \(diagnostics.unreadableItems) unreadable, \(diagnostics.skippedDirectories) skipped, \(diagnostics.revisitedDirectories) revisited
         Links: \(diagnostics.symbolicLinks) symbolic, \(diagnostics.duplicateHardLinks) duplicate hard links
         """
-        write(summary + "\n", to: .standardOutput)
+        try write(summary + "\n", to: .standardOutput)
 
         if !diagnostics.firstUnreadablePaths.isEmpty {
-            write("First unreadable paths:\n", to: .standardOutput)
+            try write("First unreadable paths:\n", to: .standardOutput)
             for path in diagnostics.firstUnreadablePaths {
-                write("  \(path)\n", to: .standardOutput)
+                try write("  \(terminalSafe(path))\n", to: .standardOutput)
             }
         }
+    }
+
+    private static func prepareExport(
+        _ configuration: LinuxCLIConfiguration
+    ) throws -> PreparedLinuxExport? {
+        if let path = configuration.jsonOutput {
+            return .json(
+                path: path,
+                destination: try ScanExporter.prepareLinuxDestination(
+                    for: fileURL(for: path),
+                    excludingDirectoryIdentities: []
+                )
+            )
+        }
+        if let path = configuration.csvOutput {
+            return .csv(
+                path: path,
+                destination: try ScanExporter.prepareLinuxDestination(
+                    for: fileURL(for: path),
+                    excludingDirectoryIdentities: []
+                )
+            )
+        }
+        return nil
     }
 
     private static func fileURL(for path: String) -> URL {
@@ -314,8 +399,24 @@ struct DiskInventoryZedCLI {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 
-    private static func write(_ text: String, to handle: FileHandle) {
-        try? handle.write(contentsOf: Data(text.utf8))
+    static func terminalSafe(_ text: String) -> String {
+        var result = ""
+        result.reserveCapacity(text.utf8.count)
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 0x00...0x1F, 0x7F...0x9F,
+                 0x061C, 0x200E, 0x200F,
+                 0x202A...0x202E, 0x2066...0x2069:
+                result += String(format: "\\u{%04X}", scalar.value)
+            default:
+                result.unicodeScalars.append(scalar)
+            }
+        }
+        return result
+    }
+
+    private static func write(_ text: String, to handle: FileHandle) throws {
+        try handle.write(contentsOf: Data(text.utf8))
     }
 }
 #endif

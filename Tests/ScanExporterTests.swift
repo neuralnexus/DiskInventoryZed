@@ -40,8 +40,9 @@ final class ScanExporterTests: XCTestCase {
 #endif
 
         let json = try JSONSerialization.jsonObject(with: Data(contentsOf: jsonURL)) as? [String: Any]
-        XCTAssertEqual(json?["schemaVersion"] as? Int, 3)
+        XCTAssertEqual(json?["schemaVersion"] as? Int, 4)
         XCTAssertEqual(json?["rootPath"] as? String, "/tmp")
+        XCTAssertNotNil(json?["options"])
 
         let csv = try String(contentsOf: csvURL, encoding: .utf8)
         XCTAssertTrue(csv.contains("allocated_bytes"))
@@ -49,8 +50,9 @@ final class ScanExporterTests: XCTestCase {
         XCTAssertTrue(csv.contains(",4096,1024,"))
 
         let imported = try ScanExporter.importSnapshot(from: jsonURL)
-        XCTAssertEqual(imported.schemaVersion, 3)
+        XCTAssertEqual(imported.schemaVersion, 4)
         XCTAssertEqual(imported.rootPath, "/tmp")
+        XCTAssertEqual(imported.options, .default)
         XCTAssertEqual(imported.entries.count, 2)
         XCTAssertEqual(imported.entries.first(where: { $0.path == file.path })?.logicalSize, 1_024)
     }
@@ -133,13 +135,19 @@ final class ScanExporterTests: XCTestCase {
             children: [grown, added]
         )
 
-        let comparison = try ScanSnapshotComparator.compare(current: current, with: baseline)
+        let comparison = try ScanSnapshotComparator.compare(
+            current: current,
+            options: .default,
+            diagnostics: .empty,
+            with: baseline
+        )
         XCTAssertEqual(comparison.totalDelta, 25)
         XCTAssertEqual(comparison.addedCount, 1)
         XCTAssertEqual(comparison.removedCount, 1)
         XCTAssertEqual(comparison.changedCount, 1)
         XCTAssertEqual(Set(comparison.largestGrowth.map(\.kind)), [.added, .grew])
         XCTAssertEqual(comparison.largestShrinkage.first?.kind, .removed)
+        XCTAssertNotNil(comparison.reliabilityWarning)
     }
 
     func testExistingDestinationPolicy() throws {
@@ -230,7 +238,59 @@ final class ScanExporterTests: XCTestCase {
             diagnostics: .empty
         )
 
-        XCTAssertThrowsError(try ScanSnapshotComparator.compare(current: root, with: baseline))
+        XCTAssertThrowsError(try ScanSnapshotComparator.compare(
+            current: root,
+            options: .default,
+            diagnostics: .empty,
+            with: baseline
+        ))
+    }
+
+    func testSnapshotComparisonRejectsInconsistentDirectorySize() throws {
+        let currentFile = FileNode(
+            url: URL(fileURLWithPath: "/tmp/file.bin"),
+            name: "file.bin",
+            kind: .file,
+            logicalSize: 1,
+            allocatedSize: 1
+        )
+        let current = FileNode(
+            url: URL(fileURLWithPath: "/tmp"),
+            name: "tmp",
+            kind: .directory,
+            logicalSize: 1,
+            allocatedSize: 1,
+            children: [currentFile]
+        )
+        let invalidRoot = JSONExportEntry(
+            path: "/tmp",
+            parentPath: nil,
+            name: "tmp",
+            kind: .directory,
+            isPackage: false,
+            isSymbolicLink: false,
+            allocatedSize: 999,
+            logicalSize: 999,
+            childCount: 1,
+            creationDate: nil,
+            modificationDate: nil,
+            isHardLinkDuplicate: false,
+            issue: nil
+        )
+        let baseline = ImportedScanSnapshot(
+            schemaVersion: 3,
+            exportedAt: Date(),
+            rootPath: "/tmp",
+            entries: [invalidRoot, JSONExportEntry(node: currentFile, parentPath: "/tmp")],
+            diagnostics: .empty
+        )
+
+        XCTAssertThrowsError(try ScanSnapshotComparator.compare(
+            current: current,
+            options: .default,
+            diagnostics: .empty,
+            with: baseline
+        ))
     }
 
     func testSnapshotComparisonRejectsUnsupportedDirectSchema() throws {
@@ -242,14 +302,19 @@ final class ScanExporterTests: XCTestCase {
             allocatedSize: 0
         )
         let baseline = ImportedScanSnapshot(
-            schemaVersion: 4,
+            schemaVersion: 5,
             exportedAt: Date(),
             rootPath: "/tmp",
             entries: [JSONExportEntry(node: root, parentPath: nil)],
             diagnostics: .empty
         )
 
-        XCTAssertThrowsError(try ScanSnapshotComparator.compare(current: root, with: baseline))
+        XCTAssertThrowsError(try ScanSnapshotComparator.compare(
+            current: root,
+            options: .default,
+            diagnostics: .empty,
+            with: baseline
+        ))
     }
 
     func testSnapshotComparisonRejectsNonCanonicalPaths() throws {
@@ -298,7 +363,273 @@ final class ScanExporterTests: XCTestCase {
             diagnostics: .empty
         )
 
-        XCTAssertThrowsError(try ScanSnapshotComparator.compare(current: root, with: baseline))
+        XCTAssertThrowsError(try ScanSnapshotComparator.compare(
+            current: root,
+            options: .default,
+            diagnostics: .empty,
+            with: baseline
+        ))
+    }
+
+    func testSnapshotComparisonRejectsMismatchedSchemaFourOptions() throws {
+        let root = FileNode(
+            url: URL(fileURLWithPath: "/tmp"),
+            name: "tmp",
+            kind: .directory,
+            logicalSize: 0,
+            allocatedSize: 0
+        )
+        let baseline = ImportedScanSnapshot(
+            schemaVersion: 4,
+            exportedAt: Date(),
+            rootPath: "/tmp",
+            entries: [JSONExportEntry(node: root, parentPath: nil)],
+            diagnostics: .empty,
+            options: ScanOptions(
+                skipDeveloperFolders: true,
+                showHiddenFiles: false,
+                showPackageContents: true,
+                followSymlinks: false
+            )
+        )
+
+        XCTAssertThrowsError(try ScanSnapshotComparator.compare(
+            current: root,
+            options: .default,
+            diagnostics: .empty,
+            with: baseline
+        ))
+    }
+
+    func testSnapshotImportRejectsSchemaFourWithoutOptions() throws {
+        let outputDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DiskInventoryZedMissingOptionsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outputDirectory) }
+        let snapshotURL = outputDirectory.appendingPathComponent("snapshot.json")
+        let snapshot = """
+        {"schemaVersion":4,"exportedAt":"1970-01-01T00:00:00Z","rootPath":"/tmp","diagnostics":{"unreadableItems":0,"skippedDirectories":0,"symbolicLinks":0,"packages":0,"duplicateHardLinks":0,"revisitedDirectories":0,"firstUnreadablePaths":[]},"entries":[{"path":"/tmp","name":"tmp","kind":"directory","isPackage":false,"isSymbolicLink":false,"allocatedSize":0,"logicalSize":0,"childCount":0,"isHardLinkDuplicate":false}]}
+        """
+        try Data(snapshot.utf8).write(to: snapshotURL)
+
+        XCTAssertThrowsError(try ScanExporter.importSnapshot(from: snapshotURL))
+    }
+
+    func testLegacySchemaTwoAndThreeSnapshotsImportWithReliabilityWarning() throws {
+        let outputDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DiskInventoryZedLegacySnapshotTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outputDirectory) }
+        let current = FileNode(
+            url: URL(fileURLWithPath: "/tmp"),
+            name: "tmp",
+            kind: .directory,
+            logicalSize: 0,
+            allocatedSize: 0
+        )
+
+        for schemaVersion in 2...3 {
+            let snapshotURL = outputDirectory.appendingPathComponent("schema-\(schemaVersion).json")
+            let snapshot = """
+            {"schemaVersion":\(schemaVersion),"exportedAt":"1970-01-01T00:00:00Z","rootPath":"/tmp","diagnostics":{},"entries":[{"path":"/tmp","name":"tmp","kind":"directory","isPackage":false,"isSymbolicLink":false,"allocatedSize":0,"logicalSize":0,"childCount":0,"isHardLinkDuplicate":false}]}
+            """
+            try Data(snapshot.utf8).write(to: snapshotURL)
+
+            let imported = try ScanExporter.importSnapshot(from: snapshotURL)
+            let comparison = try ScanSnapshotComparator.compare(
+                current: current,
+                options: .default,
+                diagnostics: .empty,
+                with: imported
+            )
+
+            XCTAssertEqual(imported.schemaVersion, schemaVersion)
+            XCTAssertNil(imported.options)
+            XCTAssertNotNil(comparison.reliabilityWarning)
+        }
+    }
+
+    func testSchemaFourComparisonWarningsReflectCoverage() throws {
+        let root = FileNode(
+            url: URL(fileURLWithPath: "/tmp"),
+            name: "tmp",
+            kind: .directory,
+            logicalSize: 0,
+            allocatedSize: 0
+        )
+        let entry = JSONExportEntry(node: root, parentPath: nil)
+        let complete = ImportedScanSnapshot(
+            schemaVersion: 4,
+            exportedAt: Date(),
+            rootPath: "/tmp",
+            entries: [entry],
+            diagnostics: .empty,
+            options: .default
+        )
+        let incomplete = ImportedScanSnapshot(
+            schemaVersion: 4,
+            exportedAt: Date(),
+            rootPath: "/tmp",
+            entries: [entry],
+            diagnostics: ScanDiagnostics(skippedDirectories: 1),
+            options: .default
+        )
+
+        let completeComparison = try ScanSnapshotComparator.compare(
+            current: root,
+            options: .default,
+            diagnostics: .empty,
+            with: complete
+        )
+        let baselineIncomplete = try ScanSnapshotComparator.compare(
+            current: root,
+            options: .default,
+            diagnostics: .empty,
+            with: incomplete
+        )
+        let currentIncomplete = try ScanSnapshotComparator.compare(
+            current: root,
+            options: .default,
+            diagnostics: ScanDiagnostics(unreadableItems: 1),
+            with: complete
+        )
+
+        XCTAssertNil(completeComparison.reliabilityWarning)
+        XCTAssertNotNil(baselineIncomplete.reliabilityWarning)
+        XCTAssertNotNil(currentIncomplete.reliabilityWarning)
+    }
+
+    func testSnapshotImportRejectsOversizedSparseFile() throws {
+        let outputDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DiskInventoryZedOversizedSnapshotTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outputDirectory) }
+        let snapshotURL = outputDirectory.appendingPathComponent("snapshot.json")
+        XCTAssertTrue(FileManager.default.createFile(atPath: snapshotURL.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: snapshotURL)
+        try handle.truncate(atOffset: UInt64(ScanExporter.maximumSnapshotBytes + 1))
+        try handle.close()
+
+        XCTAssertThrowsError(try ScanExporter.importSnapshot(from: snapshotURL))
+    }
+
+    func testSnapshotImportRejectsExcessDiagnosticPathsDuringDecode() throws {
+        let outputDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DiskInventoryZedDiagnosticLimitTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outputDirectory) }
+        let snapshotURL = outputDirectory.appendingPathComponent("snapshot.json")
+        let paths = (0..<21).map { "\"/tmp/unreadable-\($0)\"" }.joined(separator: ",")
+        let snapshot = """
+        {"schemaVersion":3,"exportedAt":"1970-01-01T00:00:00Z","rootPath":"/tmp","diagnostics":{"unreadableItems":21,"firstUnreadablePaths":[\(paths)]},"entries":[{"path":"/tmp","name":"tmp","kind":"directory","isPackage":false,"isSymbolicLink":false,"allocatedSize":0,"logicalSize":0,"childCount":0,"isHardLinkDuplicate":false}]}
+        """
+        try Data(snapshot.utf8).write(to: snapshotURL)
+
+        XCTAssertThrowsError(try ScanExporter.importSnapshot(from: snapshotURL))
+    }
+
+    func testSnapshotValidatorRejectsOversizedPath() throws {
+        let path = "/" + String(repeating: "a", count: ScanExporter.maximumSnapshotPathBytes)
+        let root = JSONExportEntry(
+            path: path,
+            parentPath: nil,
+            name: "root",
+            kind: .directory,
+            isPackage: false,
+            isSymbolicLink: false,
+            allocatedSize: 0,
+            logicalSize: 0,
+            childCount: 0,
+            creationDate: nil,
+            modificationDate: nil,
+            isHardLinkDuplicate: false,
+            issue: nil
+        )
+
+        XCTAssertThrowsError(try ScanSnapshotValidator.validate(
+            entries: [root],
+            declaredRootPath: path,
+            diagnostics: .empty
+        ))
+    }
+
+    func testComparisonRetainsOnlyLargestHundredChanges() throws {
+        let currentFiles = (0..<600).map { index in
+            FileNode(
+                url: URL(fileURLWithPath: "/tmp/file-\(index)"),
+                name: "file-\(index)",
+                kind: .file,
+                logicalSize: Int64(index),
+                allocatedSize: Int64(index)
+            )
+        }
+        let current = FileNode(
+            url: URL(fileURLWithPath: "/tmp"),
+            name: "tmp",
+            kind: .directory,
+            logicalSize: 0,
+            allocatedSize: 0,
+            children: currentFiles
+        )
+        let baselineRoot = FileNode(
+            url: URL(fileURLWithPath: "/tmp"),
+            name: "tmp",
+            kind: .directory,
+            logicalSize: 0,
+            allocatedSize: 0
+        )
+        let baseline = ImportedScanSnapshot(
+            schemaVersion: 3,
+            exportedAt: Date(),
+            rootPath: "/tmp",
+            entries: [JSONExportEntry(node: baselineRoot, parentPath: nil)],
+            diagnostics: .empty
+        )
+
+        let comparison = try ScanSnapshotComparator.compare(
+            current: current,
+            options: .default,
+            diagnostics: .empty,
+            with: baseline
+        )
+
+        XCTAssertEqual(comparison.addedCount, 600)
+        XCTAssertEqual(comparison.largestGrowth.count, 100)
+        XCTAssertEqual(comparison.largestGrowth.first?.currentSize, 599)
+        XCTAssertEqual(comparison.largestGrowth.last?.currentSize, 500)
+    }
+
+    func testCSVProtectsSpreadsheetFormulaFields() throws {
+        let formulas = ["=2+2", " +1", "\t-1", "@cmd", "＝1", "−1"]
+        let files = formulas.enumerated().map { index, formula in
+            FileNode(
+                url: URL(fileURLWithPath: "/tmp/formula-\(index)"),
+                name: formula,
+                kind: .file,
+                logicalSize: 1,
+                allocatedSize: 1
+            )
+        }
+        let root = FileNode(
+            url: URL(fileURLWithPath: "/tmp"),
+            name: "tmp",
+            kind: .directory,
+            logicalSize: Int64(files.count),
+            allocatedSize: Int64(files.count),
+            children: files
+        )
+        let outputDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DiskInventoryZedCSVFormulaTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outputDirectory) }
+        let output = outputDirectory.appendingPathComponent("scan.csv")
+
+        try ScanExporter.exportCSV(root: root, to: output)
+
+        let csv = try String(contentsOf: output, encoding: .utf8)
+        for formula in formulas {
+            XCTAssertTrue(csv.contains("\"'\(formula)\""))
+        }
     }
 
 #if os(Linux)
@@ -445,6 +776,31 @@ final class ScanExporterTests: XCTestCase {
         ))
     }
 
+    func testLinuxPostScanRestrictionRejectsParentMovedIntoScan() async throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DiskInventoryZedRestrictedExportTests-\(UUID().uuidString)", isDirectory: true)
+        let source = workspace.appendingPathComponent("source", isDirectory: true)
+        let outside = workspace.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let destination = try ScanExporter.prepareLinuxDestination(
+            for: outside.appendingPathComponent("scan.json"),
+            excludingDirectoryIdentities: []
+        )
+        let result = try await DiskScanner().scan(url: source, options: .default) { _ in }
+        let movedParent = source.appendingPathComponent("moved-output", isDirectory: true)
+        try FileManager.default.moveItem(at: outside, to: movedParent)
+
+        XCTAssertThrowsError(try ScanExporter.restrictLinuxDestination(
+            destination,
+            excludingDirectoryIdentities: result.scannedDirectoryIdentities
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: movedParent.appendingPathComponent("scan.json").path
+        ))
+    }
+
     func testLinuxPreparedDestinationRejectsSkippedDirectoryAlias() async throws {
         let workspace = FileManager.default.temporaryDirectory
             .appendingPathComponent("DiskInventoryZedAliasedExportTests-\(UUID().uuidString)", isDirectory: true)
@@ -547,7 +903,12 @@ final class ScanExporterTests: XCTestCase {
             diagnostics: .empty
         )
 
-        XCTAssertThrowsError(try ScanSnapshotComparator.compare(current: root, with: baseline))
+        XCTAssertThrowsError(try ScanSnapshotComparator.compare(
+            current: root,
+            options: .default,
+            diagnostics: .empty,
+            with: baseline
+        ))
     }
 
     func testLinuxExportRefusesSymbolicLinkDestination() throws {
@@ -575,6 +936,22 @@ final class ScanExporterTests: XCTestCase {
         ))
         XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "unchanged")
         XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: link.path), target.path)
+    }
+
+    func testLinuxExportRejectsNonStickyWorldWritableParent() throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DiskInventoryZedUntrustedExportTests-\(UUID().uuidString)", isDirectory: true)
+        let outputDirectory = workspace.appendingPathComponent("shared", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        XCTAssertEqual(outputDirectory.path.withCString {
+            Glibc.chmod($0, mode_t(0o777))
+        }, 0)
+
+        XCTAssertThrowsError(try ScanExporter.prepareLinuxDestination(
+            for: outputDirectory.appendingPathComponent("scan.json"),
+            excludingDirectoryIdentities: []
+        ))
     }
 #endif
 }

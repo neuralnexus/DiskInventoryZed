@@ -24,14 +24,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
-      - name: Cache Swift packages
-        uses: actions/cache@v4
-        with:
-          path: .build
-          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.swift') }}
-          restore-keys: |
-            ${{ runner.os }}-spm-
 
       - name: Run unit tests
         run: swift test -Xswiftc -strict-concurrency=complete
@@ -45,28 +37,20 @@ jobs:
       
       - name: Package and verify app bundle
         env:
-          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          SIGNING_IDENTITY: '-'
         run: ./scripts/package-app.sh
       
       - name: Create DMG
+        env:
+          SIGNING_IDENTITY: '-'
         run: |
           ./scripts/create-dmg.sh
 
-      - name: Notarize tagged release when credentials are configured
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-        run: |
-          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_TEAM_ID" ] && [ -n "$APPLE_APP_PASSWORD" ]; then
-            ./scripts/notarize.sh DiskInventoryZed-*.dmg
-          else
-            echo "Notarization credentials are not configured; publishing an unnotarized build."
-          fi
-
       - name: Generate release checksums
         run: shasum -a 256 DiskInventoryZed-*.dmg > DiskInventoryZed-checksums.txt
+
+      - name: Archive app bundle
+        run: ditto -c -k --sequesterRsrc --keepParent DiskInventoryZed.app DiskInventoryZed.app.zip
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
@@ -81,7 +65,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: DiskInventoryZed-App
-          path: DiskInventoryZed.app
+          path: DiskInventoryZed.app.zip
           if-no-files-found: error
 
   linux:
@@ -97,14 +81,6 @@ jobs:
         uses: swift-actions/setup-swift@v2
         with:
           swift-version: "5.9"
-
-      - name: Cache Swift packages
-        uses: actions/cache@v4
-        with:
-          path: .build
-          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.swift') }}
-          restore-keys: |
-            ${{ runner.os }}-spm-
 
       - name: Run Linux unit tests
         run: swift test -Xswiftc -strict-concurrency=complete
@@ -128,62 +104,160 @@ jobs:
 
           with open(sys.argv[1], encoding="utf-8") as source:
               scan = json.load(source)
-          assert scan["schemaVersion"] == 3
+          assert scan["schemaVersion"] == 4
           assert any(entry["name"] == "file.txt" for entry in scan["entries"])
           PY
 
   release:
     needs: [build, linux]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: macos-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment: release
     permissions:
       contents: write
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     
     steps:
-      - name: Checkout release metadata
+      - name: Checkout tagged source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Resolve release version
-        id: version
-        shell: bash
+      - name: Validate release provenance and credentials
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_SIGNING_CERTIFICATE_BASE64: ${{ secrets.APPLE_SIGNING_CERTIFICATE_BASE64 }}
+          APPLE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
         run: |
-          VERSION="$(python3 - <<'PY'
-          import plistlib
-          with open("Resources/Info.plist", "rb") as source:
-              print(plistlib.load(source)["CFBundleShortVersionString"])
-          PY
-          )"
-          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+          EXPECTED_TAG="v${VERSION}"
+          if [ "$GITHUB_REF_NAME" != "$EXPECTED_TAG" ]; then
+            echo "Release tag '$GITHUB_REF_NAME' must match Info.plist version '$EXPECTED_TAG'." >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          MAIN_SHA="$(git rev-parse origin/main)"
+          if [ "$GITHUB_SHA" != "$MAIN_SHA" ]; then
+            echo "Tagged release commit must be the current origin/main commit." >&2
+            exit 1
+          fi
+          : "${APPLE_ID:?APPLE_ID secret is required for tagged releases}"
+          : "${APPLE_TEAM_ID:?APPLE_TEAM_ID secret is required for tagged releases}"
+          : "${APPLE_APP_PASSWORD:?APPLE_APP_PASSWORD secret is required for tagged releases}"
+          : "${APPLE_SIGNING_IDENTITY:?APPLE_SIGNING_IDENTITY secret is required for tagged releases}"
+          : "${APPLE_SIGNING_CERTIFICATE_BASE64:?APPLE_SIGNING_CERTIFICATE_BASE64 secret is required for tagged releases}"
+          : "${APPLE_SIGNING_CERTIFICATE_PASSWORD:?APPLE_SIGNING_CERTIFICATE_PASSWORD secret is required for tagged releases}"
 
       - name: Check whether release exists
-        id: existing
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ steps.version.outputs.tag }}
+          TAG_NAME: ${{ github.ref_name }}
         run: |
-          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
+          RESPONSE_PATH="$RUNNER_TEMP/release-lookup.json"
+          if ! HTTP_STATUS="$(curl --silent --show-error \
+            --output "$RESPONSE_PATH" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG_NAME")"; then
+            echo "Could not determine whether release '$TAG_NAME' exists." >&2
+            exit 1
           fi
+          case "$HTTP_STATUS" in
+            404) ;;
+            200)
+              echo "Release '$TAG_NAME' already exists; refusing to replace its assets." >&2
+              exit 1
+              ;;
+            *)
+              echo "Release lookup failed with HTTP status $HTTP_STATUS." >&2
+              cat "$RESPONSE_PATH" >&2
+              exit 1
+              ;;
+          esac
 
-      - name: Download artifacts
-        if: steps.existing.outputs.publish == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          name: DiskInventoryZed-DMG
+      - name: Import Developer ID certificate
+        env:
+          APPLE_SIGNING_CERTIFICATE_BASE64: ${{ secrets.APPLE_SIGNING_CERTIFICATE_BASE64 }}
+          APPLE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          umask 077
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id-certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/disk-inventory-zed-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "SIGNING_CERTIFICATE_PATH=$CERTIFICATE_PATH" >> "$GITHUB_ENV"
+          echo "SIGNING_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          printf '%s' "$APPLE_SIGNING_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" \
+            -P "$APPLE_SIGNING_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          rm -f "$CERTIFICATE_PATH"
+
+      - name: Build signed universal apps
+        env:
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          swift build -c release --arch arm64 --arch x86_64
+          ./scripts/package-app.sh
+          HELPER_APP="$RUNNER_TEMP/First-Run-Helper.app"
+          ./scripts/package-helper.sh "$HELPER_APP"
+          echo "PREBUILT_HELPER_APP=$HELPER_APP" >> "$GITHUB_ENV"
+
+      - name: Notarize signed applications
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          ./scripts/notarize.sh DiskInventoryZed.app
+          ./scripts/notarize.sh "$PREBUILT_HELPER_APP"
+
+      - name: Create signed DMG
+        env:
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: ./scripts/create-dmg.sh
+
+      - name: Notarize tagged release
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: ./scripts/notarize.sh DiskInventoryZed-*.dmg
+
+      - name: Generate release checksums
+        run: shasum -a 256 DiskInventoryZed-*.dmg > DiskInventoryZed-checksums.txt
       
       - name: Create Release
-        if: steps.existing.outputs.publish == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          files: |
-            DiskInventoryZed-*.dmg
-            DiskInventoryZed-checksums.txt
-          generate_release_notes: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG_NAME" \
+            DiskInventoryZed-*.dmg \
+            DiskInventoryZed-checksums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --target "$GITHUB_SHA" \
+            --generate-notes
+
+      - name: Remove signing keychain
+        if: always()
+        run: |
+          if [ -n "${SIGNING_CERTIFICATE_PATH:-}" ]; then
+            rm -f "$SIGNING_CERTIFICATE_PATH"
+          fi
+          if [ -n "${SIGNING_KEYCHAIN_PATH:-}" ]; then
+            security delete-keychain "$SIGNING_KEYCHAIN_PATH" || true
+          fi

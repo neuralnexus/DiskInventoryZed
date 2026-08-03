@@ -316,6 +316,13 @@ struct RightSidebarView: View {
                             SummaryMetric(title: "Resized", value: comparison.changedCount.formatted())
                         }
 
+                        if let warning = comparison.reliabilityWarning {
+                            Label(warning, systemImage: "exclamationmark.triangle.fill")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+
                         comparisonSection(
                             title: "Largest growth",
                             icon: "arrow.up.right",
@@ -337,7 +344,7 @@ struct RightSidebarView: View {
                     Text("Compare this scan with an earlier snapshot")
                         .font(.system(size: 11, weight: .semibold))
                         .multilineTextAlignment(.center)
-                    Text("Use Export → Export Snapshot after a scan. Later, scan the same location and choose Compare with Snapshot.")
+                    Text("Use Export → Export Snapshot after a scan. Later, scan the same location with matching scan settings and choose Compare with Snapshot.")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)

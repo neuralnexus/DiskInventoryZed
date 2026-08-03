@@ -3,8 +3,10 @@ set -euo pipefail
 
 readonly APP_NAME="DiskInventoryZed"
 readonly APP_BUNDLE="${APP_NAME}.app"
-readonly BINARY_PATH=".build/apple/Products/release/${APP_NAME}"
 readonly SIGNING_IDENTITY="${SIGNING_IDENTITY:--}"
+BINARY_DIRECTORY="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)"
+readonly BINARY_DIRECTORY
+readonly BINARY_PATH="${BINARY_DIRECTORY}/${APP_NAME}"
 
 if [ ! -f "$BINARY_PATH" ]; then
     echo "Binary not found at $BINARY_PATH" >&2
@@ -42,7 +44,8 @@ fi
 
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 
-readonly ARCHITECTURES="$(lipo -archs "$APP_BUNDLE/Contents/MacOS/$APP_NAME")"
+ARCHITECTURES="$(lipo -archs "$APP_BUNDLE/Contents/MacOS/$APP_NAME")"
+readonly ARCHITECTURES
 if [[ "$ARCHITECTURES" != *"arm64"* || "$ARCHITECTURES" != *"x86_64"* ]]; then
     echo "Expected a universal binary, found: $ARCHITECTURES" >&2
     exit 1
