@@ -22,6 +22,30 @@ public sealed class MainViewModelReliabilityTests
     }
 
     [Fact]
+    public async Task ScanPathNormalizesQuotesAndWhitespaceIntroducedByExpansion()
+    {
+        var variable = $"DISK_INVENTORY_ZED_TEST_PATH_{Guid.NewGuid():N}";
+        Environment.SetEnvironmentVariable(variable, "  \"C:\\expanded\"  ");
+        string? scannedPath = null;
+        try
+        {
+            using var viewModel = new MainViewModel(Services(scanAsync: (path, _, _, _) =>
+            {
+                scannedPath = path;
+                return Task.FromResult(Result(Root("expanded")));
+            }));
+
+            await viewModel.ScanAsync($"%{variable}%");
+
+            Assert.Equal("C:\\expanded", scannedPath);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(variable, null);
+        }
+    }
+
+    [Fact]
     public async Task CancelReleasesUiBeforeBlockedScannerReturnsAndLateResultCannotPublish()
     {
         var scanner = new TaskCompletionSource<DiskScanResult>(TaskCreationOptions.RunContinuationsAsynchronously);

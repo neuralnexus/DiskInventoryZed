@@ -215,7 +215,7 @@ internal static partial class WindowsFileMetadata
         var nativePath = ToExtendedPath(path);
         using var entryHandle = CreateFileW(
             nativePath,
-            FileReadData | FileReadAttributes,
+            FileReadAttributes,
             FileShareRead,
             IntPtr.Zero,
             OpenExisting,
@@ -229,8 +229,16 @@ internal static partial class WindowsFileMetadata
                 entryHandle,
                 FileAttributeTagInfoClass,
                 out var entryTagInformation,
-                (uint)sizeof(FileAttributeTagInfo)) ||
-            (entryTagInformation.ReparseTag & IoReparseTagNameSurrogate) != 0 ||
+                (uint)sizeof(FileAttributeTagInfo)))
+        {
+            throw new IOException("Only stable, locally available regular file entries can be verified.");
+        }
+
+        var entryPlaceholderState = CfGetPlaceholderStateFromAttributeTag(
+            entryTagInformation.FileAttributes,
+            entryTagInformation.ReparseTag);
+        if ((entryTagInformation.ReparseTag & IoReparseTagNameSurrogate) != 0 ||
+            !IsLocallyAvailableRegularFile(entryTagInformation.FileAttributes, entryPlaceholderState) ||
             !TryReadIdentity(entryHandle, out var entryIdentity))
         {
             throw new IOException("Only stable, locally available regular file entries can be verified.");
@@ -299,6 +307,7 @@ internal static partial class WindowsFileMetadata
         var entryHandle = CreateFileW(
             ToExtendedPath(path),
             FileListDirectory | FileReadAttributes,
+            // Write sharing would permit in-place reparse mutation after validation.
             FileShareRead,
             IntPtr.Zero,
             OpenExisting,

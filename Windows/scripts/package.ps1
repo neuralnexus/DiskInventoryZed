@@ -86,6 +86,12 @@ function Get-SigningCertificate {
     if (-not $IsWindows) {
         throw "$Policy signing requires Windows."
     }
+    if ([string]::IsNullOrWhiteSpace($PublisherSubject) -or
+        $PublisherSubject.Length -gt 1024 -or
+        $PublisherSubject -cne $PublisherSubject.Trim() -or
+        $PublisherSubject -match '[\x00-\x1F\x7F]') {
+        throw "The expected signing publisher subject is invalid."
+    }
     $normalizedThumbprint = $Thumbprint.Replace(" ", "").ToUpperInvariant()
     if ($normalizedThumbprint -notmatch '^[0-9A-F]{40,64}$') {
         throw "The signing certificate thumbprint is invalid."

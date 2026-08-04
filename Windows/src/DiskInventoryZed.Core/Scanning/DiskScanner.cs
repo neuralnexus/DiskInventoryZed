@@ -102,6 +102,7 @@ public sealed class DiskScanner
         }
 
         var rootPath = NormalizePath(path);
+        cancellationToken.ThrowIfCancellationRequested();
         FileAttributes rootAttributes;
         try
         {
@@ -284,6 +285,7 @@ public sealed class DiskScanner
 
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             using var directoryGuard = OperatingSystem.IsWindows()
                 ? WindowsFileMetadata.OpenDirectoryGuard(
                     work.Path,
@@ -298,9 +300,17 @@ public sealed class DiskScanner
                 ReturnSpecialDirectories = false
             };
 
-            foreach (var childPath in state.EnumerateEntries(work.Path, enumerationOptions))
+            cancellationToken.ThrowIfCancellationRequested();
+            using var enumerator = state.EnumerateEntries(work.Path, enumerationOptions).GetEnumerator();
+            while (true)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                if (!enumerator.MoveNext())
+                {
+                    break;
+                }
+                cancellationToken.ThrowIfCancellationRequested();
+                var childPath = enumerator.Current;
                 Volatile.Write(ref state.CurrentPath, childPath);
 
                 FileAttributes attributes;

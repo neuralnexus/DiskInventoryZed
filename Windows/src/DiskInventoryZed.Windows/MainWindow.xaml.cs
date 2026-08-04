@@ -140,14 +140,36 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (node.IsDirectory)
+        ActivateFileGridNode(node);
+    }
+
+    private void FileGrid_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter &&
+            Keyboard.Modifiers == ModifierKeys.None &&
+            FindVisualParent<DataGridRow>(e.OriginalSource as DependencyObject) is { DataContext: FileNode node })
         {
-            _viewModel.NavigateTo(node);
+            e.Handled = ActivateFileGridNode(node);
+        }
+    }
+
+    private bool ActivateFileGridNode(FileNode node)
+    {
+        if (!_viewModel.TryGetActiveNode(node, out var activeNode))
+        {
+            return false;
+        }
+
+        if (activeNode.IsDirectory)
+        {
+            _viewModel.NavigateTo(activeNode);
         }
         else
         {
+            _viewModel.SelectedNode = activeNode;
             RunShellAction(WindowsShellService.Open);
         }
+        return true;
     }
 
     private void FileGrid_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
@@ -161,7 +183,11 @@ public partial class MainWindow : Window
 
     private void FileGrid_ContextMenuOpening(object sender, ContextMenuEventArgs e)
     {
-        if (FindVisualParent<DataGridRow>(Mouse.DirectlyOver as DependencyObject) is null)
+        var openedFromKeyboard = e.CursorLeft < 0 && e.CursorTop < 0;
+        if ((!openedFromKeyboard &&
+             FindVisualParent<DataGridRow>(Mouse.DirectlyOver as DependencyObject) is null) ||
+            FileGrid.SelectedItem is not FileNode selectedNode ||
+            !_viewModel.TryGetActiveNode(selectedNode, out _))
         {
             e.Handled = true;
         }

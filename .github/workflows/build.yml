@@ -25,8 +25,6 @@ jobs:
     outputs:
       version: ${{ steps.release.outputs.version }}
       tag: ${{ steps.release.outputs.tag }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout release metadata
@@ -40,11 +38,11 @@ jobs:
 
       - name: Validate tagged release source
         id: release
+        if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
-            exit 0
-          fi
           VERSION="$(python3 - <<'PY'
           import os
           import plistlib
@@ -621,11 +619,14 @@ jobs:
 
       - name: Test-sign and package x64 and ARM64 applications
         shell: pwsh
+        env:
+          SIGNING_THUMBPRINT: ${{ steps.ci-signing.outputs.thumbprint }}
+          SIGNING_PUBLISHER: ${{ steps.ci-signing.outputs.subject }}
         run: |
           $signing = @{
             SignaturePolicy = "Test"
-            CertificateThumbprint = "${{ steps.ci-signing.outputs.thumbprint }}"
-            ExpectedPublisherSubject = "${{ steps.ci-signing.outputs.subject }}"
+            CertificateThumbprint = $env:SIGNING_THUMBPRINT
+            ExpectedPublisherSubject = $env:SIGNING_PUBLISHER
           }
           ./Windows/scripts/package.ps1 -Runtime win-x64 @signing
           ./Windows/scripts/package.ps1 -Runtime win-arm64 @signing
@@ -731,6 +732,16 @@ jobs:
               throw "Tagged Windows releases require complete protected signing configuration."
             }
           }
+          $expectedThumbprint = $env:EXPECTED_THUMBPRINT.Replace(" ", "").ToUpperInvariant()
+          if ($expectedThumbprint -notmatch '^[0-9A-F]{40,64}$') {
+            throw "The expected Windows signing certificate thumbprint is invalid."
+          }
+          $expectedPublisher = $env:EXPECTED_PUBLISHER
+          if ($expectedPublisher.Length -gt 1024 -or
+              $expectedPublisher -cne $expectedPublisher.Trim() -or
+              $expectedPublisher -match '[\x00-\x1F\x7F]') {
+            throw "The expected Windows signing publisher subject is invalid."
+          }
 
           try {
             $bytes = [Convert]::FromBase64String($env:CERTIFICATE_BASE64)
@@ -768,16 +779,13 @@ jobs:
             }
 
             $certificate = $certificates[0]
-            $expectedThumbprint = $env:EXPECTED_THUMBPRINT.Replace(" ", "").ToUpperInvariant()
             if ($certificate.Thumbprint -cne $expectedThumbprint) {
               throw "The imported Windows signing certificate thumbprint is not allowlisted."
             }
-            if ($certificate.Subject -cne $env:EXPECTED_PUBLISHER) {
+            if ($certificate.Subject -cne $expectedPublisher) {
               throw "The imported Windows signing certificate publisher is not allowlisted."
             }
             "thumbprint=$($certificate.Thumbprint)" |
-              Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-            "subject=$($certificate.Subject)" |
               Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
             $importComplete = $true
           }
@@ -813,11 +821,12 @@ jobs:
         shell: pwsh
         env:
           TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+          EXPECTED_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER_SUBJECT }}
         run: |
           $signing = @{
             SignaturePolicy = "Release"
             CertificateThumbprint = "${{ steps.production-signing.outputs.thumbprint }}"
-            ExpectedPublisherSubject = "${{ steps.production-signing.outputs.subject }}"
+            ExpectedPublisherSubject = $env:EXPECTED_PUBLISHER
             TimestampUrl = $env:TIMESTAMP_URL
           }
           ./Windows/scripts/package.ps1 -Runtime win-x64 @signing

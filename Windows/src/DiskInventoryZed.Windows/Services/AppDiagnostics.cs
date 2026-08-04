@@ -9,7 +9,7 @@ namespace DiskInventoryZed.Windows.Services;
 internal sealed class AppDiagnostics
 {
     private const int DefaultMaximumLogBytes = 512 * 1024;
-    private static readonly Mutex DiagnosticsMutex = new(false, @"Local\DiskInventoryZed.Diagnostics");
+    private static readonly Lazy<Mutex?> DiagnosticsMutex = new(CreateDiagnosticsMutex);
     private readonly object _gate = new();
     private readonly string _directory;
     private readonly string _logPath;
@@ -128,12 +128,18 @@ internal sealed class AppDiagnostics
 
     private void TryWriteEvent(string eventCode, Exception? error)
     {
+        var diagnosticsMutex = DiagnosticsMutex.Value;
+        if (diagnosticsMutex is null)
+        {
+            return;
+        }
+
         var lockTaken = false;
         try
         {
             try
             {
-                lockTaken = DiagnosticsMutex.WaitOne(TimeSpan.FromMilliseconds(100));
+                lockTaken = diagnosticsMutex.WaitOne(TimeSpan.FromMilliseconds(100));
             }
             catch (AbandonedMutexException)
             {
@@ -154,8 +160,27 @@ internal sealed class AppDiagnostics
         {
             if (lockTaken)
             {
-                DiagnosticsMutex.ReleaseMutex();
+                try
+                {
+                    diagnosticsMutex.ReleaseMutex();
+                }
+                catch
+                {
+                    // A diagnostics lock failure must not escape into the application.
+                }
             }
+        }
+    }
+
+    private static Mutex? CreateDiagnosticsMutex()
+    {
+        try
+        {
+            return new Mutex(false, @"Local\DiskInventoryZed.Diagnostics");
+        }
+        catch
+        {
+            return null;
         }
     }
 

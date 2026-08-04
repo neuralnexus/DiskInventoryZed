@@ -134,6 +134,64 @@ public sealed class DiskScannerReliabilityTests
     }
 
     [Fact]
+    public async Task PreCancelledScanDoesNotStartRootIo()
+    {
+        using var fixture = new TemporaryDirectory();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        var rootIoCalls = 0;
+        var scanner = new DiskScanner(
+            (_, isDirectory, _, logicalSize, _) => Metadata(logicalSize, isDirectory ? 0 : logicalSize),
+            _ =>
+            {
+                Interlocked.Increment(ref rootIoCalls);
+                return FileAttributes.Directory;
+            },
+            (_, _) => []);
+
+        var operation = scanner.StartScan(fixture.Path, cancellationToken: cancellation.Token);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => operation.Completion);
+        Assert.Equal(0, Volatile.Read(ref rootIoCalls));
+    }
+
+    [Fact]
+    public async Task CancellationIsObservedBeforeAdvancingTheEnumeratorAgain()
+    {
+        using var fixture = new TemporaryDirectory();
+        var child = Path.Combine(fixture.Path, "file.bin");
+        using var cancellation = new CancellationTokenSource();
+        var advances = 0;
+        var scanner = new DiskScanner(
+            (path, isDirectory, _, logicalSize, _) =>
+            {
+                if (path == child)
+                {
+                    cancellation.Cancel();
+                }
+                return Metadata(logicalSize, isDirectory ? 0 : logicalSize);
+            },
+            path => path == child ? FileAttributes.Normal : FileAttributes.Directory,
+            (_, _) => EnumerateOnce());
+
+        var operation = scanner.StartScan(
+            fixture.Path,
+            new ScanOptions(ShowHiddenFiles: true),
+            cancellationToken: cancellation.Token);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => operation.Completion);
+        Assert.Equal(1, Volatile.Read(ref advances));
+
+        IEnumerable<string> EnumerateOnce()
+        {
+            Interlocked.Increment(ref advances);
+            yield return child;
+            Interlocked.Increment(ref advances);
+            throw new InvalidOperationException("The enumerator advanced after cancellation.");
+        }
+    }
+
+    [Fact]
     public async Task EntryLimitFailsClosedBeforeRetainingAnUnboundedScan()
     {
         using var fixture = new TemporaryDirectory();

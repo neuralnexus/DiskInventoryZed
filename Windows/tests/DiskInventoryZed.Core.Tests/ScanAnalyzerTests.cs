@@ -45,6 +45,20 @@ public sealed class ScanAnalyzerTests
         Assert.Throws<OperationCanceledException>(() => ScanAnalyzer.Analyze(root, cancellation.Token));
     }
 
+    [Fact]
+    public void ExtensionStatsAreBoundedToTheLargestTypes()
+    {
+        var files = Enumerable.Range(0, ScanAnalyzer.MaximumExtensionStats + 100)
+            .Select(index => File($"file-{index}.ext{index}", index + 1L))
+            .ToArray();
+
+        var analysis = ScanAnalyzer.Analyze(DirectoryNode(files));
+
+        Assert.Equal(ScanAnalyzer.MaximumExtensionStats, analysis.ExtensionStats.Count);
+        Assert.Equal($"ext{files.Length - 1}", analysis.ExtensionStats[0].Extension);
+        Assert.DoesNotContain(analysis.ExtensionStats, item => item.Extension == "ext0");
+    }
+
     private static FileNode File(
         string name,
         long size,

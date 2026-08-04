@@ -396,7 +396,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public async Task ScanAsync(string path)
     {
         VerifyAccess();
-        path = Environment.ExpandEnvironmentVariables(path.Trim().Trim('"'));
+        path = Environment.ExpandEnvironmentVariables(path).Trim();
+        if (path.Length >= 2 && path[0] == '"' && path[^1] == '"')
+        {
+            path = path[1..^1].Trim();
+        }
         if (string.IsNullOrWhiteSpace(path))
         {
             RaiseError("Enter a folder, mapped drive, or UNC path to scan.");

@@ -37,7 +37,22 @@ public sealed record ScanAnalysis(
 
 public static class ScanAnalyzer
 {
+    internal const int MaximumExtensionStats = 500;
+
     public static ScanAnalysis Analyze(FileNode root, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return AnalyzeCore(root, cancellationToken);
+        }
+        catch (InvalidOperationException) when (cancellationToken.IsCancellationRequested)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            throw;
+        }
+    }
+
+    private static ScanAnalysis AnalyzeCore(FileNode root, CancellationToken cancellationToken)
     {
         var extensions = new Dictionary<string, (long Size, int Count)>(StringComparer.OrdinalIgnoreCase);
         var files = new List<FileNode>();
@@ -90,25 +105,45 @@ public static class ScanAnalyzer
             }
         }
 
-        var extensionStats = extensions
+        var extensionStats = ObserveCancellation(extensions, cancellationToken)
             .Select(item => new ExtensionStat(item.Key, item.Value.Size, item.Value.Count))
-            .OrderByDescending(item => item.TotalSize)
+            .OrderByDescending(
+                item => item.TotalSize,
+                new CancellationComparer<long>(Comparer<long>.Default, cancellationToken))
+            .ThenBy(
+                item => item.Extension,
+                new CancellationComparer<string>(StringComparer.OrdinalIgnoreCase, cancellationToken))
+            .Take(MaximumExtensionStats)
             .ToArray();
-        var largestFiles = files.OrderByDescending(file => file.AllocatedSize).Take(100).ToArray();
-        var oldLargeFiles = files
-            .Where(file => file.AllocatedSize >= 100_000_000 && file.ModificationDate < oldFileCutoff)
-            .OrderByDescending(file => file.AllocatedSize)
+        var largestFiles = ObserveCancellation(files, cancellationToken)
+            .OrderByDescending(
+                file => file.AllocatedSize,
+                new CancellationComparer<long>(Comparer<long>.Default, cancellationToken))
             .Take(100)
             .ToArray();
-        var duplicateCandidates = duplicateGroups.Values
+        var oldLargeFiles = ObserveCancellation(files, cancellationToken)
+            .Where(file => file.AllocatedSize >= 100_000_000 && file.ModificationDate < oldFileCutoff)
+            .OrderByDescending(
+                file => file.AllocatedSize,
+                new CancellationComparer<long>(Comparer<long>.Default, cancellationToken))
+            .Take(100)
+            .ToArray();
+        var duplicateCandidates = ObserveCancellation(duplicateGroups.Values, cancellationToken)
             .Where(matches => matches.Count > 1)
             .Select(matches => new DuplicateCandidate(
                 matches[0].LogicalSize,
-                matches.OrderBy(file => file.FullPath, StringComparer.OrdinalIgnoreCase).ToArray()))
-            .OrderByDescending(candidate => candidate.PotentialSavings)
+                ObserveCancellation(matches, cancellationToken)
+                    .OrderBy(
+                        file => file.FullPath,
+                        new CancellationComparer<string>(StringComparer.OrdinalIgnoreCase, cancellationToken))
+                    .ToArray()))
+            .OrderByDescending(
+                candidate => candidate.PotentialSavings,
+                new CancellationComparer<long>(Comparer<long>.Default, cancellationToken))
             .Take(500)
             .ToArray();
 
+        cancellationToken.ThrowIfCancellationRequested();
         return new ScanAnalysis(
             extensionStats,
             largestFiles,
@@ -117,5 +152,34 @@ public static class ScanAnalyzer
             allNodes,
             nodesById,
             parentById);
+    }
+
+    private static IEnumerable<T> ObserveCancellation<T>(
+        IEnumerable<T> source,
+        CancellationToken cancellationToken)
+    {
+        var count = 0;
+        foreach (var item in source)
+        {
+            if ((count++ & 255) == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            yield return item;
+        }
+    }
+
+    private sealed class CancellationComparer<T>(IComparer<T> inner, CancellationToken cancellationToken) : IComparer<T>
+    {
+        private int _comparisons;
+
+        public int Compare(T? left, T? right)
+        {
+            if ((_comparisons++ & 255) == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            return inner.Compare(left!, right!);
+        }
     }
 }

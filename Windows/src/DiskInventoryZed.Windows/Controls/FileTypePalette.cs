@@ -6,12 +6,13 @@ namespace DiskInventoryZed.Windows.Controls;
 
 public static class FileTypePalette
 {
-    private static readonly ConcurrentDictionary<string, SolidColorBrush> Brushes = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<(Color Color, byte Opacity), SolidColorBrush> Brushes = new();
     private static readonly string[] FolderColors = ["#367FC2", "#31A778", "#D17A35", "#B44784", "#7654C8"];
 
     public static SolidColorBrush BrushFor(FileNode node, double opacity = 1) => node.IsDirectory
-        ? CachedBrush($"folder:{StableHash(node.FullPath) % (ulong)FolderColors.Length}:{opacity:F2}",
-            Parse(FolderColors[(int)(StableHash(node.FullPath) % (ulong)FolderColors.Length)]), opacity)
+        ? CachedBrush(
+            Parse(FolderColors[(int)(StableHash(node.FullPath) % (ulong)FolderColors.Length)]),
+            opacity)
         : BrushForExtension(node.Extension ?? "unknown", opacity);
 
     public static SolidColorBrush BrushForExtension(string extension, double opacity = 1)
@@ -32,15 +33,23 @@ public static class FileTypePalette
             "unknown" => Color.FromRgb(112, 126, 141),
             _ => HsvToColor(StableHash(normalized) % 360, 0.58, 0.84)
         };
-        return CachedBrush($"ext:{normalized}:{opacity:F2}", color, opacity);
+        return CachedBrush(color, opacity);
     }
 
-    private static SolidColorBrush CachedBrush(string key, Color color, double opacity) => Brushes.GetOrAdd(key, _ =>
+    private static SolidColorBrush CachedBrush(Color color, double opacity)
     {
-        var brush = new SolidColorBrush(color) { Opacity = opacity };
-        brush.Freeze();
-        return brush;
-    });
+        if (double.IsNaN(opacity))
+        {
+            opacity = 1;
+        }
+        var normalizedOpacity = (byte)Math.Round(Math.Clamp(opacity, 0, 1) * byte.MaxValue);
+        return Brushes.GetOrAdd((color, normalizedOpacity), static key =>
+        {
+            var brush = new SolidColorBrush(key.Color) { Opacity = key.Opacity / (double)byte.MaxValue };
+            brush.Freeze();
+            return brush;
+        });
+    }
 
     private static Color Parse(string value) => (Color)ColorConverter.ConvertFromString(value);
 

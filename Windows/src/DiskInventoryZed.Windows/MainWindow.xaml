@@ -277,6 +277,7 @@
                                        FontSize="10" Margin="8,4" AutomationProperties.LiveSetting="Polite" />
                         <DataGrid x:Name="FileGrid" Grid.Row="1"
                                   AutomationProperties.Name="Scanned files and folders"
+                                  AutomationProperties.HelpText="Press Enter to open the selected item. Press Shift+F10 for item actions."
                                   ItemsSource="{Binding VisibleItems}"
                                   SelectedItem="{Binding SelectedNode, Mode=TwoWay}"
                                   AutoGenerateColumns="False"
@@ -289,6 +290,7 @@
                                   BorderThickness="0"
                                   HorizontalGridLinesBrush="#1E2934"
                                   MouseDoubleClick="FileGrid_MouseDoubleClick"
+                                  PreviewKeyDown="FileGrid_PreviewKeyDown"
                                   PreviewMouseRightButtonDown="FileGrid_PreviewMouseRightButtonDown"
                                   ContextMenuOpening="FileGrid_ContextMenuOpening">
                             <DataGrid.Resources>
