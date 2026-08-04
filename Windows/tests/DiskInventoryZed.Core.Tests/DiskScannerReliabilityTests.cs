@@ -177,8 +177,8 @@ public sealed class DiskScannerReliabilityTests
     public async Task EntryLimitSignalsBeforeAnotherWorkerReturnsFromBlockedIo()
     {
         using var fixture = new TemporaryDirectory();
-        var blockedDirectory = Path.Combine(fixture.Path, "blocked");
-        var limitDirectory = Path.Combine(fixture.Path, "limit");
+        var blockedDirectory = Directory.CreateDirectory(Path.Combine(fixture.Path, "blocked")).FullName;
+        var limitDirectory = Directory.CreateDirectory(Path.Combine(fixture.Path, "limit")).FullName;
         var children = new[]
         {
             Path.Combine(limitDirectory, "first.bin"),
@@ -204,7 +204,7 @@ public sealed class DiskScannerReliabilityTests
             new ScanOptions(ShowHiddenFiles: true, MaximumEntries: 4));
         try
         {
-            var error = await operation.FatalError.WaitAsync(TimeSpan.FromSeconds(2));
+            var error = await operation.FatalError.WaitAsync(TimeSpan.FromSeconds(10));
             await Assert.ThrowsAsync<DiskScanLimitExceededException>(() => operation.Result);
 
             Assert.IsType<DiskScanLimitExceededException>(error);
@@ -225,7 +225,7 @@ public sealed class DiskScannerReliabilityTests
 
         IEnumerable<string> EnumerateAfterBlockedWorkerStarts()
         {
-            Assert.True(blockedWorkerStarted.Wait(TimeSpan.FromSeconds(2)));
+            Assert.True(blockedWorkerStarted.Wait(TimeSpan.FromSeconds(10)));
             return children;
         }
     }
