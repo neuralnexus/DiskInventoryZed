@@ -504,7 +504,6 @@ jobs:
 
             foreach ($storeName in @(
               [Security.Cryptography.X509Certificates.StoreName]::My,
-              [Security.Cryptography.X509Certificates.StoreName]::TrustedPeople,
               [Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher
             )) {
               Write-Host "Adding the ephemeral certificate to CurrentUser/$storeName."
@@ -522,6 +521,12 @@ jobs:
               finally {
                 $store.Dispose()
               }
+            }
+
+            Write-Host "Adding the ephemeral certificate to LocalMachine/Root."
+            & certutil.exe -f -addstore Root $certificateFilePath | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "CertUtil failed to trust the CI signing certificate."
             }
 
             $store = [Security.Cryptography.X509Certificates.X509Store]::new(
@@ -549,7 +554,6 @@ jobs:
             if (-not $installationComplete -and $null -ne $certificate) {
               if ($null -ne $publicCertificate) {
                 foreach ($storeName in @(
-                  [Security.Cryptography.X509Certificates.StoreName]::TrustedPeople,
                   [Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher
                 )) {
                   $store = [Security.Cryptography.X509Certificates.X509Store]::new(
@@ -566,6 +570,7 @@ jobs:
                     $store.Dispose()
                   }
                 }
+                & certutil.exe -f -delstore Root $certificate.Thumbprint | Out-Null
               }
               $myCertificatePath = "Cert:/CurrentUser/My/$($certificate.Thumbprint)"
               $privateKeyDeleted = $false
@@ -650,7 +655,7 @@ jobs:
           $thumbprint = "${{ steps.ci-signing.outputs.thumbprint }}"
           $cleanupErrors = [System.Collections.Generic.List[string]]::new()
           $certificatePaths = @(
-            "Cert:/CurrentUser/TrustedPeople/$thumbprint",
+            "Cert:/LocalMachine/Root/$thumbprint",
             "Cert:/CurrentUser/TrustedPublisher/$thumbprint"
           )
           foreach ($path in $certificatePaths) {
