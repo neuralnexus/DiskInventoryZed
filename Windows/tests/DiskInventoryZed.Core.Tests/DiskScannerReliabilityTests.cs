@@ -43,7 +43,7 @@ public sealed class DiskScannerReliabilityTests
         var child = Path.Combine(fixture.Path, "unknown-link.bin");
         await File.WriteAllBytesAsync(child, new byte[4096]);
         var scanner = new DiskScanner(
-            (path, isDirectory, isReparsePoint, logicalSize) =>
+            (path, isDirectory, isReparsePoint, logicalSize, _) =>
                 path == child
                     ? Metadata(0, 0, ReparsePointClassification.Unknown)
                     : Metadata(logicalSize, isDirectory ? 0 : logicalSize),
@@ -68,7 +68,7 @@ public sealed class DiskScannerReliabilityTests
         using var fixture = new TemporaryDirectory();
         var child = Path.Combine(fixture.Path, "linked.bin");
         await File.WriteAllBytesAsync(child, new byte[4096]);
-        var scanner = new DiskScanner((path, isDirectory, isReparsePoint, logicalSize) =>
+        var scanner = new DiskScanner((path, isDirectory, isReparsePoint, logicalSize, _) =>
             path == child
                 ? Metadata(logicalSize, 4096, hardLinkCount: 2)
                 : Metadata(logicalSize, isDirectory ? 0 : logicalSize));
@@ -88,7 +88,7 @@ public sealed class DiskScannerReliabilityTests
         using var fixture = new TemporaryDirectory();
         var child = Path.Combine(fixture.Path, "changed.bin");
         await File.WriteAllBytesAsync(child, [1, 2, 3]);
-        var scanner = new DiskScanner((path, isDirectory, isReparsePoint, logicalSize) =>
+        var scanner = new DiskScanner((path, isDirectory, isReparsePoint, logicalSize, _) =>
             path == child
                 ? Metadata(logicalSize, logicalSize, approximate: true, metadataUnavailable: true)
                 : Metadata(logicalSize, isDirectory ? 0 : logicalSize));
@@ -107,7 +107,7 @@ public sealed class DiskScannerReliabilityTests
     public async Task EmptyRootWithUnavailableMetadataStillProducesAResult()
     {
         using var fixture = new TemporaryDirectory();
-        var scanner = new DiskScanner((_, _, _, logicalSize) =>
+        var scanner = new DiskScanner((_, _, _, logicalSize, _) =>
             Metadata(logicalSize, 0, approximate: true, metadataUnavailable: true));
 
         var result = await scanner.ScanAsync(fixture.Path, new ScanOptions(ShowHiddenFiles: true));
@@ -125,12 +125,141 @@ public sealed class DiskScannerReliabilityTests
         await File.WriteAllBytesAsync(child, [1]);
         using var cancellation = new CancellationTokenSource();
         var scanner = new DiskScanner(
-            (path, isDirectory, isReparsePoint, logicalSize) =>
+            (path, isDirectory, isReparsePoint, logicalSize, _) =>
                 Metadata(logicalSize, isDirectory ? 0 : logicalSize),
             enumerateEntries: (_, _) => CancelThenYield(cancellation, child));
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             scanner.ScanAsync(fixture.Path, new ScanOptions(ShowHiddenFiles: true), cancellationToken: cancellation.Token));
+    }
+
+    [Fact]
+    public async Task EntryLimitFailsClosedBeforeRetainingAnUnboundedScan()
+    {
+        using var fixture = new TemporaryDirectory();
+        var children = Enumerable.Range(0, 4)
+            .Select(index => Path.Combine(fixture.Path, $"file-{index}.bin"))
+            .ToArray();
+        var scanner = new DiskScanner(
+            (_, isDirectory, _, logicalSize, _) => Metadata(logicalSize, isDirectory ? 0 : logicalSize),
+            path => children.Contains(path, StringComparer.Ordinal) ? FileAttributes.Normal : FileAttributes.Directory,
+            (_, _) => children);
+
+        var error = await Assert.ThrowsAsync<DiskScanLimitExceededException>(() => scanner.ScanAsync(
+            fixture.Path,
+            new ScanOptions(ShowHiddenFiles: true, MaximumEntries: 3)));
+
+        Assert.Equal(3, error.MaximumEntries);
+        Assert.Contains("safety limit", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task EntryLimitIncludesTheRootAndAllowsTheExactBoundary()
+    {
+        using var fixture = new TemporaryDirectory();
+        var children = Enumerable.Range(0, 2)
+            .Select(index => Path.Combine(fixture.Path, $"file-{index}.bin"))
+            .ToArray();
+        var scanner = new DiskScanner(
+            (_, isDirectory, _, logicalSize, _) => Metadata(logicalSize, isDirectory ? 0 : logicalSize),
+            path => children.Contains(path, StringComparer.Ordinal) ? FileAttributes.Normal : FileAttributes.Directory,
+            (_, _) => children);
+
+        var result = await scanner.ScanAsync(
+            fixture.Path,
+            new ScanOptions(ShowHiddenFiles: true, MaximumEntries: 3));
+
+        Assert.Equal(2, result.TotalFiles);
+        Assert.Equal(3, result.Options.MaximumEntries);
+    }
+
+    [Fact]
+    public async Task EntryLimitSignalsBeforeAnotherWorkerReturnsFromBlockedIo()
+    {
+        using var fixture = new TemporaryDirectory();
+        var blockedDirectory = Path.Combine(fixture.Path, "blocked");
+        var limitDirectory = Path.Combine(fixture.Path, "limit");
+        var children = new[]
+        {
+            Path.Combine(limitDirectory, "first.bin"),
+            Path.Combine(limitDirectory, "second.bin")
+        };
+        using var releaseBlockedWorker = new ManualResetEventSlim();
+        using var blockedWorkerStarted = new ManualResetEventSlim();
+        var scanner = new DiskScanner(
+            (_, isDirectory, _, logicalSize, _) => Metadata(logicalSize, isDirectory ? 0 : logicalSize),
+            path => path == fixture.Path || path == blockedDirectory || path == limitDirectory
+                ? FileAttributes.Directory
+                : FileAttributes.Normal,
+            (path, _) => path switch
+            {
+                var root when root == fixture.Path => [blockedDirectory, limitDirectory],
+                var blocked when blocked == blockedDirectory => BlockUntilReleased(),
+                var limited when limited == limitDirectory => EnumerateAfterBlockedWorkerStarts(),
+                _ => []
+            });
+
+        var operation = scanner.StartScan(
+            fixture.Path,
+            new ScanOptions(ShowHiddenFiles: true, MaximumEntries: 4));
+        try
+        {
+            var error = await operation.FatalError.WaitAsync(TimeSpan.FromSeconds(2));
+            await Assert.ThrowsAsync<DiskScanLimitExceededException>(() => operation.Result);
+
+            Assert.IsType<DiskScanLimitExceededException>(error);
+            Assert.False(operation.Completion.IsCompleted);
+        }
+        finally
+        {
+            releaseBlockedWorker.Set();
+        }
+        await Assert.ThrowsAsync<DiskScanLimitExceededException>(() => operation.Completion);
+
+        IEnumerable<string> BlockUntilReleased()
+        {
+            blockedWorkerStarted.Set();
+            releaseBlockedWorker.Wait();
+            return [];
+        }
+
+        IEnumerable<string> EnumerateAfterBlockedWorkerStarts()
+        {
+            Assert.True(blockedWorkerStarted.Wait(TimeSpan.FromSeconds(2)));
+            return children;
+        }
+    }
+
+    [Fact]
+    public async Task StartScanReturnsBeforeBlockingRootIoCompletes()
+    {
+        using var fixture = new TemporaryDirectory();
+        using var releaseRootIo = new ManualResetEventSlim();
+        using var rootIoStarted = new ManualResetEventSlim();
+        var scanner = new DiskScanner(
+            (_, isDirectory, _, logicalSize, _) => Metadata(logicalSize, isDirectory ? 0 : logicalSize),
+            _ =>
+            {
+                rootIoStarted.Set();
+                releaseRootIo.Wait();
+                return FileAttributes.Directory;
+            },
+            (_, _) => []);
+
+        var startCall = Task.Run(() => scanner.StartScan(fixture.Path));
+        try
+        {
+            Assert.True(rootIoStarted.Wait(TimeSpan.FromSeconds(2)));
+            var operation = await startCall.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.False(operation.Completion.IsCompleted);
+        }
+        finally
+        {
+            releaseRootIo.Set();
+        }
+
+        var startedOperation = await startCall;
+        await startedOperation.Completion.WaitAsync(TimeSpan.FromSeconds(2));
     }
 
     private static IEnumerable<string> CancelThenYield(CancellationTokenSource cancellation, string path)

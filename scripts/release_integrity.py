@@ -148,18 +148,27 @@ def release_identity(
     tag: str,
     marker: str,
     expected_draft: bool,
+    expected_digests: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     if release.get("tag_name") != tag:
         raise ReleaseIntegrityError("The release tag changed during verification.")
-    if marker not in (release.get("body") or ""):
+    body = release.get("body")
+    if not isinstance(body, str) or marker not in body:
         raise ReleaseIntegrityError("Release ownership changed during verification.")
     if release.get("draft") is not expected_draft:
         state = "draft" if expected_draft else "published"
         raise ReleaseIntegrityError(f"The release is not in the expected {state} state.")
     if release.get("prerelease") is not False:
         raise ReleaseIntegrityError("The release is marked as a prerelease.")
+    if release.get("name") != f"Disk Inventory Zed {tag.removeprefix('v')}":
+        raise ReleaseIntegrityError("The release title changed during verification.")
+    author = release.get("author")
+    if not isinstance(author, dict) or author.get("login") != "github-actions[bot]":
+        raise ReleaseIntegrityError("The release author is not the trusted workflow identity.")
+    if not expected_draft and release.get("immutable") is not True:
+        raise ReleaseIntegrityError("The published release is not immutable.")
 
-    assets: dict[str, list[int]] = {}
+    assets: dict[str, list[int | str]] = {}
     raw_assets = release.get("assets")
     if not isinstance(raw_assets, list):
         raise ReleaseIntegrityError("The release asset list is invalid.")
@@ -173,13 +182,34 @@ def release_identity(
         size = asset.get("size")
         if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
             raise ReleaseIntegrityError(f"Invalid asset size for {name}: {size!r}")
-        assets[name] = [asset_id, size]
+        asset_digest = asset.get("digest")
+        if not isinstance(asset_digest, str) or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", asset_digest
+        ):
+            raise ReleaseIntegrityError(f"Invalid server digest for {name}: {asset_digest!r}")
+        if expected_digests is not None:
+            expected_digest = expected_digests.get(name)
+            if expected_digest is None or asset_digest != f"sha256:{expected_digest}":
+                raise ReleaseIntegrityError(
+                    f"The server digest does not match this run for {name}."
+                )
+        if asset.get("state") != "uploaded":
+            raise ReleaseIntegrityError(f"Release asset {name} is not fully uploaded.")
+        uploader = asset.get("uploader")
+        if not isinstance(uploader, dict) or uploader.get("login") != "github-actions[bot]":
+            raise ReleaseIntegrityError(f"Release asset {name} has an untrusted uploader.")
+        assets[name] = [asset_id, size, asset_digest]
     if set(assets) != expected_names:
         raise ReleaseIntegrityError(
             f"Release asset identities differ: "
             f"expected={sorted(expected_names)}, actual={sorted(assets)}"
         )
-    return {"id": _positive_id(release.get("id"), "release ID"), "assets": assets}
+    body_digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return {
+        "id": _positive_id(release.get("id"), "release ID"),
+        "bodyDigest": body_digest,
+        "assets": assets,
+    }
 
 
 def verify_download(
@@ -220,8 +250,13 @@ def verify_download(
         downloaded,
     )
 
-    before = release_identity(_load_json(before_json), expected_names, tag, marker, True)
-    after = release_identity(_load_json(after_json), expected_names, tag, marker, True)
+    expected_digests = {name: digest(path) for name, path in local_assets.items()}
+    before = release_identity(
+        _load_json(before_json), expected_names, tag, marker, True, expected_digests
+    )
+    after = release_identity(
+        _load_json(after_json), expected_names, tag, marker, True, expected_digests
+    )
     if before != after:
         raise ReleaseIntegrityError("The release or its assets changed during download verification.")
     state_out.write_text(json.dumps(after, sort_keys=True) + "\n", encoding="utf-8")

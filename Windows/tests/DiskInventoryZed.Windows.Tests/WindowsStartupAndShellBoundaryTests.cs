@@ -53,20 +53,22 @@ public sealed class WindowsStartupAndShellBoundaryTests
         };
         var calls = 0;
         using var viewModel = new MainViewModel(new MainViewModelServices(
-            async (_, _, _, _) =>
-            {
-                var index = Interlocked.Increment(ref calls) - 1;
-                started[index].TrySetResult();
-                var result = await workers[index].Task;
-                returned[index].TrySetResult();
-                return result;
-            },
+            (_, _, _, token) => FromTask(RunScanAsync(), token),
             (_, _) => throw new InvalidOperationException("No analysis expected."),
             (_, _, _) => throw new InvalidOperationException("No verification expected."),
             VisibleItemsFilter.Apply,
             (_, _) => Task.CompletedTask,
             () => new AppSettings(),
             _ => { }));
+
+        async Task<DiskScanResult> RunScanAsync()
+        {
+            var index = Interlocked.Increment(ref calls) - 1;
+            started[index].TrySetResult();
+            var result = await workers[index].Task;
+            returned[index].TrySetResult();
+            return result;
+        }
         var recovery = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var awaitingRecovery = false;
         var recoveryWasOnDispatcher = false;
@@ -125,13 +127,7 @@ public sealed class WindowsStartupAndShellBoundaryTests
         var verificationStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseVerification = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var viewModel = new MainViewModel(new MainViewModelServices(
-            async (_, _, _, _) =>
-            {
-                scanStarted.TrySetResult();
-                await releaseScan.Task;
-                return new DiskScanResult(
-                    root, 2, 1, TimeSpan.Zero, ScanDiagnostics.Empty, new ScanOptions(ShowHiddenFiles: true));
-            },
+            (_, _, _, token) => FromTask(RunScanAsync(), token),
             async (node, token) =>
             {
                 analysisStarted.TrySetResult();
@@ -154,6 +150,14 @@ public sealed class WindowsStartupAndShellBoundaryTests
             (_, _) => Task.CompletedTask,
             () => new AppSettings(),
             _ => { }));
+
+        async Task<DiskScanResult> RunScanAsync()
+        {
+            scanStarted.TrySetResult();
+            await releaseScan.Task;
+            return new DiskScanResult(
+                root, 2, 1, TimeSpan.Zero, ScanDiagnostics.Empty, new ScanOptions(ShowHiddenFiles: true));
+        }
         var stayedOnDispatcher = true;
         void RecordAffinity() => stayedOnDispatcher &= dispatcher.CheckAccess();
         viewModel.PropertyChanged += (_, _) => RecordAffinity();
@@ -222,6 +226,9 @@ public sealed class WindowsStartupAndShellBoundaryTests
         var root = new FileNode($"C:\\{name}", name, FileNodeKind.Directory, 0, 0);
         return new DiskScanResult(root, 0, 1, TimeSpan.Zero, ScanDiagnostics.Empty, new ScanOptions());
     }
+
+    private static DiskScanOperation FromTask(Task<DiskScanResult> task, CancellationToken token) =>
+        new(task.WaitAsync(token), task, new TaskCompletionSource<Exception>().Task);
 
     private static Task RunOnStaAsync(Func<Task> action)
     {

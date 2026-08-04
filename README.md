@@ -17,6 +17,7 @@ Disk Inventory Zed visualizes disk usage with interactive sunbursts, treemaps, a
 - **Interactive Treemap Visualization** — Squarified treemap algorithm for optimal space usage visualization
 - **Fast Concurrent Scanning** — Uses Swift concurrency for parallel directory traversal
 - **Crash-Safe Scan Snapshots** — Bounded workers build an immutable tree before SwiftUI sees it
+- **Bounded Windows Scans** — Windows fails closed at one million retained entries instead of risking unbounded memory growth
 - **Three Visualizations** — Treemap, hierarchical sunburst, and detailed list views
 - **Smart Sorting** — Sort by name or size (ascending/descending)
 - **Bounded File Actions** — Reveal items in Finder or File Explorer; macOS also supports confirmed moves to Trash, while Windows performs no deletion
@@ -33,6 +34,7 @@ Disk Inventory Zed visualizes disk usage with interactive sunbursts, treemaps, a
 - **Global Search** — Debounced indexed search by file name or path without blocking the interface
 - **Portable Exports** — Versioned JSON and streaming CSV with reliability metadata
 - **Deep-Tree Safety** — Iterative tree building, navigation, and export avoid recursion overflow
+- **Private Local Diagnostics** — Windows keeps a small local crash journal with no telemetry, scanned paths, filenames, or exception messages
 
 ## Requirements
 
@@ -46,7 +48,7 @@ Disk Inventory Zed visualizes disk usage with interactive sunbursts, treemaps, a
 
 - Windows 10 22H2 or Windows 11
 - x64 or ARM64
-- .NET 8.0.423 SDK and Visual Studio 2022 .NET desktop workload (only when building from source)
+- .NET 10.0.302 SDK and Visual Studio 2026 .NET desktop workload (only when building from source)
 
 ## Building
 
@@ -141,7 +143,7 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 ## Architecture
 
 - **SwiftUI** — Modern declarative UI framework
-- **WPF on .NET 8** — Native Windows desktop UI with custom-drawn sunburst and treemap controls
+- **WPF on .NET 10 LTS** — Native Windows desktop UI with custom-drawn sunburst and treemap controls
 - **Swift Concurrency** — A bounded actor-backed work queue with cooperative cancellation
 - **Windows File IDs** — ReFS/NTFS 128-bit identity for cycle protection and hard-link accounting
 - **Immutable Snapshots** — Background workers never mutate data already published to either UI
@@ -172,23 +174,35 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 - Automation re-resolves the remote tag immediately before draft mutation and publication, and aborts
   if it no longer points to the commit that produced the artifacts.
 - Tagged macOS artifacts require Developer ID signing and successful Apple notarization and stapling.
-- Tagged builds fail closed unless all `APPLE_SIGNING_*`, `APPLE_KEYCHAIN_PASSWORD`, `APPLE_ID`,
-  `APPLE_TEAM_ID`, and `APPLE_APP_PASSWORD` Actions secrets are configured.
-- The publication job targets the `release` environment; configure required reviewers on that
-  environment before enabling tagged releases.
-- CI creates a draft release, downloads every uploaded asset, verifies the platform checksums, and only
-  then publishes the same release and asset identities it verified. Published releases are never
-  overwritten; a failed workflow may resume only a draft carrying that same workflow run's ownership
-  marker, while an already-published rerun fails explicitly.
+- Tagged Windows artifacts require allowlisted Authenticode publisher identity, SHA-256 signing, and a
+  trusted RFC 3161 timestamp. Every shipped PE file must carry a valid embedded signature.
+- GitHub artifact attestations bind each signed DMG and Windows zip to the release workflow and source
+  commit. Verify a download with `gh attestation verify <file> --repo neuralnexus/DiskInventoryZed`.
+- The approval-gated publication job creates a draft, downloads every uploaded asset, verifies local and
+  server SHA-256 digests, and publishes that same identity immediately. It refuses existing published
+  releases and drafts not owned by the current workflow run.
+- Production tags fail closed unless immutable releases are enabled and both `release-signing` and
+  `release-publish` environments require reviewers, prevent self-review and administrator bypass, and
+  permit only `v*` tags.
+- `release-publish` also requires a fine-grained `RELEASE_SETTINGS_TOKEN` secret scoped only to this
+  repository with **Administration: read-only** permission so the workflow can verify immutability before
+  creating a draft. Artifact publication continues to use the short-lived `GITHUB_TOKEN`.
+- Apple credentials belong only in `release-signing`: `APPLE_SIGNING_CERTIFICATE_BASE64`,
+  `APPLE_SIGNING_CERTIFICATE_PASSWORD`, `APPLE_KEYCHAIN_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`,
+  `APPLE_TEAM_ID`, and `APPLE_APP_PASSWORD`.
+- Windows credentials belong only in `release-signing`: `WINDOWS_SIGNING_CERTIFICATE_BASE64` and
+  `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`; allowlist `WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT`,
+  `WINDOWS_SIGNING_PUBLISHER_SUBJECT`, and the HTTPS `WINDOWS_TIMESTAMP_URL` as environment variables.
 - The standard-library validator in `scripts/release_integrity.py` is unit-tested on every workflow run
   and rejects malformed manifests, prereleases, ownership changes, and release/asset identity changes.
 - GitHub's legacy version/date selection determines the **Latest** release, so publishing an older
   maintenance tag does not unconditionally displace a newer release.
-- Protect `v*` tags from update/deletion and enable GitHub immutable releases before production use;
-  workflow checks narrow races but cannot make separate GitHub API calls transactional.
+- Protect `v*` tags with an active tag ruleset whose only include is `refs/tags/v*`, whose exclusion list
+  is empty, and whose rules prohibit updates and deletion; configure no bypass actors. GitHub API
+  verification and publication are separate operations, so this ruleset remains part of the security boundary.
 - Windows dependencies are restored from committed lock files with the repository-pinned .NET SDK.
-- Windows release zips are currently unsigned and include the .NET license and third-party notices;
-  users should verify the published SHA-256 checksums before running them.
+- Windows release zips use a versioned top-level directory and include exact payload checksums,
+  source/package metadata, the GPL, the .NET license, and third-party notices.
 
 ## License
 

@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 using System.Threading.Channels;
 using DiskInventoryZed.Core.Models;
 
@@ -9,7 +10,8 @@ internal delegate FileMetadata FileMetadataReader(
     string path,
     bool isDirectory,
     bool isReparsePoint,
-    long logicalSize);
+    long logicalSize,
+    bool followReparsePoints);
 
 /// <summary>A fixed-worker, cancellable scanner that publishes only a completed immutable tree.</summary>
 public sealed class DiskScanner
@@ -46,7 +48,54 @@ public sealed class DiskScanner
         IProgress<ScanProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
+        var operation = StartScan(path, options, progress, cancellationToken);
+        _ = operation.Result.ContinueWith(
+            static result => _ = result.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+        return await operation.Completion.ConfigureAwait(false);
+    }
+
+    public DiskScanOperation StartScan(
+        string path,
+        ScanOptions? options = null,
+        IProgress<ScanProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        var fatalError = new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completion = Task.Run(
+            () => ScanCoreAsync(path, options, progress, cancellationToken, fatalError),
+            CancellationToken.None);
+        var result = AwaitResultAsync(completion, fatalError.Task, cancellationToken);
+        return new DiskScanOperation(result, completion, fatalError.Task);
+    }
+
+    private static async Task<DiskScanResult> AwaitResultAsync(
+        Task<DiskScanResult> completion,
+        Task<Exception> fatalError,
+        CancellationToken cancellationToken)
+    {
+        var completed = await Task.WhenAny(completion, fatalError).WaitAsync(cancellationToken);
+        if (ReferenceEquals(completed, fatalError))
+        {
+            throw await fatalError;
+        }
+        return await completion.WaitAsync(cancellationToken);
+    }
+
+    private async Task<DiskScanResult> ScanCoreAsync(
+        string path,
+        ScanOptions? options,
+        IProgress<ScanProgress>? progress,
+        CancellationToken cancellationToken,
+        TaskCompletionSource<Exception> fatalErrorSignal)
+    {
         options ??= new ScanOptions();
+        if (options.MaximumEntries <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "The scan entry limit must be greater than zero.");
+        }
         if (!Path.IsPathFullyQualified(path))
         {
             throw new DiskScanException("Enter a fully qualified drive or UNC path.");
@@ -84,7 +133,8 @@ public sealed class DiskScanner
             rootPath,
             true,
             rootAttributes.HasFlag(FileAttributes.ReparsePoint),
-            0);
+            0,
+            options.FollowReparsePoints);
         if (rootMetadata.ReparsePointClassification == ReparsePointClassification.Unknown)
         {
             throw new DiskScanException("The selected root is an unrecognized reparse point and cannot be scanned safely.");
@@ -121,6 +171,8 @@ public sealed class DiskScanner
             state.VisitedDirectories.TryAdd(rootIdentity, rootPath);
         }
 
+        using var scanCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var scanToken = scanCancellation.Token;
         var channel = Channel.CreateUnbounded<WorkItem>(new UnboundedChannelOptions
         {
             AllowSynchronousContinuations = false,
@@ -128,38 +180,67 @@ public sealed class DiskScanner
             SingleWriter = false
         });
         var outstanding = 1;
-        await channel.Writer.WriteAsync(new WorkItem(rootPath, rootRecord), cancellationToken);
+        await channel.Writer.WriteAsync(new WorkItem(rootPath, rootRecord), scanToken);
 
         var workerCount = IsNetworkRoot(rootPath) ? 2 : Math.Clamp(Environment.ProcessorCount, 2, 8);
+        Exception? fatalError = null;
         var workers = Enumerable.Range(0, workerCount).Select(_ => Task.Run(async () =>
         {
-            await foreach (var work in channel.Reader.ReadAllAsync(cancellationToken))
+            try
             {
-                try
+                await foreach (var work in channel.Reader.ReadAllAsync(scanToken))
                 {
-                    await ProcessDirectoryAsync(
-                        work,
-                        state,
-                        channel.Writer,
-                        () => Interlocked.Increment(ref outstanding),
-                        () => Interlocked.Decrement(ref outstanding),
-                        cancellationToken);
-                }
-                finally
-                {
-                    if (Interlocked.Decrement(ref outstanding) == 0)
+                    try
                     {
-                        channel.Writer.TryComplete();
+                        await ProcessDirectoryAsync(
+                            work,
+                            state,
+                            channel.Writer,
+                            () => Interlocked.Increment(ref outstanding),
+                            () => Interlocked.Decrement(ref outstanding),
+                            scanToken);
+                    }
+                    finally
+                    {
+                        if (Interlocked.Decrement(ref outstanding) == 0)
+                        {
+                            channel.Writer.TryComplete();
+                        }
                     }
                 }
             }
-        }, cancellationToken)).ToArray();
+            catch (Exception error)
+            {
+                if (error is not OperationCanceledException)
+                {
+                    if (Interlocked.CompareExchange(ref fatalError, error, null) is null)
+                    {
+                        fatalErrorSignal.TrySetResult(error);
+                    }
+                }
+                scanCancellation.Cancel();
+                channel.Writer.TryComplete(error);
+                throw;
+            }
+        }, CancellationToken.None)).ToArray();
 
-        using var reporterCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using var reporterCancellation = CancellationTokenSource.CreateLinkedTokenSource(scanToken);
         var reporter = ReportProgressAsync(state, reporterCancellation.Token);
         try
         {
-            await Task.WhenAll(workers);
+            try
+            {
+                await Task.WhenAll(workers);
+            }
+            catch
+            {
+                if (Volatile.Read(ref fatalError) is { } fatal)
+                {
+                    ExceptionDispatchInfo.Capture(fatal).Throw();
+                }
+                cancellationToken.ThrowIfCancellationRequested();
+                throw;
+            }
         }
         finally
         {
@@ -229,6 +310,7 @@ public sealed class DiskScanner
                 }
                 catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Security.SecurityException)
                 {
+                    state.ReserveRecord();
                     var inaccessible = ScanRecord.Inaccessible(childPath, error.Message);
                     state.Records[childPath] = inaccessible;
                     childPaths.Add(childPath);
@@ -253,10 +335,18 @@ public sealed class DiskScanner
                     continue;
                 }
 
-                var apparentLogicalSize = isDirectory ? 0 : TryGetLogicalSize(childPath);
-                var metadata = state.ReadMetadata(childPath, isDirectory, isReparsePoint, apparentLogicalSize);
+                state.ReserveRecord();
+                var apparentLogicalSize = isDirectory || isReparsePoint || OperatingSystem.IsWindows()
+                    ? 0
+                    : TryGetLogicalSize(childPath);
+                var metadata = state.ReadMetadata(
+                    childPath,
+                    isDirectory,
+                    isReparsePoint,
+                    apparentLogicalSize,
+                    state.Options.FollowReparsePoints);
                 var isLink = metadata.ReparsePointClassification == ReparsePointClassification.NameSurrogate;
-                var isUnknownReparse = isReparsePoint &&
+                var isUnknownReparse =
                     metadata.ReparsePointClassification == ReparsePointClassification.Unknown;
                 var shouldTraverse = isDirectory && !isUnknownReparse &&
                     (!isLink || state.Options.FollowReparsePoints);
@@ -274,8 +364,8 @@ public sealed class DiskScanner
                         : isDirectory ? FileNodeKind.Directory : FileNodeKind.File,
                     logicalSize,
                     isDirectory || isLink || isUnknownReparse ? 0 : metadata.AllocatedSize,
-                    metadata.CreationDate ?? TryGetCreationTime(childPath),
-                    metadata.ModificationDate ?? TryGetModificationTime(childPath),
+                    metadata.CreationDate ?? (isLink || isUnknownReparse ? null : TryGetCreationTime(childPath)),
+                    metadata.ModificationDate ?? (isLink || isUnknownReparse ? null : TryGetModificationTime(childPath)),
                     isLink || isUnknownReparse,
                     metadata.Identity,
                     metadata.HardLinkCount);
@@ -351,7 +441,9 @@ public sealed class DiskScanner
         {
             throw;
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        catch (Exception error) when (
+            error is not DiskScanException &&
+            error is IOException or UnauthorizedAccessException or System.Security.SecurityException)
         {
             work.Record.Issue = error.Message;
             work.Record.EnumerationFailed = true;
@@ -572,6 +664,15 @@ public sealed class DiskScanner
         public string CurrentPath;
         public int FileCount;
         public int DirectoryCount;
+        private int _retainedEntries = 1;
+
+        public void ReserveRecord()
+        {
+            if (Interlocked.Increment(ref _retainedEntries) > Options.MaximumEntries)
+            {
+                throw new DiskScanLimitExceededException(Options.MaximumEntries);
+            }
+        }
 
         public ScanRecord CreateRootRecord(bool isSymbolicLink, FileMetadata metadata)
         {

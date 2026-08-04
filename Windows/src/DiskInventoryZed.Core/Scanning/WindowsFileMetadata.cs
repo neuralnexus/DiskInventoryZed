@@ -28,11 +28,11 @@ internal readonly record struct FileMetadata(
 internal static partial class WindowsFileMetadata
 {
     private const uint FileReadAttributes = 0x0080;
-    private const uint FileListDirectory = 0x0001;
+    private const uint FileReadData = 0x0001;
+    private const uint FileListDirectory = FileReadData;
     private const uint GenericRead = 0x80000000;
     private const uint FileShareRead = 0x00000001;
     private const uint FileShareWrite = 0x00000002;
-    private const uint FileShareDelete = 0x00000004;
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileFlagOpenReparsePoint = 0x00200000;
@@ -56,7 +56,8 @@ internal static partial class WindowsFileMetadata
         string path,
         bool isDirectory,
         bool isReparsePoint,
-        long logicalSize)
+        long logicalSize,
+        bool followReparsePoints)
     {
         if (!OperatingSystem.IsWindows())
         {
@@ -75,10 +76,40 @@ internal static partial class WindowsFileMetadata
         }
 
         var nativePath = ToExtendedPath(path);
-        var reparseClassification = isReparsePoint
-            ? ReadReparsePointClassification(nativePath, isDirectory)
-            : ReparsePointClassification.NotReparsePoint;
-        if (reparseClassification == ReparsePointClassification.Unknown)
+        using var entryHandle = CreateFileW(
+            nativePath,
+            FileReadAttributes,
+            FileShareRead | FileShareWrite,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagOpenReparsePoint | (isDirectory ? FileFlagBackupSemantics : 0),
+            IntPtr.Zero);
+        if (entryHandle.IsInvalid ||
+            !GetFileAttributeTagInformationByHandle(
+                entryHandle,
+                FileAttributeTagInfoClass,
+                out var tagInformation,
+                (uint)sizeof(FileAttributeTagInfo)))
+        {
+            return new FileMetadata(
+                0,
+                0,
+                null,
+                1,
+                false,
+                null,
+                null,
+                ReparsePointClassification.Unknown,
+                true);
+        }
+
+        var actualIsDirectory = (tagInformation.FileAttributes & FileAttributeDirectory) != 0;
+        var reparseClassification = (tagInformation.FileAttributes & FileAttributeReparsePoint) == 0
+            ? ReparsePointClassification.NotReparsePoint
+            : (tagInformation.ReparseTag & IoReparseTagNameSurrogate) != 0
+                ? ReparsePointClassification.NameSurrogate
+                : ReparsePointClassification.Other;
+        if (reparseClassification == ReparsePointClassification.NameSurrogate && !followReparsePoints)
         {
             return new FileMetadata(
                 0,
@@ -92,83 +123,121 @@ internal static partial class WindowsFileMetadata
                 false);
         }
 
-        using var handle = CreateFileW(
-            nativePath,
-            FileReadAttributes,
-            FileShareRead | FileShareWrite | FileShareDelete,
-            IntPtr.Zero,
-            OpenExisting,
-            isDirectory ? FileFlagBackupSemantics : 0,
-            IntPtr.Zero);
-        if (handle.IsInvalid)
+        SafeFileHandle? targetHandle = null;
+        try
         {
+            var metadataHandle = entryHandle;
+            if (reparseClassification == ReparsePointClassification.NameSurrogate)
+            {
+                targetHandle = CreateFileW(
+                    nativePath,
+                    FileReadAttributes,
+                    FileShareRead | FileShareWrite,
+                    IntPtr.Zero,
+                    OpenExisting,
+                    actualIsDirectory ? FileFlagBackupSemantics : 0,
+                    IntPtr.Zero);
+                if (targetHandle.IsInvalid)
+                {
+                    return new FileMetadata(
+                        0,
+                        0,
+                        null,
+                        1,
+                        false,
+                        null,
+                        null,
+                        reparseClassification,
+                        true);
+                }
+                metadataHandle = targetHandle;
+            }
+
+            var hasStandardInfo = GetFileStandardInformationByHandle(
+                metadataHandle,
+                FileStandardInfoClass,
+                out var standardInformation,
+                (uint)sizeof(FileStandardInfo));
+            var hasLegacyInformation = GetFileInformationByHandle(
+                metadataHandle,
+                out var legacyInformation);
+            var legacyLogicalSize = hasLegacyInformation && !actualIsDirectory
+                ? (long)Math.Min(
+                    (ulong)long.MaxValue,
+                    ((ulong)legacyInformation.FileSizeHigh << 32) | legacyInformation.FileSizeLow)
+                : logicalSize;
+            var measuredLogicalSize = hasStandardInfo && !actualIsDirectory
+                ? Math.Max(0, standardInformation.EndOfFile)
+                : legacyLogicalSize;
+            var measuredAllocatedSize = hasStandardInfo && !actualIsDirectory
+                ? Math.Max(0, standardInformation.AllocationSize)
+                : actualIsDirectory ? 0 : legacyLogicalSize;
+
+            DateTimeOffset? creationDate = null;
+            DateTimeOffset? modificationDate = null;
+            if (GetFileBasicInformationByHandle(
+                    metadataHandle,
+                    FileBasicInfoClass,
+                    out var basicInformation,
+                    (uint)sizeof(FileBasicInfo)))
+            {
+                creationDate = FromFileTime(basicInformation.CreationTime);
+                modificationDate = FromFileTime(basicInformation.LastWriteTime);
+            }
+
+            FileIdentity? identity = TryReadIdentity(metadataHandle, out var measuredIdentity)
+                ? measuredIdentity
+                : null;
+            var hardLinkCount = hasStandardInfo
+                ? standardInformation.NumberOfLinks
+                : hasLegacyInformation
+                    ? legacyInformation.NumberOfLinks
+                    : 1;
             return new FileMetadata(
-                logicalSize,
-                logicalSize,
-                null,
-                1,
-                true,
-                null,
-                null,
+                measuredLogicalSize,
+                measuredAllocatedSize,
+                identity,
+                hardLinkCount,
+                !hasStandardInfo,
+                creationDate,
+                modificationDate,
                 reparseClassification,
-                true);
+                false);
         }
-
-        var hasStandardInfo = GetFileStandardInformationByHandle(
-            handle,
-            FileStandardInfoClass,
-            out var standardInformation,
-            (uint)sizeof(FileStandardInfo));
-        var measuredLogicalSize = hasStandardInfo && !isDirectory
-            ? Math.Max(0, standardInformation.EndOfFile)
-            : logicalSize;
-        var measuredAllocatedSize = hasStandardInfo && !isDirectory
-            ? Math.Max(0, standardInformation.AllocationSize)
-            : isDirectory ? 0 : logicalSize;
-
-        DateTimeOffset? creationDate = null;
-        DateTimeOffset? modificationDate = null;
-        if (GetFileBasicInformationByHandle(
-                handle,
-                FileBasicInfoClass,
-                out var basicInformation,
-                (uint)sizeof(FileBasicInfo)))
+        finally
         {
-            creationDate = FromFileTime(basicInformation.CreationTime);
-            modificationDate = FromFileTime(basicInformation.LastWriteTime);
+            targetHandle?.Dispose();
         }
-
-        FileIdentity? identity = null;
-        if (GetFileIdInformationByHandle(
-                handle,
-                FileIdInfoClass,
-                out var idInformation,
-                (uint)sizeof(FileIdInfo)) &&
-            idInformation.VolumeSerialNumber != 0 &&
-            idInformation.FileId != Guid.Empty)
-        {
-            identity = new FileIdentity(idInformation.VolumeSerialNumber, idInformation.FileId);
-        }
-
-        var hardLinkCount = hasStandardInfo
-            ? standardInformation.NumberOfLinks
-            : GetFileInformationByHandle(handle, out var information) ? information.NumberOfLinks : 1;
-        return new FileMetadata(
-            measuredLogicalSize,
-            measuredAllocatedSize,
-            identity,
-            hardLinkCount,
-            !hasStandardInfo,
-            creationDate,
-            modificationDate,
-            reparseClassification,
-            false);
     }
 
     internal static unsafe FileStream OpenLocallyAvailableRead(string path, int bufferSize)
     {
+        var nativePath = ToExtendedPath(path);
+        using var entryHandle = CreateFileW(
+            nativePath,
+            FileReadData | FileReadAttributes,
+            FileShareRead,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagOpenReparsePoint | FileFlagOpenNoRecall,
+            IntPtr.Zero);
+        if (entryHandle.IsInvalid)
+        {
+            throw NativeIOException("The file entry could not be locked for safe verification.");
+        }
+        if (!GetFileAttributeTagInformationByHandle(
+                entryHandle,
+                FileAttributeTagInfoClass,
+                out var entryTagInformation,
+                (uint)sizeof(FileAttributeTagInfo)) ||
+            (entryTagInformation.ReparseTag & IoReparseTagNameSurrogate) != 0 ||
+            !TryReadIdentity(entryHandle, out var entryIdentity))
+        {
+            throw new IOException("Only stable, locally available regular file entries can be verified.");
+        }
+
         var handle = CreateFileW(
-            ToExtendedPath(path),
+            nativePath,
             GenericRead,
             FileShareRead,
             IntPtr.Zero,
@@ -197,7 +266,9 @@ internal static partial class WindowsFileMetadata
                 tagInformation.FileAttributes,
                 tagInformation.ReparseTag);
             if ((tagInformation.ReparseTag & IoReparseTagNameSurrogate) != 0 ||
-                !IsLocallyAvailableRegularFile(tagInformation.FileAttributes, placeholderState))
+                !IsLocallyAvailableRegularFile(tagInformation.FileAttributes, placeholderState) ||
+                !TryReadIdentity(handle, out var openedIdentity) ||
+                openedIdentity != entryIdentity)
             {
                 throw new IOException("Only locally available regular files can be verified.");
             }
@@ -295,33 +366,6 @@ internal static partial class WindowsFileMetadata
         }
     }
 
-    private static unsafe ReparsePointClassification ReadReparsePointClassification(
-        string path,
-        bool isDirectory)
-    {
-        using var handle = CreateFileW(
-            path,
-            0,
-            FileShareRead | FileShareWrite | FileShareDelete,
-            IntPtr.Zero,
-            OpenExisting,
-            FileFlagOpenReparsePoint | (isDirectory ? FileFlagBackupSemantics : 0),
-            IntPtr.Zero);
-        if (handle.IsInvalid ||
-            !GetFileAttributeTagInformationByHandle(
-                handle,
-                FileAttributeTagInfoClass,
-                out var tagInformation,
-                (uint)sizeof(FileAttributeTagInfo)))
-        {
-            return ReparsePointClassification.Unknown;
-        }
-
-        return (tagInformation.ReparseTag & IoReparseTagNameSurrogate) != 0
-            ? ReparsePointClassification.NameSurrogate
-            : ReparsePointClassification.Other;
-    }
-
     private static DateTimeOffset? FromFileTime(long value)
     {
         if (value <= 0)
@@ -337,6 +381,24 @@ internal static partial class WindowsFileMetadata
         {
             return null;
         }
+    }
+
+    private static unsafe bool TryReadIdentity(SafeFileHandle handle, out FileIdentity identity)
+    {
+        if (GetFileIdInformationByHandle(
+                handle,
+                FileIdInfoClass,
+                out var information,
+                (uint)sizeof(FileIdInfo)) &&
+            information.VolumeSerialNumber != 0 &&
+            information.FileId != Guid.Empty)
+        {
+            identity = new FileIdentity(information.VolumeSerialNumber, information.FileId);
+            return true;
+        }
+
+        identity = default;
+        return false;
     }
 
     private static string ToExtendedPath(string path)

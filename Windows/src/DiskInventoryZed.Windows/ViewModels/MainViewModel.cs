@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.IO;
+using System.Runtime.InteropServices;
 using DiskInventoryZed.Core.Analysis;
 using DiskInventoryZed.Core.Models;
 using DiskInventoryZed.Core.Scanning;
@@ -120,6 +121,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ObservableCollection<LocationItem> Drives { get; } = [];
     public IReadOnlyList<Choice<long>> MinimumSizeOptions { get; }
     public IReadOnlyList<Choice<FileSortOrder>> SortOptions { get; }
+    public string ProductIdentity
+    {
+        get
+        {
+            var version = typeof(MainViewModel).Assembly.GetName().Version;
+            var productVersion = version is null
+                ? "unknown"
+                : $"{version.Major}.{version.Minor}.{version.Build}";
+            return $"v{productVersion} | {RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant()} | no telemetry";
+        }
+    }
 
     public FileNode? RootNode
     {
@@ -456,13 +468,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         try
         {
             var options = new ScanOptions(SkipDeveloperFolders, ShowHiddenFiles, FollowReparsePoints);
-            var scanTask = Task.Run(
-                () => _services.ScanAsync(path, options, progress, cancellation.Token),
-                CancellationToken.None);
-            TrackScanWorker(scanTask);
-            backgroundOperation = scanTask;
-            ObserveFault(scanTask);
-            var result = await scanTask.WaitAsync(cancellation.Token);
+            var scanOperation = _services.StartScan(path, options, progress, cancellation.Token);
+            TrackScanWorker(scanOperation.Completion);
+            backgroundOperation = scanOperation.Completion;
+            ObserveFault(scanOperation.Completion);
+            var result = await scanOperation.Result;
             cancellation.Token.ThrowIfCancellationRequested();
             IsAnalyzing = true;
             ScanProgressText = "Building file type and duplicate indexes...";
@@ -520,6 +530,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             if (!IsDisposed && ReferenceEquals(_scanCancellation, cancellation))
             {
+                App.RecordDiagnostic("scan-failed", error);
                 PathText = previousPath;
                 ScanStatusPath = previousPath;
                 RaiseError(error.Message);
@@ -1119,7 +1130,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private static void ObserveFault(Task task) =>
         _ = task.ContinueWith(
-            completed => _ = completed.Exception,
+            completed => App.RecordDiagnostic(
+                "background-operation-fault",
+                completed.Exception?.GetBaseException()),
             CancellationToken.None,
             TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);

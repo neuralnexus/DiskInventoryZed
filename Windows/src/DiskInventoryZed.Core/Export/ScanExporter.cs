@@ -129,6 +129,7 @@ public static partial class ScanExporter
         writer.WriteBoolean("skipDeveloperFolders", options.SkipDeveloperFolders);
         writer.WriteBoolean("showHiddenFiles", options.ShowHiddenFiles);
         writer.WriteBoolean("followReparsePoints", options.FollowReparsePoints);
+        writer.WriteNumber("maximumEntries", options.MaximumEntries);
         writer.WriteEndObject();
     }
 

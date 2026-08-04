@@ -501,7 +501,7 @@
         <Border Grid.Row="3" Background="#0E141B" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0">
             <Grid Margin="10,0">
                 <TextBlock Text="{Binding StatusText}" Foreground="{StaticResource SecondaryText}" FontSize="10" VerticalAlignment="Center" />
-                <TextBlock Text="Sunburst first • Heatmap second • no telemetry" Foreground="#607080" FontSize="9" HorizontalAlignment="Right" VerticalAlignment="Center" />
+                <TextBlock Text="{Binding ProductIdentity}" Foreground="#607080" FontSize="9" HorizontalAlignment="Right" VerticalAlignment="Center" />
             </Grid>
         </Border>
     </Grid>

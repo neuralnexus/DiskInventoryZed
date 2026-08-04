@@ -10,6 +10,18 @@ namespace DiskInventoryZed.Windows.Tests;
 public sealed class MainViewModelReliabilityTests
 {
     [Fact]
+    public void ProductIdentityExposesVersionArchitectureAndPrivacyContract()
+    {
+        using var viewModel = new MainViewModel(Services());
+
+        Assert.Contains("v1.2.0", viewModel.ProductIdentity, StringComparison.Ordinal);
+        Assert.Contains("no telemetry", viewModel.ProductIdentity, StringComparison.Ordinal);
+        Assert.Contains(System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture.ToString(),
+            viewModel.ProductIdentity,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task CancelReleasesUiBeforeBlockedScannerReturnsAndLateResultCannotPublish()
     {
         var scanner = new TaskCompletionSource<DiskScanResult>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -363,7 +375,7 @@ public sealed class MainViewModelReliabilityTests
                 var result = await verifier.Task;
                 returned.TrySetResult();
                 return result;
-        }));
+            }));
         await viewModel.ScanAsync("C:\\root");
         await viewModel.WaitForFilterAsync().WaitAsync(TimeSpan.FromSeconds(2));
         var originalStatus = viewModel.VerificationStatus;
@@ -499,13 +511,19 @@ public sealed class MainViewModelReliabilityTests
         Func<IReadOnlyList<DuplicateCandidate>, IProgress<DuplicateVerificationProgress>?, CancellationToken, Task<DuplicateVerificationResult>>? verifyAsync = null,
         Func<FileNode, ScanAnalysis?, string, string?, long, FileSortOrder, CancellationToken, VisibleItemsResult>? filter = null) =>
         new(
-            scanAsync ?? ((_, _, _, _) => Task.FromResult(Result(Root("root")))),
+            (path, options, progress, token) => FromTask(
+                (scanAsync ?? ((_, _, _, _) => Task.FromResult(Result(Root("root")))))
+                    (path, options, progress, token),
+                token),
             analyzeAsync ?? ((root, token) => Task.FromResult(ScanAnalyzer.Analyze(root, token))),
             verifyAsync ?? ((_, _, _) => Task.FromResult(new DuplicateVerificationResult([], [], 0))),
             filter ?? VisibleItemsFilter.Apply,
             (_, _) => Task.CompletedTask,
             () => new AppSettings(),
             _ => { });
+
+    private static DiskScanOperation FromTask(Task<DiskScanResult> task, CancellationToken token) =>
+        new(task.WaitAsync(token), task, new TaskCompletionSource<Exception>().Task);
 
     private static DiskScanResult Result(FileNode root) =>
         new(

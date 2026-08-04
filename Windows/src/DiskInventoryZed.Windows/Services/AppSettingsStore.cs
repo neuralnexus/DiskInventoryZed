@@ -38,8 +38,9 @@ public sealed class AppSettingsStore
                 ? JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(_settingsPath), JsonOptions) ?? new AppSettings()
                 : new AppSettings();
         }
-        catch
+        catch (Exception error)
         {
+            App.RecordDiagnostic("settings-load-failed", error);
             return new AppSettings();
         }
     }
@@ -53,8 +54,9 @@ public sealed class AppSettingsStore
             File.WriteAllText(temporaryPath, JsonSerializer.Serialize(settings, JsonOptions));
             File.Move(temporaryPath, _settingsPath, true);
         }
-        catch
+        catch (Exception error)
         {
+            App.RecordDiagnostic("settings-save-failed", error);
             // Settings must never prevent scanning or closing the application.
         }
     }

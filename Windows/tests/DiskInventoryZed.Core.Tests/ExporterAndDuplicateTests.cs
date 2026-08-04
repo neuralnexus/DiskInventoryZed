@@ -39,6 +39,7 @@ public sealed class ExporterAndDuplicateTests
         Assert.True(jsonRoot.GetProperty("scanOptions").GetProperty("skipDeveloperFolders").GetBoolean());
         Assert.True(jsonRoot.GetProperty("scanOptions").GetProperty("showHiddenFiles").GetBoolean());
         Assert.False(jsonRoot.GetProperty("scanOptions").GetProperty("followReparsePoints").GetBoolean());
+        Assert.Equal(1_000_000, jsonRoot.GetProperty("scanOptions").GetProperty("maximumEntries").GetInt32());
         Assert.Equal("2026-07-31T20:33:00Z", jsonRoot.GetProperty("entries")[1].GetProperty("modificationDate").GetString());
     }
 

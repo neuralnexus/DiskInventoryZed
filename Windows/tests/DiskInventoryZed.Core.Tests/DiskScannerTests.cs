@@ -183,7 +183,7 @@ public sealed partial class DiskScannerTests
         using var fixture = new TemporaryDirectory();
         var path = Directory.CreateDirectory(Path.Combine(fixture.Path, "guarded")).FullName;
         var moved = Path.Combine(fixture.Path, "moved");
-        var identity = WindowsFileMetadata.Read(path, true, false, 0).Identity;
+        var identity = WindowsFileMetadata.Read(path, true, false, 0, false).Identity;
         Assert.NotNull(identity);
 
         using (WindowsFileMetadata.OpenDirectoryGuard(path, false, identity))
@@ -204,7 +204,7 @@ public sealed partial class DiskScannerTests
         var movedActual = Path.Combine(fixture.Path, "moved-actual");
         var junction = Path.Combine(fixture.Path, "junction");
         await CreateJunctionAsync(junction, actualPath);
-        var expectedIdentity = WindowsFileMetadata.Read(expectedPath, true, false, 0).Identity;
+        var expectedIdentity = WindowsFileMetadata.Read(expectedPath, true, false, 0, false).Identity;
         Assert.NotNull(expectedIdentity);
 
         Assert.Throws<IOException>(() =>
@@ -223,7 +223,7 @@ public sealed partial class DiskScannerTests
         var movedTarget = Path.Combine(fixture.Path, "moved-target");
         var junction = Path.Combine(fixture.Path, "junction");
         await CreateJunctionAsync(junction, target.FullName);
-        var metadata = WindowsFileMetadata.Read(junction, true, true, 0);
+        var metadata = WindowsFileMetadata.Read(junction, true, true, 0, true);
         Assert.NotNull(metadata.Identity);
 
         using (WindowsFileMetadata.OpenDirectoryGuard(junction, true, metadata.Identity))
@@ -235,6 +235,56 @@ public sealed partial class DiskScannerTests
         Directory.Delete(junction);
         Directory.Move(target.FullName, movedTarget);
         Assert.True(Directory.Exists(movedTarget));
+    }
+
+    [WindowsFact]
+    public async Task WindowsUnfollowedJunctionMetadataNeverReadsTheTargetIdentity()
+    {
+        using var fixture = new TemporaryDirectory();
+        var target = Directory.CreateDirectory(Path.Combine(fixture.Path, "target"));
+        var junction = Path.Combine(fixture.Path, "junction");
+        await CreateJunctionAsync(junction, target.FullName);
+
+        var unfollowed = WindowsFileMetadata.Read(junction, true, true, 0, false);
+        var followed = WindowsFileMetadata.Read(junction, true, true, 0, true);
+
+        Assert.Equal(ReparsePointClassification.NameSurrogate, unfollowed.ReparsePointClassification);
+        Assert.Null(unfollowed.Identity);
+        Assert.Equal(0, unfollowed.LogicalSize);
+        Assert.NotNull(followed.Identity);
+    }
+
+    [WindowsFact]
+    public void WindowsDuplicateReadRejectsAReplacementSymlink()
+    {
+        using var fixture = new TemporaryDirectory();
+        var target = Path.Combine(fixture.Path, "target.bin");
+        var link = Path.Combine(fixture.Path, "replacement.bin");
+        File.WriteAllBytes(target, [1, 2, 3]);
+        File.CreateSymbolicLink(link, target);
+
+        Assert.Throws<IOException>(() => DuplicateVerifier.OpenRead(link));
+    }
+
+    [WindowsFact]
+    public void WindowsMetadataUsesTheHandleWhenTheAttributeHintIsStale()
+    {
+        using var fixture = new TemporaryDirectory();
+        var target = Path.Combine(fixture.Path, "target.bin");
+        var link = Path.Combine(fixture.Path, "changed-after-attributes.bin");
+        File.WriteAllBytes(target, new byte[4096]);
+        File.CreateSymbolicLink(link, target);
+
+        var metadata = WindowsFileMetadata.Read(
+            link,
+            isDirectory: false,
+            isReparsePoint: false,
+            logicalSize: 4096,
+            followReparsePoints: false);
+
+        Assert.Equal(ReparsePointClassification.NameSurrogate, metadata.ReparsePointClassification);
+        Assert.Equal(0, metadata.LogicalSize);
+        Assert.Null(metadata.Identity);
     }
 
     private static async Task CreateJunctionAsync(string junction, string target)

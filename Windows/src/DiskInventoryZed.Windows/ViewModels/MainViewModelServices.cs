@@ -8,7 +8,7 @@ namespace DiskInventoryZed.Windows.ViewModels;
 internal sealed record VisibleItemsResult(IReadOnlyList<FileNode> Items, int Total);
 
 internal sealed record MainViewModelServices(
-    Func<string, ScanOptions, IProgress<ScanProgress>?, CancellationToken, Task<DiskScanResult>> ScanAsync,
+    Func<string, ScanOptions, IProgress<ScanProgress>?, CancellationToken, DiskScanOperation> StartScan,
     Func<FileNode, CancellationToken, Task<ScanAnalysis>> AnalyzeAsync,
     Func<IReadOnlyList<DuplicateCandidate>, IProgress<DuplicateVerificationProgress>?, CancellationToken, Task<DuplicateVerificationResult>> VerifyDuplicatesAsync,
     Func<FileNode, ScanAnalysis?, string, string?, long, FileSortOrder, CancellationToken, VisibleItemsResult> FilterVisibleItems,
@@ -21,7 +21,7 @@ internal sealed record MainViewModelServices(
         var settingsStore = new AppSettingsStore();
         return new MainViewModelServices(
             (path, options, progress, cancellationToken) =>
-                new DiskScanner().ScanAsync(path, options, progress, cancellationToken),
+                new DiskScanner().StartScan(path, options, progress, cancellationToken),
             (root, cancellationToken) =>
                 Task.FromResult(ScanAnalyzer.Analyze(root, cancellationToken)),
             DuplicateVerifier.VerifyAsync,

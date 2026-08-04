@@ -177,6 +177,41 @@ class ReleaseIntegrityTests(unittest.TestCase):
             with self.assertRaises(integrity.ReleaseIntegrityError):
                 integrity.release_identity(release, set(assets), self.tag, self.marker, True)
 
+    def test_release_identity_requires_trusted_metadata_and_immutable_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            assets = self.write_local_assets(Path(directory))
+            for change in (
+                {"name": "Unexpected title"},
+                {"author": {"login": "someone-else"}},
+                {"immutable": False},
+            ):
+                with self.subTest(change=change):
+                    release = self.rest_release(assets, draft=False)
+                    release.update(change)
+                    with self.assertRaises(integrity.ReleaseIntegrityError):
+                        integrity.release_identity(
+                            release, set(assets), self.tag, self.marker, False
+                        )
+
+            for asset_change in (
+                {"digest": "sha256:" + "0" * 64},
+                {"state": "new"},
+                {"uploader": {"login": "someone-else"}},
+            ):
+                with self.subTest(asset_change=asset_change):
+                    release = self.rest_release(assets, draft=True)
+                    release["assets"][0].update(asset_change)
+                    expected = {name: self.sha(path) for name, path in assets.items()}
+                    with self.assertRaises(integrity.ReleaseIntegrityError):
+                        integrity.release_identity(
+                            release,
+                            set(assets),
+                            self.tag,
+                            self.marker,
+                            True,
+                            expected,
+                        )
+
             release = self.rest_release(assets, draft=True)
             release["assets"].append(dict(release["assets"][0]))
             with self.assertRaises(integrity.ReleaseIntegrityError):
@@ -216,11 +251,21 @@ class ReleaseIntegrityTests(unittest.TestCase):
         return {
             "id": 42,
             "tag_name": self.tag,
+            "name": f"Disk Inventory Zed {self.version}",
             "body": self.marker,
             "draft": draft,
             "prerelease": False,
+            "immutable": not draft,
+            "author": {"login": "github-actions[bot]"},
             "assets": [
-                {"id": index + 100, "name": name, "size": path.stat().st_size}
+                {
+                    "id": index + 100,
+                    "name": name,
+                    "size": path.stat().st_size,
+                    "digest": f"sha256:{self.sha(path)}",
+                    "state": "uploaded",
+                    "uploader": {"login": "github-actions[bot]"},
+                }
                 for index, (name, path) in enumerate(assets.items())
             ],
         }

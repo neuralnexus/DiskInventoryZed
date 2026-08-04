@@ -11,3 +11,5 @@ Windows/**/obj/
 Windows/**/TestResults/
 Windows/.vs/
 artifacts/
+__pycache__/
+*.pyc

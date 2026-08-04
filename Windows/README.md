@@ -34,6 +34,8 @@ share.
 - Schema-v3 JSON snapshots compatible with the macOS application
 - Streaming CSV inventory export
 - Non-destructive File Explorer integration for opening and revealing items
+- A one-million-entry safety limit that fails closed before retained scan data can exhaust memory
+- Bounded, privacy-safe local crash diagnostics with no telemetry
 
 The Windows application does not delete, recycle, rename, or otherwise mutate scanned items. A scan
 is a point-in-time path snapshot; File Explorer actions resolve the current item at that path and are
@@ -45,9 +47,10 @@ disabled while a new snapshot is being built.
 - x64 or ARM64 processor
 - .NET is not required for release downloads; published builds are self-contained
 
-Release zips are currently not Authenticode-signed. Windows SmartScreen may therefore ask for
-confirmation on first launch. Verify the zip against the SHA-256 checksum published with the release.
-Each zip includes the GPL license plus the .NET runtime license and third-party notices.
+Official release executables and DLLs are Authenticode-signed and RFC 3161 timestamped. SmartScreen may
+still show a reputation warning for a new publisher or release. Verify the zip against the SHA-256
+checksum and GitHub artifact attestation published with the release. Each zip includes the GPL license,
+the .NET runtime license, third-party notices, package metadata, and an exact payload manifest.
 
 ## Run A Release
 
@@ -57,9 +60,27 @@ Each zip includes the GPL license plus the .NET runtime license and third-party 
 
 The portable zip does not install services, drivers, Explorer extensions, or telemetry.
 
+The archive has one versioned top-level folder. Keep its files together after extraction;
+`PACKAGE-MANIFEST.sha256` covers every payload file other than the manifest itself, and
+`PACKAGE-METADATA.json` records the version, runtime identifier, source commit, SDK, and signature policy.
+
+## Verify A Release
+
+Compare the downloaded zip with `DiskInventoryZed-Windows-checksums.txt` on the GitHub release, then verify
+its provenance with GitHub CLI:
+
+```powershell
+Get-FileHash .\DiskInventoryZed-Windows-v1.2.0-win-x64.zip -Algorithm SHA256
+gh attestation verify .\DiskInventoryZed-Windows-v1.2.0-win-x64.zip --repo neuralnexus/DiskInventoryZed
+```
+
+After extracting, `Get-AuthenticodeSignature` should report `Valid` for `DiskInventoryZed.exe`,
+`DiskInventoryZed.dll`, and `DiskInventoryZed.Core.dll`. The package manifest uses lowercase SHA-256
+followed by two spaces and a relative path so it can also be checked with standard SHA-256 tooling.
+
 ## Build From Source
 
-Install the .NET 8.0.423 SDK and Visual Studio 2022 with the **.NET desktop development** workload.
+Install the .NET 10.0.302 SDK and Visual Studio 2026 with the **.NET desktop development** workload.
 The repository-root `global.json` and committed NuGet lock files define the build toolchain.
 
 ```powershell
@@ -88,6 +109,10 @@ pwsh Windows\scripts\package.ps1 -Runtime win-arm64
 ```
 
 Artifacts are written to `artifacts\windows`.
+
+The script defaults to `-SignaturePolicy Unsigned` for local builds. CI exercises `Test` signing with an
+ephemeral trusted certificate; only the protected release workflow may use `Release`, an allowlisted
+production certificate, and an HTTPS RFC 3161 timestamp service.
 
 ## Keyboard Shortcuts
 
@@ -118,6 +143,35 @@ Artifacts are written to `artifacts\windows`.
 - Reparse points that cannot be classified safely are shown but not traversed.
 - A selected root that is a link or junction is rejected unless **Follow links and junctions** is
   enabled; a root whose reparse type or target identity is unknown is rejected.
+- A scan stops with an explicit error before retaining more than 1,000,000 entries. The previous completed
+  snapshot remains visible; choose a smaller root or enable developer-folder exclusions before retrying.
+
+## Diagnostics And Privacy
+
+Disk Inventory Zed sends no telemetry. It keeps a local support journal in
+`%LOCALAPPDATA%\DiskInventoryZed\diagnostics.jsonl` and at most one rotated
+`diagnostics.previous.jsonl`, each bounded to approximately 512 KiB. Session markers in the same folder
+allow the next launch to report an unclean exit without confusing another running instance for a crash.
+
+Entries contain only a UTC timestamp, event code, product version, process architecture, process ID,
+exception type, and HRESULT. Scanned paths, filenames, file contents, search text, exception messages,
+exports, and settings are never written to this journal or transmitted. Review the JSONL files before
+sharing them in a support report. Deleting the files while the app is closed is safe.
+
+## Production Release Setup
+
+Before creating a `v*` tag:
+
+1. Enable immutable releases and create an active tag ruleset with only `refs/tags/v*`, no exclusions or bypass actors, and update/deletion restrictions.
+2. Create `release-signing` and `release-publish` environments with required reviewers, self-review and administrator bypass disabled, and exactly one custom `v*` tag deployment policy.
+3. Store Apple and Windows signing credentials only in `release-signing`.
+4. Store a repository-scoped fine-grained `RELEASE_SETTINGS_TOKEN` with **Administration: read-only** only in `release-publish`.
+5. Confirm the Windows publisher subject, certificate thumbprint, and HTTPS timestamp URL environment variables match the production certificate.
+
+Signed artifacts are built before publication approval. After approval, one job verifies immutable-release
+configuration, creates and verifies the draft, and publishes it immediately to minimize the mutable-draft
+window. Separate GitHub API calls are not transactional, so protected tags and restricted repository write
+access remain required.
 
 ## Project Layout
 
