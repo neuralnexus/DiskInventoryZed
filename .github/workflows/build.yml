@@ -444,7 +444,8 @@ jobs:
 
       - name: Create ephemeral CI code-signing certificate
         id: ci-signing
-        shell: pwsh
+        shell: powershell
+        timeout-minutes: 2
         run: |
           $certificate = New-SelfSignedCertificate `
             -Type CodeSigningCert `
@@ -467,8 +468,10 @@ jobs:
               $store.Dispose()
             }
           }
-          "thumbprint=$($certificate.Thumbprint)" >> $env:GITHUB_OUTPUT
-          "subject=$($certificate.Subject)" >> $env:GITHUB_OUTPUT
+          "thumbprint=$($certificate.Thumbprint)" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "subject=$($certificate.Subject)" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Test-sign and package x64 and ARM64 applications
         shell: pwsh
@@ -533,7 +536,8 @@ jobs:
 
       - name: Import production Authenticode certificate
         id: production-signing
-        shell: pwsh
+        shell: powershell
+        timeout-minutes: 2
         env:
           CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
           CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
@@ -580,8 +584,10 @@ jobs:
           if ($certificate.Subject -cne $env:EXPECTED_PUBLISHER) {
             throw "The imported Windows signing certificate publisher is not allowlisted."
           }
-          "thumbprint=$($certificate.Thumbprint)" >> $env:GITHUB_OUTPUT
-          "subject=$($certificate.Subject)" >> $env:GITHUB_OUTPUT
+          "thumbprint=$($certificate.Thumbprint)" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "subject=$($certificate.Subject)" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Sign, timestamp, and package Windows releases
         shell: pwsh
