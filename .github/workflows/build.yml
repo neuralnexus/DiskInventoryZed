@@ -504,7 +504,7 @@ jobs:
 
             foreach ($storeName in @(
               [Security.Cryptography.X509Certificates.StoreName]::My,
-              [Security.Cryptography.X509Certificates.StoreName]::Root,
+              [Security.Cryptography.X509Certificates.StoreName]::TrustedPeople,
               [Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher
             )) {
               Write-Host "Adding the ephemeral certificate to CurrentUser/$storeName."
@@ -549,7 +549,7 @@ jobs:
             if (-not $installationComplete -and $null -ne $certificate) {
               if ($null -ne $publicCertificate) {
                 foreach ($storeName in @(
-                  [Security.Cryptography.X509Certificates.StoreName]::Root,
+                  [Security.Cryptography.X509Certificates.StoreName]::TrustedPeople,
                   [Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher
                 )) {
                   $store = [Security.Cryptography.X509Certificates.X509Store]::new(
@@ -650,7 +650,7 @@ jobs:
           $thumbprint = "${{ steps.ci-signing.outputs.thumbprint }}"
           $cleanupErrors = [System.Collections.Generic.List[string]]::new()
           $certificatePaths = @(
-            "Cert:/CurrentUser/Root/$thumbprint",
+            "Cert:/CurrentUser/TrustedPeople/$thumbprint",
             "Cert:/CurrentUser/TrustedPublisher/$thumbprint"
           )
           foreach ($path in $certificatePaths) {
