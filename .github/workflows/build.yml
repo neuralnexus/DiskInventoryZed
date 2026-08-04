@@ -444,34 +444,175 @@ jobs:
 
       - name: Create ephemeral CI code-signing certificate
         id: ci-signing
-        shell: powershell
+        shell: pwsh
         timeout-minutes: 2
         run: |
-          $certificate = New-SelfSignedCertificate `
-            -Type CodeSigningCert `
-            -Subject "CN=Disk Inventory Zed CI" `
-            -CertStoreLocation Cert:/CurrentUser/My `
-            -KeyAlgorithm RSA `
-            -KeyLength 3072 `
-            -HashAlgorithm SHA256 `
-            -KeyExportPolicy NonExportable `
-            -NotAfter ([DateTime]::UtcNow.AddDays(2))
-          foreach ($storeName in @("Root", "TrustedPublisher")) {
+          $subject = "CN=Disk Inventory Zed CI"
+          $certificateDirectory = Join-Path $env:RUNNER_TEMP "DiskInventoryZed-ci-signing"
+          $keyPath = Join-Path $certificateDirectory "signing.key"
+          $certificateFilePath = Join-Path $certificateDirectory "signing.cer"
+          $pfxPath = Join-Path $certificateDirectory "signing.pfx"
+          $passwordBytes = [byte[]]::new(32)
+          [Security.Cryptography.RandomNumberGenerator]::Fill($passwordBytes)
+          $password = [Convert]::ToBase64String($passwordBytes)
+          $certificate = $null
+          $publicCertificate = $null
+          $installationComplete = $false
+          New-Item $certificateDirectory -ItemType Directory -Force | Out-Null
+          try {
+            $openssl = (Get-Command openssl.exe -ErrorAction Stop).Source
+            Write-Host "Generating the ephemeral CI signing key."
+            & $openssl req -x509 -newkey rsa:2048 -sha256 `
+              -keyout $keyPath `
+              -out $certificateFilePath `
+              -days 2 `
+              -subj "/CN=Disk Inventory Zed CI" `
+              -passout "pass:$password" `
+              -addext "basicConstraints=critical,CA:FALSE" `
+              -addext "keyUsage=critical,digitalSignature" `
+              -addext "extendedKeyUsage=codeSigning"
+            if ($LASTEXITCODE -ne 0) {
+              throw "OpenSSL failed to create the CI signing certificate."
+            }
+
+            & $openssl pkcs12 -export `
+              -inkey $keyPath `
+              -in $certificateFilePath `
+              -out $pfxPath `
+              -name "Disk Inventory Zed CI" `
+              -passin "pass:$password" `
+              -passout "pass:$password"
+            if ($LASTEXITCODE -ne 0) {
+              throw "OpenSSL failed to package the CI signing certificate."
+            }
+
+            Write-Host "Loading the ephemeral key into the user certificate store."
+            $keyStorageFlags = (
+              [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::UserKeySet -bor
+              [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::PersistKeySet
+            )
+            $certificate = [Security.Cryptography.X509Certificates.X509CertificateLoader]::LoadPkcs12(
+              [IO.File]::ReadAllBytes($pfxPath),
+              $password,
+              $keyStorageFlags,
+              $null)
+            if (-not $certificate.HasPrivateKey -or $certificate.Subject -cne $subject) {
+              throw "The generated CI signing certificate is invalid."
+            }
+            $publicCertificate = [Security.Cryptography.X509Certificates.X509CertificateLoader]::LoadCertificate(
+              $certificate.RawData)
+
+            foreach ($storeName in @(
+              [Security.Cryptography.X509Certificates.StoreName]::My,
+              [Security.Cryptography.X509Certificates.StoreName]::Root,
+              [Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher
+            )) {
+              Write-Host "Adding the ephemeral certificate to CurrentUser/$storeName."
+              $store = [Security.Cryptography.X509Certificates.X509Store]::new(
+                $storeName,
+                [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+              $storeCertificate = $publicCertificate
+              if ($storeName -eq [Security.Cryptography.X509Certificates.StoreName]::My) {
+                $storeCertificate = $certificate
+              }
+              try {
+                $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                $store.Add($storeCertificate)
+              }
+              finally {
+                $store.Dispose()
+              }
+            }
+
             $store = [Security.Cryptography.X509Certificates.X509Store]::new(
-              $storeName,
+              [Security.Cryptography.X509Certificates.StoreName]::My,
               [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
             try {
-              $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-              $store.Add($certificate)
+              $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+              $storedCertificates = $store.Certificates.Find(
+                [Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
+                $certificate.Thumbprint,
+                $false)
+              if ($storedCertificates.Count -ne 1 -or -not $storedCertificates[0].HasPrivateKey) {
+                throw "The CI signing key was not persisted in the user certificate store."
+              }
             }
             finally {
               $store.Dispose()
             }
+
+            "thumbprint=$($certificate.Thumbprint)" >> $env:GITHUB_OUTPUT
+            "subject=$($certificate.Subject)" >> $env:GITHUB_OUTPUT
+            $installationComplete = $true
           }
-          "thumbprint=$($certificate.Thumbprint)" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "subject=$($certificate.Subject)" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          finally {
+            if (-not $installationComplete -and $null -ne $certificate) {
+              if ($null -ne $publicCertificate) {
+                foreach ($storeName in @(
+                  [Security.Cryptography.X509Certificates.StoreName]::Root,
+                  [Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher
+                )) {
+                  $store = [Security.Cryptography.X509Certificates.X509Store]::new(
+                    $storeName,
+                    [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+                  try {
+                    $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                    $store.Remove($publicCertificate)
+                  }
+                  catch {
+                    Write-Warning "Could not roll back CurrentUser/${storeName}: $($_.Exception.Message)"
+                  }
+                  finally {
+                    $store.Dispose()
+                  }
+                }
+              }
+              $myCertificatePath = "Cert:/CurrentUser/My/$($certificate.Thumbprint)"
+              $privateKeyDeleted = $false
+              try {
+                if (Test-Path -LiteralPath $myCertificatePath) {
+                  Remove-Item -LiteralPath $myCertificatePath -DeleteKey -Force -ErrorAction Stop
+                  $privateKeyDeleted = $true
+                }
+              }
+              catch {
+                Write-Warning "Could not roll back the CI signing key: $($_.Exception.Message)"
+              }
+              if (-not $privateKeyDeleted) {
+                $privateKey = $null
+                try {
+                  $privateKey = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey(
+                    $certificate)
+                  if ($privateKey -is [Security.Cryptography.RSACng]) {
+                    $privateKey.Key.Delete()
+                  }
+                  elseif ($privateKey -is [Security.Cryptography.RSACryptoServiceProvider]) {
+                    $privateKey.PersistKeyInCsp = $false
+                    $privateKey.Clear()
+                  }
+                  else {
+                    Write-Warning "The persisted CI signing key uses an unknown RSA provider."
+                  }
+                }
+                catch {
+                  Write-Warning "Could not delete the persisted CI signing key: $($_.Exception.Message)"
+                }
+                finally {
+                  if ($null -ne $privateKey) {
+                    $privateKey.Dispose()
+                  }
+                }
+              }
+            }
+            if ($null -ne $publicCertificate) {
+              $publicCertificate.Dispose()
+            }
+            if ($null -ne $certificate) {
+              $certificate.Dispose()
+            }
+            [Array]::Clear($passwordBytes, 0, $passwordBytes.Length)
+            Remove-Item $certificateDirectory -Recurse -Force -ErrorAction SilentlyContinue
+          }
 
       - name: Test-sign and package x64 and ARM64 applications
         shell: pwsh
@@ -507,8 +648,37 @@ jobs:
         shell: pwsh
         run: |
           $thumbprint = "${{ steps.ci-signing.outputs.thumbprint }}"
-          foreach ($storeName in @("My", "Root", "TrustedPublisher")) {
-            Remove-Item "Cert:/CurrentUser/$storeName/$thumbprint" -Force -ErrorAction SilentlyContinue
+          $cleanupErrors = [System.Collections.Generic.List[string]]::new()
+          $certificatePaths = @(
+            "Cert:/CurrentUser/Root/$thumbprint",
+            "Cert:/CurrentUser/TrustedPublisher/$thumbprint"
+          )
+          foreach ($path in $certificatePaths) {
+            try {
+              if (Test-Path -LiteralPath $path) {
+                Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+              }
+            }
+            catch {
+              [void]$cleanupErrors.Add("${path}: $($_.Exception.Message)")
+            }
+          }
+          $myCertificatePath = "Cert:/CurrentUser/My/$thumbprint"
+          try {
+            if (Test-Path -LiteralPath $myCertificatePath) {
+              Remove-Item -LiteralPath $myCertificatePath -DeleteKey -Force -ErrorAction Stop
+            }
+          }
+          catch {
+            [void]$cleanupErrors.Add("${myCertificatePath}: $($_.Exception.Message)")
+          }
+          foreach ($path in $certificatePaths + $myCertificatePath) {
+            if (Test-Path -LiteralPath $path) {
+              [void]$cleanupErrors.Add("Certificate remains in $path.")
+            }
+          }
+          if ($cleanupErrors.Count -ne 0) {
+            throw "Ephemeral certificate cleanup failed: $($cleanupErrors -join '; ')"
           }
 
   windows-signing:
@@ -565,29 +735,74 @@ jobs:
           }
           $certificatePath = Join-Path $env:RUNNER_TEMP "DiskInventoryZed-signing.pfx"
           [IO.File]::WriteAllBytes($certificatePath, $bytes)
-          $password = ConvertTo-SecureString $env:CERTIFICATE_PASSWORD -AsPlainText -Force
-          $certificates = @(Import-PfxCertificate `
-            -FilePath $certificatePath `
-            -CertStoreLocation Cert:/CurrentUser/My `
-            -Password $password `
-            -Exportable:$false |
-              Where-Object HasPrivateKey)
-          if ($certificates.Count -ne 1) {
-            throw "The Windows signing bundle must contain exactly one private code-signing certificate."
+          $existingThumbprints = @{}
+          $store = [Security.Cryptography.X509Certificates.X509Store]::new(
+            [Security.Cryptography.X509Certificates.StoreName]::My,
+            [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+          try {
+            $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+            foreach ($existingCertificate in $store.Certificates) {
+              $existingThumbprints[$existingCertificate.Thumbprint] = $true
+            }
+          }
+          finally {
+            $store.Dispose()
           }
 
-          $certificate = $certificates[0]
-          $expectedThumbprint = $env:EXPECTED_THUMBPRINT.Replace(" ", "").ToUpperInvariant()
-          if ($certificate.Thumbprint -cne $expectedThumbprint) {
-            throw "The imported Windows signing certificate thumbprint is not allowlisted."
+          $importComplete = $false
+          try {
+            $password = ConvertTo-SecureString $env:CERTIFICATE_PASSWORD -AsPlainText -Force
+            $certificates = @(Import-PfxCertificate `
+              -FilePath $certificatePath `
+              -CertStoreLocation Cert:/CurrentUser/My `
+              -Password $password `
+              -Exportable:$false |
+                Where-Object HasPrivateKey)
+            if ($certificates.Count -ne 1) {
+              throw "The Windows signing bundle must contain exactly one private code-signing certificate."
+            }
+
+            $certificate = $certificates[0]
+            $expectedThumbprint = $env:EXPECTED_THUMBPRINT.Replace(" ", "").ToUpperInvariant()
+            if ($certificate.Thumbprint -cne $expectedThumbprint) {
+              throw "The imported Windows signing certificate thumbprint is not allowlisted."
+            }
+            if ($certificate.Subject -cne $env:EXPECTED_PUBLISHER) {
+              throw "The imported Windows signing certificate publisher is not allowlisted."
+            }
+            "thumbprint=$($certificate.Thumbprint)" |
+              Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "subject=$($certificate.Subject)" |
+              Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            $importComplete = $true
           }
-          if ($certificate.Subject -cne $env:EXPECTED_PUBLISHER) {
-            throw "The imported Windows signing certificate publisher is not allowlisted."
+          finally {
+            if (-not $importComplete) {
+              $store = [Security.Cryptography.X509Certificates.X509Store]::new(
+                [Security.Cryptography.X509Certificates.StoreName]::My,
+                [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+              try {
+                $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+                $newThumbprints = @(
+                  $store.Certificates |
+                    Where-Object { -not $existingThumbprints.ContainsKey($_.Thumbprint) } |
+                    ForEach-Object Thumbprint)
+              }
+              finally {
+                $store.Dispose()
+              }
+              foreach ($newThumbprint in $newThumbprints) {
+                $importedCertificatePath = "Cert:/CurrentUser/My/$newThumbprint"
+                if (Test-Path -LiteralPath $importedCertificatePath) {
+                  Remove-Item `
+                    -LiteralPath $importedCertificatePath `
+                    -DeleteKey `
+                    -Force `
+                    -ErrorAction Stop
+                }
+              }
+            }
           }
-          "thumbprint=$($certificate.Thumbprint)" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "subject=$($certificate.Subject)" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Sign, timestamp, and package Windows releases
         shell: pwsh
@@ -631,10 +846,26 @@ jobs:
         shell: pwsh
         run: |
           $thumbprint = "${{ steps.production-signing.outputs.thumbprint }}"
-          if (-not [string]::IsNullOrWhiteSpace($thumbprint)) {
-            Remove-Item "Cert:/CurrentUser/My/$thumbprint" -Force -ErrorAction SilentlyContinue
+          try {
+            if (-not [string]::IsNullOrWhiteSpace($thumbprint)) {
+              $thumbprint = $thumbprint.Replace(" ", "").ToUpperInvariant()
+              if ($thumbprint -notmatch '^[0-9A-F]{40,64}$') {
+                throw "The production signing certificate thumbprint is invalid."
+              }
+              $certificatePath = "Cert:/CurrentUser/My/$thumbprint"
+              if (Test-Path -LiteralPath $certificatePath) {
+                Remove-Item -LiteralPath $certificatePath -DeleteKey -Force -ErrorAction Stop
+              }
+              if (Test-Path -LiteralPath $certificatePath) {
+                throw "Production signing certificate cleanup failed."
+              }
+            }
           }
-          Remove-Item (Join-Path $env:RUNNER_TEMP "DiskInventoryZed-signing.pfx") -Force -ErrorAction SilentlyContinue
+          finally {
+            Remove-Item (Join-Path $env:RUNNER_TEMP "DiskInventoryZed-signing.pfx") `
+              -Force `
+              -ErrorAction SilentlyContinue
+          }
 
   publish-release:
     needs: [validate, build, windows, macos-signing, windows-signing]
