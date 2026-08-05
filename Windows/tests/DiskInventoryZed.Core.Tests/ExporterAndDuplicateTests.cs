@@ -156,6 +156,7 @@ public sealed class ExporterAndDuplicateTests
         var group = Assert.Single(result.Groups);
         Assert.Equal(2, group.Files.Count);
         Assert.Equal(64, group.Digest.Length);
+        Assert.Equal(content.Length, group.PotentialSavings);
     }
 
     private static FileNode NodeFor(string path)

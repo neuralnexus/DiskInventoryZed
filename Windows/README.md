@@ -1,7 +1,11 @@
 # Disk Inventory Zed for Windows
 
-The Windows port is a native WPF application for Windows 10 and Windows 11. It opens in the
+The Windows port is a native WPF application preparing for its first public release. It opens in the
 interactive circular sunburst view and includes the rectangular heatmap and sortable file list.
+
+The latest public `v1.1` release contains macOS assets only. This branch builds Windows preview
+artifacts for the planned `v1.2.0` release; availability is defined by the assets on
+[GitHub Releases](https://github.com/neuralnexus/DiskInventoryZed/releases), not by source support alone.
 
 ## Supported Locations
 
@@ -43,16 +47,19 @@ disabled while a new snapshot is being built.
 
 ## Requirements
 
-- Windows 10 version 22H2 or Windows 11
-- x64 or ARM64 processor
+- Windows 11 24H2 or later as this project's mainstream client baseline
+- x64 processor for the currently hosted runtime gate
+- ARM64 packages are structurally validated, but native ARM64 execution remains pending and is not enforced by hosted CI
 - .NET is not required for release downloads; published builds are self-contained
 
-Official release executables and DLLs are Authenticode-signed and RFC 3161 timestamped. SmartScreen may
+Published Windows release executables and DLLs will be Authenticode-signed and RFC 3161 timestamped. SmartScreen may
 still show a reputation warning for a new publisher or release. Verify the zip against the SHA-256
 checksum and GitHub artifact attestation published with the release. Each zip includes the GPL license,
 the .NET runtime license, third-party notices, package metadata, and an exact payload manifest.
 
-## Run A Release
+## Run A Published Release
+
+These steps apply when a `v1.2.0` or later GitHub release includes Windows assets:
 
 1. Extract the zip to a writable folder.
 2. Run `DiskInventoryZed.exe`.
@@ -95,7 +102,7 @@ Core and 10% line / 5% branch for the Windows application. Native Windows tests 
 metadata, hard links, hidden entries, junction cycles, atomic export replacement, WPF resources,
 directory-guard identity/handle release, scan-generation races, dispatcher affinity, disposal, and
 packaged x64 startup through asynchronous drive discovery. ARM64 packages
-are structurally verified; native ARM64 execution remains a gate for the planned self-hosted runner.
+are structurally verified; native ARM64 execution remains pending on a planned isolated runner.
 
 Do not attach a persistent self-hosted runner to untrusted fork pull requests. Prefer an ephemeral,
 isolated runner using local NTFS storage, and label it by architecture so CI can reject a mismatched
@@ -119,6 +126,8 @@ production certificate, and an HTTPS RFC 3161 timestamp service.
 - `Ctrl+1`: Sunburst
 - `Ctrl+2`: Heatmap
 - `Ctrl+3`: List
+- `Enter`: Open the focused List item, or navigate to an item selected in Largest / Old Large Files
+- `Shift+F10`: Open the selected List item's action menu
 - `Alt+Left` / `Alt+Right`: Back / forward
 - `Backspace`: Parent folder
 - `F5`: Rescan

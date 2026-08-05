@@ -104,6 +104,59 @@ public sealed class DiskScannerReliabilityTests
     }
 
     [Fact]
+    public async Task UnavailableMetadataRetainsKnownEntryKindsAndFailsClosed()
+    {
+        using var fixture = new TemporaryDirectory();
+        var file = Path.Combine(fixture.Path, "locked.bin");
+        var directory = Path.Combine(fixture.Path, "locked-directory");
+        var scanner = new DiskScanner(
+            (path, isDirectory, _, logicalSize, _) => path == fixture.Path
+                ? Metadata(logicalSize, 0)
+                : Metadata(
+                    0,
+                    0,
+                    ReparsePointClassification.Unavailable,
+                    metadataUnavailable: true),
+            path => path switch
+            {
+                var root when root == fixture.Path => FileAttributes.Directory,
+                var childDirectory when childDirectory == directory => FileAttributes.Directory,
+                _ => FileAttributes.Normal
+            },
+            (path, _) => path == fixture.Path ? [file, directory] : throw new InvalidOperationException(
+                "A directory with unavailable metadata must not be traversed."));
+
+        var result = await scanner.ScanAsync(fixture.Path, new ScanOptions(ShowHiddenFiles: true));
+
+        Assert.Equal(FileNodeKind.File, result.Root.Children.Single(node => node.FullPath == file).Kind);
+        Assert.Equal(FileNodeKind.Directory, result.Root.Children.Single(node => node.FullPath == directory).Kind);
+        Assert.All(result.Root.Children, node =>
+        {
+            Assert.True(node.IsUnreadable);
+            Assert.False(node.IsSymbolicLink);
+        });
+        Assert.Equal(0, result.Diagnostics.SymbolicLinks);
+        Assert.Equal(2, result.Diagnostics.UnreadableItems);
+        Assert.Equal(2, result.Diagnostics.MetadataUnavailableItems);
+        Assert.Equal(1, result.TotalFiles);
+        Assert.Equal(2, result.TotalDirectories);
+        Assert.Equal(result.TotalFiles, result.Root.TotalFileCount);
+        Assert.Equal(result.TotalDirectories, result.Root.TotalDirectoryCount);
+    }
+
+    [Fact]
+    public void UnavailableEntryMetadataPreservesAReparsePointHint()
+    {
+        var regular = WindowsFileMetadata.UnavailableEntry(false);
+        var reparsePoint = WindowsFileMetadata.UnavailableEntry(true);
+
+        Assert.Equal(ReparsePointClassification.Unavailable, regular.ReparsePointClassification);
+        Assert.Equal(ReparsePointClassification.Unknown, reparsePoint.ReparsePointClassification);
+        Assert.True(regular.MetadataUnavailable);
+        Assert.True(reparsePoint.MetadataUnavailable);
+    }
+
+    [Fact]
     public async Task EmptyRootWithUnavailableMetadataStillProducesAResult()
     {
         using var fixture = new TemporaryDirectory();
@@ -115,6 +168,22 @@ public sealed class DiskScannerReliabilityTests
         Assert.Empty(result.Root.Children);
         Assert.Equal(0, result.Diagnostics.UnreadableItems);
         Assert.Equal(1, result.Diagnostics.MetadataUnavailableItems);
+    }
+
+    [Fact]
+    public async Task RootWithUnavailableEntryTypeIsRejected()
+    {
+        using var fixture = new TemporaryDirectory();
+        var scanner = new DiskScanner((_, _, _, _, _) => Metadata(
+            0,
+            0,
+            ReparsePointClassification.Unavailable,
+            metadataUnavailable: true));
+
+        var error = await Assert.ThrowsAsync<DiskScanException>(() => scanner.ScanAsync(fixture.Path));
+
+        Assert.Contains("selected root", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("metadata", error.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -153,6 +222,61 @@ public sealed class DiskScannerReliabilityTests
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => operation.Completion);
         Assert.Equal(0, Volatile.Read(ref rootIoCalls));
+    }
+
+    [Fact]
+    public async Task CancellationAfterChildAttributesSkipsMetadataIo()
+    {
+        using var fixture = new TemporaryDirectory();
+        var child = Path.Combine(fixture.Path, "file.bin");
+        using var cancellation = new CancellationTokenSource();
+        var childMetadataCalls = 0;
+        var scanner = new DiskScanner(
+            (path, isDirectory, _, logicalSize, _) =>
+            {
+                if (path == child)
+                {
+                    Interlocked.Increment(ref childMetadataCalls);
+                }
+                return Metadata(logicalSize, isDirectory ? 0 : logicalSize);
+            },
+            path =>
+            {
+                if (path == child)
+                {
+                    cancellation.Cancel();
+                    return FileAttributes.Normal;
+                }
+                return FileAttributes.Directory;
+            },
+            (_, _) => [child]);
+
+        var operation = scanner.StartScan(
+            fixture.Path,
+            new ScanOptions(ShowHiddenFiles: true),
+            cancellationToken: cancellation.Token);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => operation.Completion);
+        Assert.Equal(0, Volatile.Read(ref childMetadataCalls));
+    }
+
+    [Fact]
+    public async Task CancellationAfterRootAttributesPrecedesTypeValidation()
+    {
+        using var fixture = new TemporaryDirectory();
+        using var cancellation = new CancellationTokenSource();
+        var scanner = new DiskScanner(
+            (_, isDirectory, _, logicalSize, _) => Metadata(logicalSize, isDirectory ? 0 : logicalSize),
+            _ =>
+            {
+                cancellation.Cancel();
+                return FileAttributes.Normal;
+            },
+            (_, _) => []);
+
+        var operation = scanner.StartScan(fixture.Path, cancellationToken: cancellation.Token);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => operation.Completion);
     }
 
     [Fact]

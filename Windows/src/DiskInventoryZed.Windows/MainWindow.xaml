@@ -418,7 +418,11 @@
                             </Grid>
                         </TabItem>
                         <TabItem Header="LARGEST">
-                            <ListBox x:Name="LargestList" ItemsSource="{Binding LargestFiles}" MouseDoubleClick="InsightList_MouseDoubleClick">
+                            <ListBox x:Name="LargestList" ItemsSource="{Binding LargestFiles}"
+                                     AutomationProperties.Name="Largest files"
+                                     AutomationProperties.HelpText="Press Enter to navigate to the selected file's containing folder."
+                                     MouseDoubleClick="InsightList_MouseDoubleClick"
+                                     PreviewKeyDown="InsightList_PreviewKeyDown">
                                 <ListBox.ItemTemplate>
                                     <DataTemplate>
                                         <Grid>
@@ -438,7 +442,11 @@
                             <ScrollViewer VerticalScrollBarVisibility="Auto">
                                 <StackPanel>
                                     <TextBlock Text="OLD LARGE FILES" Style="{StaticResource SectionLabel}" Margin="5" />
-                                    <ListBox x:Name="OldFilesList" ItemsSource="{Binding OldLargeFiles}" MaxHeight="180" MouseDoubleClick="InsightList_MouseDoubleClick">
+                                    <ListBox x:Name="OldFilesList" ItemsSource="{Binding OldLargeFiles}" MaxHeight="180"
+                                             AutomationProperties.Name="Old large files"
+                                             AutomationProperties.HelpText="Press Enter to navigate to the selected file's containing folder."
+                                             MouseDoubleClick="InsightList_MouseDoubleClick"
+                                             PreviewKeyDown="InsightList_PreviewKeyDown">
                                         <ListBox.ItemTemplate>
                                             <DataTemplate>
                                                 <DockPanel><TextBlock Text="{Binding FormattedSize}" DockPanel.Dock="Right" FontSize="9" /><TextBlock Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis" FontSize="10" /></DockPanel>

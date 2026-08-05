@@ -11,7 +11,8 @@ internal enum ReparsePointClassification
     NotReparsePoint,
     NameSurrogate,
     Other,
-    Unknown
+    Unknown,
+    Unavailable
 }
 
 internal readonly record struct FileMetadata(
@@ -91,16 +92,7 @@ internal static partial class WindowsFileMetadata
                 out var tagInformation,
                 (uint)sizeof(FileAttributeTagInfo)))
         {
-            return new FileMetadata(
-                0,
-                0,
-                null,
-                1,
-                false,
-                null,
-                null,
-                ReparsePointClassification.Unknown,
-                true);
+            return UnavailableEntry(isReparsePoint);
         }
 
         var actualIsDirectory = (tagInformation.FileAttributes & FileAttributeDirectory) != 0;
@@ -298,6 +290,19 @@ internal static partial class WindowsFileMetadata
                placeholderState != CfPlaceholderStateInvalid &&
                (placeholderState & unavailablePlaceholderStates) == 0;
     }
+
+    internal static FileMetadata UnavailableEntry(bool isReparsePoint) => new(
+        0,
+        0,
+        null,
+        1,
+        false,
+        null,
+        null,
+        isReparsePoint
+            ? ReparsePointClassification.Unknown
+            : ReparsePointClassification.Unavailable,
+        true);
 
     internal static unsafe IDisposable OpenDirectoryGuard(
         string path,

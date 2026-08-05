@@ -206,11 +206,25 @@ public partial class MainWindow : Window
 
     private void InsightList_MouseDoubleClick(object sender, MouseButtonEventArgs e)
     {
-        if (sender is ListBox { SelectedItem: FileNode node })
+        if (InsightNodeFrom(e.OriginalSource as DependencyObject) is { } node)
         {
             _viewModel.Focus(node);
         }
     }
+
+    private void InsightList_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter &&
+            Keyboard.Modifiers == ModifierKeys.None &&
+            InsightNodeFrom(e.OriginalSource as DependencyObject) is { } node)
+        {
+            _viewModel.Focus(node);
+            e.Handled = true;
+        }
+    }
+
+    internal static FileNode? InsightNodeFrom(DependencyObject? source) =>
+        FindVisualParent<ListBoxItem>(source)?.DataContext as FileNode;
 
     private async void VerifyDuplicates_Click(object sender, RoutedEventArgs e) =>
         await _viewModel.VerifyDuplicatesAsync();

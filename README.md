@@ -2,12 +2,12 @@
 
 # Disk Inventory Zed
 
-A modern, fast successor to the classic disk visualizers **Disk Inventory X** and **OverDisk**, with native applications for macOS and Windows.
+A modern, fast successor to the classic disk visualizers **Disk Inventory X** and **OverDisk**, with a native macOS release and a Windows port under active development.
 This is not a fork; it is a GPL-licensed re-imagination of a KDirStat-style disk mapping utility.
 
 ## Overview
 
-Disk Inventory Zed visualizes disk usage with interactive sunbursts, treemaps, and detailed file listings. The macOS application uses SwiftUI; the Windows port uses WPF and supports x64 and ARM64 Windows systems, mapped drives, and UNC shares.
+Disk Inventory Zed visualizes disk usage with interactive sunbursts, treemaps, and detailed file listings. The macOS application uses SwiftUI; the Windows port uses WPF and targets x64 and ARM64 systems, mapped drives, and UNC shares.
 
 <img width="1510" height="912" alt="Screenshot 2026-05-28 at 12 38 48 PM" src="https://github.com/user-attachments/assets/ab03ce74-0768-4226-ac5c-2bf87c44e8be" />
 
@@ -44,11 +44,16 @@ Disk Inventory Zed visualizes disk usage with interactive sunbursts, treemaps, a
 - Intel or Apple Silicon
 - Xcode 15.0+ (for building from source)
 
-### Windows
+### Windows Port Preview
 
-- Windows 10 22H2 or Windows 11
-- x64 or ARM64
+- Windows 11 24H2 or later as this project's mainstream client baseline
+- x64 is exercised on GitHub-hosted Windows CI; ARM64 archives are structurally validated, with native ARM64 execution still pending
 - .NET 10.0.302 SDK and Visual Studio 2026 .NET desktop workload (only when building from source)
+
+The latest public `v1.1` release contains macOS assets only. Windows source and CI packages on this
+branch are preparing the planned `v1.2.0` release; do not treat ARM64 as production-validated until a
+native ARM64 validation run is reported as passing. See [GitHub Releases](https://github.com/neuralnexus/DiskInventoryZed/releases)
+for the asset matrix that actually shipped.
 
 ## Building
 

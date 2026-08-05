@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Threading;
 using DiskInventoryZed.Core.Analysis;
 using DiskInventoryZed.Core.Models;
@@ -23,6 +24,20 @@ public sealed class WindowsStartupAndShellBoundaryTests
             Assert.NotNull(app.Resources["AccentBrush"]);
             Assert.Equal(0, window.VisualizationTabs.SelectedIndex);
             Assert.Same(viewModel, window.DataContext);
+            Assert.Equal("Largest files", AutomationProperties.GetName(window.LargestList));
+            Assert.Equal("Old large files", AutomationProperties.GetName(window.OldFilesList));
+            Assert.Equal(
+                "Press Enter to navigate to the selected file's containing folder.",
+                AutomationProperties.GetHelpText(window.LargestList));
+            Assert.Equal(
+                "Press Enter to navigate to the selected file's containing folder.",
+                AutomationProperties.GetHelpText(window.OldFilesList));
+            var insightNode = new FileNode("C:\\root\\large.bin", "large.bin", FileNodeKind.File, 1, 1);
+            Assert.Same(insightNode, MainWindow.InsightNodeFrom(new System.Windows.Controls.ListBoxItem
+            {
+                DataContext = insightNode
+            }));
+            Assert.Null(MainWindow.InsightNodeFrom(new System.Windows.Controls.ListBox()));
         }
         finally
         {

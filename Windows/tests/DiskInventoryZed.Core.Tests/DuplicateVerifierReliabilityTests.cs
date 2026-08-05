@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using DiskInventoryZed.Core.Analysis;
 using DiskInventoryZed.Core.Models;
 using DiskInventoryZed.Core.Scanning;
@@ -95,6 +96,55 @@ public sealed class DuplicateVerifierReliabilityTests
             cancellation.Token));
     }
 
+    [Fact]
+    public async Task PreCancelledVerificationDoesNotEnumerateCandidates()
+    {
+        var files = new TrackingReadOnlyList<FileNode>([new FileNode(
+            "C:\\never-read.bin",
+            "never-read.bin",
+            FileNodeKind.File,
+            10,
+            10)]);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => DuplicateVerifier.VerifyAsync(
+            [new DuplicateCandidate(10, files)],
+            cancellationToken: cancellation.Token));
+
+        Assert.False(files.WasEnumerated);
+    }
+
+    [Fact]
+    public void ProgressReportsAreBoundedAndResetForEachPhase()
+    {
+        var reports = new List<DuplicateVerificationProgress>();
+        var progress = new SynchronousProgress<DuplicateVerificationProgress>(reports.Add);
+        var timestamp = 0L;
+        var reporter = new DuplicateVerifier.ProgressReporter(progress, () => timestamp);
+        const int totalFiles = 10_000;
+
+        reporter.Report(DuplicateVerificationPhase.Sampling, 0, totalFiles, "first", true);
+        for (var index = 1; index < totalFiles; index++)
+        {
+            timestamp += Stopwatch.Frequency;
+            reporter.Report(DuplicateVerificationPhase.Sampling, index, totalFiles, "sample", false);
+        }
+        reporter.Report(DuplicateVerificationPhase.Sampling, totalFiles, totalFiles, "last", true);
+
+        Assert.Equal(DuplicateVerifier.MaximumNonTerminalProgressReportsPerPhase + 1, reports.Count);
+        Assert.Equal(0, reports[0].CompletedFiles);
+        Assert.Equal(totalFiles, reports[^1].CompletedFiles);
+
+        reporter.Report(DuplicateVerificationPhase.Hashing, 0, 2, "first", true);
+        reporter.Report(DuplicateVerificationPhase.Hashing, 2, 2, "last", true);
+
+        Assert.Equal(DuplicateVerifier.MaximumNonTerminalProgressReportsPerPhase + 3, reports.Count);
+        Assert.Equal(DuplicateVerificationPhase.Hashing, reports[^2].Phase);
+        Assert.Equal(0, reports[^2].CompletedFiles);
+        Assert.Equal(2, reports[^1].CompletedFiles);
+    }
+
     private static FileNode NodeFor(string path)
     {
         var info = new FileInfo(path);
@@ -110,5 +160,20 @@ public sealed class DuplicateVerifierReliabilityTests
     private sealed class SynchronousProgress<T>(Action<T> report) : IProgress<T>
     {
         public void Report(T value) => report(value);
+    }
+
+    private sealed class TrackingReadOnlyList<T>(IReadOnlyList<T> inner) : IReadOnlyList<T>
+    {
+        public bool WasEnumerated { get; private set; }
+        public int Count => inner.Count;
+        public T this[int index] => inner[index];
+
+        public IEnumerator<T> GetEnumerator()
+        {
+            WasEnumerated = true;
+            return inner.GetEnumerator();
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 }

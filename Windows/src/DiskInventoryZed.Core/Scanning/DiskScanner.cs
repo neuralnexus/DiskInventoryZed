@@ -107,6 +107,7 @@ public sealed class DiskScanner
         try
         {
             rootAttributes = _getAttributes(rootPath);
+            cancellationToken.ThrowIfCancellationRequested();
             if (!rootAttributes.HasFlag(FileAttributes.Directory))
             {
                 throw new DiskScanException("The selected location is not a folder.");
@@ -118,10 +119,12 @@ public sealed class DiskScanner
         }
         catch (UnauthorizedAccessException error)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             throw new DiskScanException($"Access to {rootPath} was denied. Check the current user's permissions and try again.", error);
         }
         catch (Exception error) when (error is IOException or System.Security.SecurityException)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var networkHint = IsNetworkRoot(rootPath)
                 ? " Check that the server is online and that Windows can open the share."
                 : string.Empty;
@@ -136,9 +139,14 @@ public sealed class DiskScanner
             rootAttributes.HasFlag(FileAttributes.ReparsePoint),
             0,
             options.FollowReparsePoints);
+        cancellationToken.ThrowIfCancellationRequested();
         if (rootMetadata.ReparsePointClassification == ReparsePointClassification.Unknown)
         {
             throw new DiskScanException("The selected root is an unrecognized reparse point and cannot be scanned safely.");
+        }
+        if (rootMetadata.ReparsePointClassification == ReparsePointClassification.Unavailable)
+        {
+            throw new DiskScanException("Filesystem metadata for the selected root could not be read, so it cannot be scanned safely.");
         }
 
         var rootIsLink = rootMetadata.ReparsePointClassification == ReparsePointClassification.NameSurrogate;
@@ -159,7 +167,7 @@ public sealed class DiskScanner
             _readMetadata,
             _getAttributes,
             _enumerateEntries);
-        var rootRecord = state.CreateRootRecord(rootIsLink, rootMetadata);
+        var rootRecord = state.CreateRootRecord(rootIsLink, rootMetadata, cancellationToken);
         if (rootMetadata.MetadataUnavailable)
         {
             rootRecord.Issue = "Filesystem metadata for the selected root could not be read; the scan may be incomplete.";
@@ -183,7 +191,10 @@ public sealed class DiskScanner
         var outstanding = 1;
         await channel.Writer.WriteAsync(new WorkItem(rootPath, rootRecord), scanToken);
 
-        var workerCount = IsNetworkRoot(rootPath) ? 2 : Math.Clamp(Environment.ProcessorCount, 2, 8);
+        scanToken.ThrowIfCancellationRequested();
+        var rootIsNetwork = IsNetworkRoot(rootPath);
+        scanToken.ThrowIfCancellationRequested();
+        var workerCount = rootIsNetwork ? 2 : Math.Clamp(Environment.ProcessorCount, 2, 8);
         Exception? fatalError = null;
         var workers = Enumerable.Range(0, workerCount).Select(_ => Task.Run(async () =>
         {
@@ -320,6 +331,7 @@ public sealed class DiskScanner
                 }
                 catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Security.SecurityException)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     state.ReserveRecord();
                     var inaccessible = ScanRecord.Inaccessible(childPath, error.Message);
                     state.Records[childPath] = inaccessible;
@@ -328,6 +340,7 @@ public sealed class DiskScanner
                     state.Diagnostics.RecordUnreadable(childPath);
                     continue;
                 }
+                cancellationToken.ThrowIfCancellationRequested();
 
                 var isDirectory = attributes.HasFlag(FileAttributes.Directory);
                 var isReparsePoint = attributes.HasFlag(FileAttributes.ReparsePoint);
@@ -349,21 +362,41 @@ public sealed class DiskScanner
                 var apparentLogicalSize = isDirectory || isReparsePoint || OperatingSystem.IsWindows()
                     ? 0
                     : TryGetLogicalSize(childPath);
+                cancellationToken.ThrowIfCancellationRequested();
                 var metadata = state.ReadMetadata(
                     childPath,
                     isDirectory,
                     isReparsePoint,
                     apparentLogicalSize,
                     state.Options.FollowReparsePoints);
+                cancellationToken.ThrowIfCancellationRequested();
                 var isLink = metadata.ReparsePointClassification == ReparsePointClassification.NameSurrogate;
                 var isUnknownReparse =
                     metadata.ReparsePointClassification == ReparsePointClassification.Unknown;
-                var shouldTraverse = isDirectory && !isUnknownReparse &&
+                var isMetadataUnavailable =
+                    metadata.ReparsePointClassification == ReparsePointClassification.Unavailable;
+                var shouldTraverse = isDirectory && !isUnknownReparse && !isMetadataUnavailable &&
                     (!isLink || state.Options.FollowReparsePoints);
-                var logicalSize = isLink || isUnknownReparse ? 0 : metadata.LogicalSize;
-                if (metadata.AllocatedSizeIsApproximate && !isDirectory && !isLink && !isUnknownReparse)
+                var cannotUseMetadata = isLink || isUnknownReparse || isMetadataUnavailable;
+                var logicalSize = cannotUseMetadata ? 0 : metadata.LogicalSize;
+                if (metadata.AllocatedSizeIsApproximate && !isDirectory && !cannotUseMetadata)
                 {
                     state.Diagnostics.IncrementApproximateAllocatedSizes();
+                }
+
+                var creationDate = metadata.CreationDate;
+                if (creationDate is null && !cannotUseMetadata)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    creationDate = TryGetCreationTime(childPath);
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+                var modificationDate = metadata.ModificationDate;
+                if (modificationDate is null && !cannotUseMetadata)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    modificationDate = TryGetModificationTime(childPath);
+                    cancellationToken.ThrowIfCancellationRequested();
                 }
 
                 var record = new ScanRecord(
@@ -373,20 +406,29 @@ public sealed class DiskScanner
                         ? FileNodeKind.SymbolicLink
                         : isDirectory ? FileNodeKind.Directory : FileNodeKind.File,
                     logicalSize,
-                    isDirectory || isLink || isUnknownReparse ? 0 : metadata.AllocatedSize,
-                    metadata.CreationDate ?? (isLink || isUnknownReparse ? null : TryGetCreationTime(childPath)),
-                    metadata.ModificationDate ?? (isLink || isUnknownReparse ? null : TryGetModificationTime(childPath)),
+                    isDirectory || cannotUseMetadata ? 0 : metadata.AllocatedSize,
+                    creationDate,
+                    modificationDate,
                     isLink || isUnknownReparse,
                     metadata.Identity,
                     metadata.HardLinkCount);
 
-                if (metadata.MetadataUnavailable && !isLink && !isUnknownReparse)
+                if (metadata.MetadataUnavailable)
                 {
-                    record.Issue = "Filesystem metadata changed or could not be read; size and identity may be estimates.";
                     state.Diagnostics.IncrementMetadataUnavailableItems();
+                    if (isMetadataUnavailable)
+                    {
+                        record.Issue = "Filesystem metadata changed or could not be read, so this item was not scanned.";
+                        record.IsUnreadable = true;
+                        state.Diagnostics.RecordUnreadable(childPath);
+                    }
+                    else if (!isLink && !isUnknownReparse)
+                    {
+                        record.Issue = "Filesystem metadata changed or could not be read; size and identity may be estimates.";
+                    }
                 }
 
-                if (!isDirectory && !isLink && metadata.HardLinkCount > 1 && metadata.Identity is null)
+                if (!isDirectory && !cannotUseMetadata && metadata.HardLinkCount > 1 && metadata.Identity is null)
                 {
                     record.HasUnverifiedHardLinks = true;
                     record.Issue = "This file has multiple hard links, but its stable identity was unavailable; allocated storage may be counted more than once.";
@@ -410,7 +452,14 @@ public sealed class DiskScanner
 
                 if (!shouldTraverse)
                 {
-                    Interlocked.Increment(ref state.FileCount);
+                    if (isMetadataUnavailable && isDirectory)
+                    {
+                        Interlocked.Increment(ref state.DirectoryCount);
+                    }
+                    else
+                    {
+                        Interlocked.Increment(ref state.FileCount);
+                    }
                     continue;
                 }
 
@@ -684,17 +733,34 @@ public sealed class DiskScanner
             }
         }
 
-        public ScanRecord CreateRootRecord(bool isSymbolicLink, FileMetadata metadata)
+        public ScanRecord CreateRootRecord(
+            bool isSymbolicLink,
+            FileMetadata metadata,
+            CancellationToken cancellationToken)
         {
             var name = new DirectoryInfo(RootPath).Name;
+            var creationDate = metadata.CreationDate;
+            if (creationDate is null)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                creationDate = TryGetCreationTime(RootPath);
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            var modificationDate = metadata.ModificationDate;
+            if (modificationDate is null)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                modificationDate = TryGetModificationTime(RootPath);
+                cancellationToken.ThrowIfCancellationRequested();
+            }
             return new ScanRecord(
                 RootPath,
                 string.IsNullOrEmpty(name) ? RootPath : name,
                 FileNodeKind.Directory,
                 0,
                 0,
-                metadata.CreationDate ?? TryGetCreationTime(RootPath),
-                metadata.ModificationDate ?? TryGetModificationTime(RootPath),
+                creationDate,
+                modificationDate,
                 isSymbolicLink,
                 metadata.Identity,
                 metadata.HardLinkCount);
