@@ -37,7 +37,7 @@ public sealed class WindowsStartupAndShellBoundaryTests
             {
                 DataContext = insightNode
             }));
-            Assert.Null(MainWindow.InsightNodeFrom(new System.Windows.Controls.ListBox()));
+            Assert.Null(MainWindow.InsightNodeFrom(window.LargestList));
         }
         finally
         {
@@ -255,7 +255,7 @@ public sealed class WindowsStartupAndShellBoundaryTests
                 var dispatcher = Dispatcher.CurrentDispatcher;
                 SynchronizationContext.SetSynchronizationContext(new DispatcherSynchronizationContext(dispatcher));
                 var operation = ExecuteAsync();
-                if (!operation.IsCompleted)
+                if (!operation.IsCompleted || !dispatcher.HasShutdownStarted)
                 {
                     Dispatcher.Run();
                 }
