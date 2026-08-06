@@ -176,7 +176,7 @@ jobs:
         env:
           BUILD_ENVIRONMENT: docker.io/library/swift:6.3.3-rhel-ubi9@sha256:e5bcef9413eb4ff2a5b5d965fcd06329cdccefc31002fe8b4fda50128340e31b
         run: |
-          docker run --rm --platform linux/amd64 \
+          docker run --rm --interactive --platform linux/amd64 \
             --user "$(id -u):$(id -g)" \
             -e HOME=/tmp/diz-home \
             -e BUILD_ENVIRONMENT \
