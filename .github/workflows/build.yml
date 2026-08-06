@@ -894,6 +894,7 @@ jobs:
           needs.macos-signing.result == 'success' &&
           needs.windows-signing.result == 'success' }}
     permissions:
+      attestations: read
       contents: write
 
     steps:
@@ -961,13 +962,46 @@ jobs:
           name: DiskInventoryZed-Windows
           path: windows-release
 
-      - name: Verify release artifacts
+      - name: Verify release artifacts and provenance
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.validate.outputs.tag }}
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           python3 scripts/release_integrity.py verify-local --version "$VERSION"
           sha256sum --check --strict DiskInventoryZed-checksums.txt
           (cd windows-release && sha256sum --check --strict DiskInventoryZed-Windows-checksums.txt)
+
+          EXPECTED_SOURCE_REF="refs/tags/$TAG_NAME"
+          EXPECTED_WORKFLOW_REF="$GITHUB_REPOSITORY/.github/workflows/build.yml@$EXPECTED_SOURCE_REF"
+          if [ "$GITHUB_SERVER_URL" != "https://github.com" ] || \
+             [ "$GITHUB_REF" != "$EXPECTED_SOURCE_REF" ] || \
+             [ "$GITHUB_WORKFLOW_REF" != "$EXPECTED_WORKFLOW_REF" ] || \
+             [ -z "$GITHUB_SHA" ] || \
+             [ -z "$GITHUB_WORKFLOW_SHA" ]; then
+            echo "The attestation verification identity is incomplete or unexpected." >&2
+            exit 1
+          fi
+
+          ATTESTATION_POLICY=(
+            --repo "$GITHUB_REPOSITORY"
+            --cert-identity "$GITHUB_SERVER_URL/$EXPECTED_WORKFLOW_REF"
+            --cert-oidc-issuer "https://token.actions.githubusercontent.com"
+            --source-ref "$EXPECTED_SOURCE_REF"
+            --source-digest "$GITHUB_SHA"
+            --signer-digest "$GITHUB_WORKFLOW_SHA"
+            --deny-self-hosted-runners
+            --digest-alg sha256
+            --predicate-type "https://slsa.dev/provenance/v1"
+          )
+          RELEASE_ARTIFACTS=(
+            "DiskInventoryZed-$VERSION.dmg"
+            "windows-release/DiskInventoryZed-Windows-v$VERSION-win-x64.zip"
+            "windows-release/DiskInventoryZed-Windows-v$VERSION-win-arm64.zip"
+          )
+          for artifact in "${RELEASE_ARTIFACTS[@]}"; do
+            gh attestation verify "$artifact" "${ATTESTATION_POLICY[@]}"
+          done
 
       - name: Create and verify draft release
         env:
@@ -1002,25 +1036,12 @@ jobs:
             exit 1
           fi
           MARKER="<!-- disk-inventory-zed-workflow-run:$GITHUB_RUN_ID -->"
-          RELEASE_JSON="$RUNNER_TEMP/disk-inventory-zed-release.json"
-          REPOSITORY_NAME="${GITHUB_REPOSITORY#*/}"
-          # shellcheck disable=SC2016
-          gh api graphql \
-            -f query='query($owner:String!, $name:String!, $tag:String!) { repository(owner:$owner, name:$name) { release(tagName:$tag) { databaseId isDraft isPrerelease description tagName } } }' \
-            -f owner="$GITHUB_REPOSITORY_OWNER" \
-            -f name="$REPOSITORY_NAME" \
-            -f tag="$TAG_NAME" > "$RELEASE_JSON"
-          RELEASE_STATE="$(python3 scripts/release_integrity.py classify-release \
-            --json "$RELEASE_JSON" \
-            --tag "$TAG_NAME" \
-            --marker "$MARKER")"
-          EXPECTED_RELEASE_ID=""
-          if [ "$RELEASE_STATE" = "draft" ]; then
-            EXPECTED_RELEASE_ID="$(python3 scripts/release_integrity.py uploaded-draft-id \
-              --json "$RELEASE_JSON" \
-              --tag "$TAG_NAME" \
-              --marker "$MARKER")"
-          fi
+          RELEASES_BEFORE_CREATE="$RUNNER_TEMP/disk-inventory-zed-releases-before-create.json"
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RELEASES_BEFORE_CREATE"
+          python3 scripts/release_integrity.py require-release-missing \
+            --json "$RELEASES_BEFORE_CREATE" \
+            --tag "$TAG_NAME"
           ASSETS=(
             "DiskInventoryZed-$VERSION.dmg"
             DiskInventoryZed-checksums.txt
@@ -1028,37 +1049,71 @@ jobs:
             "windows-release/DiskInventoryZed-Windows-v$VERSION-win-arm64.zip"
             windows-release/DiskInventoryZed-Windows-checksums.txt
           )
-          if [ "$RELEASE_STATE" = "draft" ]; then
-            gh release upload "$TAG_NAME" "${ASSETS[@]}" --repo "$GITHUB_REPOSITORY" --clobber
-          elif [ "$RELEASE_STATE" = "missing" ]; then
-            gh release create "$TAG_NAME" "${ASSETS[@]}" \
-              --repo "$GITHUB_REPOSITORY" \
-              --verify-tag \
-              --draft \
-              --generate-notes \
-              --notes "$MARKER" \
-              --title "Disk Inventory Zed $VERSION"
-          fi
-          RELEASE_AFTER_UPLOAD="$RUNNER_TEMP/disk-inventory-zed-release-after-upload.json"
-          # shellcheck disable=SC2016
-          gh api graphql \
-            -f query='query($owner:String!, $name:String!, $tag:String!) { repository(owner:$owner, name:$name) { release(tagName:$tag) { databaseId isDraft isPrerelease description tagName } } }' \
-            -f owner="$GITHUB_REPOSITORY_OWNER" \
-            -f name="$REPOSITORY_NAME" \
-            -f tag="$TAG_NAME" > "$RELEASE_AFTER_UPLOAD"
-          RELEASE_ID="$(python3 scripts/release_integrity.py uploaded-draft-id \
-            --json "$RELEASE_AFTER_UPLOAD" \
+          CREATED_RELEASE="$RUNNER_TEMP/disk-inventory-zed-created-release.json"
+          CREATED_RELEASE_STATE="$RUNNER_TEMP/disk-inventory-zed-created-release-state.json"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+            -f tag_name="$TAG_NAME" \
+            -f name="Disk Inventory Zed $VERSION" \
+            -f body="$MARKER" \
+            -F draft=true \
+            -F prerelease=false \
+            -F generate_release_notes=true > "$CREATED_RELEASE"
+          RELEASE_ID="$(python3 scripts/release_integrity.py created-draft-id \
+            --json "$CREATED_RELEASE" \
+            --version "$VERSION" \
             --tag "$TAG_NAME" \
-            --marker "$MARKER")"
+            --marker "$MARKER" \
+            --state-out "$CREATED_RELEASE_STATE")"
           test "$RELEASE_ID" -gt 0
-          if [ -n "$EXPECTED_RELEASE_ID" ] && [ "$RELEASE_ID" != "$EXPECTED_RELEASE_ID" ]; then
-            echo "The draft release identity changed during asset upload." >&2
-            exit 1
-          fi
+
+          RELEASES_AFTER_CREATE="$RUNNER_TEMP/disk-inventory-zed-releases-after-create.json"
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RELEASES_AFTER_CREATE"
+          python3 scripts/release_integrity.py require-unique-release \
+            --json "$RELEASES_AFTER_CREATE" \
+            --tag "$TAG_NAME" \
+            --id "$RELEASE_ID"
+
+          UPLOAD_URL="https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets"
+          for asset in "${ASSETS[@]}"; do
+            ASSET_NAME="${asset##*/}"
+            if [[ ! "$ASSET_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "Unsafe release asset name: $ASSET_NAME" >&2
+              exit 1
+            fi
+            gh api --method POST \
+              -H "Content-Type: application/octet-stream" \
+              --input "$asset" \
+              "$UPLOAD_URL?name=$ASSET_NAME" > "$RUNNER_TEMP/uploaded-$ASSET_NAME.json"
+          done
+
           RELEASE_BEFORE_DOWNLOAD="$RUNNER_TEMP/disk-inventory-zed-release-before-download.json"
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RELEASE_BEFORE_DOWNLOAD"
           mkdir release-download
-          gh release download "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --dir release-download
+          DOWNLOAD_PLAN="$RUNNER_TEMP/disk-inventory-zed-download-plan.txt"
+          python3 scripts/release_integrity.py download-plan \
+            --json "$RELEASE_BEFORE_DOWNLOAD" \
+            --version "$VERSION" \
+            --tag "$TAG_NAME" \
+            --marker "$MARKER" \
+            --id "$RELEASE_ID" \
+            --created-state "$CREATED_RELEASE_STATE" > "$DOWNLOAD_PLAN"
+          mapfile -t DOWNLOADS < "$DOWNLOAD_PLAN"
+          if [ "${#DOWNLOADS[@]}" -ne "${#ASSETS[@]}" ]; then
+            echo "The validated release download plan is incomplete." >&2
+            exit 1
+          fi
+          for download in "${DOWNLOADS[@]}"; do
+            IFS=$'\t' read -r ASSET_ID ASSET_NAME EXTRA <<< "$download"
+            if [[ ! "$ASSET_ID" =~ ^[1-9][0-9]*$ ||
+                  ! "$ASSET_NAME" =~ ^[A-Za-z0-9._-]+$ ||
+                  -n "$EXTRA" ]]; then
+              echo "Invalid validated release download entry." >&2
+              exit 1
+            fi
+            gh api -H "Accept: application/octet-stream" \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID" > "release-download/$ASSET_NAME"
+          done
           RELEASE_AFTER_DOWNLOAD="$RUNNER_TEMP/disk-inventory-zed-release-after-download.json"
           VERIFIED_RELEASE_STATE="$RUNNER_TEMP/disk-inventory-zed-verified-release-state.json"
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RELEASE_AFTER_DOWNLOAD"
@@ -1117,6 +1172,13 @@ jobs:
             --version "$VERSION" \
             --tag "$TAG_NAME" \
             --marker "$MARKER"
+          RELEASES_BEFORE_PUBLISH="$RUNNER_TEMP/disk-inventory-zed-releases-before-publish.json"
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RELEASES_BEFORE_PUBLISH"
+          python3 scripts/release_integrity.py require-unique-release \
+            --json "$RELEASES_BEFORE_PUBLISH" \
+            --tag "$TAG_NAME" \
+            --id "$RELEASE_ID"
           TAG_COMMIT="$(resolve_tag_commit)"
           if [ "$TAG_COMMIT" != "$GITHUB_SHA" ]; then
             echo "Release tag moved immediately before publication." >&2

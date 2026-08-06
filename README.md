@@ -181,11 +181,13 @@ The analysis sidebar goes beyond the classic Disk Inventory X workflow:
 - Tagged macOS artifacts require Developer ID signing and successful Apple notarization and stapling.
 - Tagged Windows artifacts require allowlisted Authenticode publisher identity, SHA-256 signing, and a
   trusted RFC 3161 timestamp. Every shipped PE file must carry a valid embedded signature.
-- GitHub artifact attestations bind each signed DMG and Windows zip to the release workflow and source
-  commit. Verify a download with `gh attestation verify <file> --repo neuralnexus/DiskInventoryZed`.
+- GitHub artifact attestations bind each signed DMG and Windows zip to the exact hosted release workflow,
+  tag, and source commit. Publication verifies that provenance before creating a draft. Verify a download
+  with `gh attestation verify <file> --repo neuralnexus/DiskInventoryZed`.
 - The approval-gated publication job creates a draft, downloads every uploaded asset, verifies local and
-  server SHA-256 digests, and publishes that same identity immediately. It refuses existing published
-  releases and drafts not owned by the current workflow run.
+  server SHA-256 digests, and publishes that same numeric release identity immediately. It refuses every
+  preexisting release for the tag and never clobbers assets. If a failed run leaves a draft, delete that
+  draft before retrying the tag workflow.
 - Production tags fail closed unless immutable releases are enabled and both `release-signing` and
   `release-publish` environments require reviewers, prevent self-review and administrator bypass, and
   permit only `v*` tags.

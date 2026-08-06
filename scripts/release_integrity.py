@@ -88,9 +88,13 @@ def verify_local(version: str, root: Path) -> dict[str, Path]:
     return assets
 
 
-def _load_json(path: Path) -> dict[str, Any]:
+def _read_json(path: Path) -> Any:
     with path.open(encoding="utf-8") as source:
-        document = json.load(source)
+        return json.load(source)
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    document = _read_json(path)
     if not isinstance(document, dict):
         raise ReleaseIntegrityError(f"Expected a JSON object in {path}")
     return document
@@ -102,44 +106,42 @@ def _positive_id(value: Any, description: str) -> int:
     return value
 
 
-def _graphql_release(document: dict[str, Any]) -> dict[str, Any] | None:
-    try:
-        release = document["data"]["repository"]["release"]
-    except (KeyError, TypeError) as error:
-        raise ReleaseIntegrityError("Invalid GraphQL release response") from error
-    if release is not None and not isinstance(release, dict):
-        raise ReleaseIntegrityError("Invalid GraphQL release object")
-    return release
+def _listed_releases(document: Any) -> list[dict[str, Any]]:
+    if not isinstance(document, list):
+        raise ReleaseIntegrityError("Invalid REST release listing")
+    if any(isinstance(item, list) for item in document):
+        if not all(isinstance(item, list) for item in document):
+            raise ReleaseIntegrityError("Invalid paginated REST release listing")
+        raw_releases = [release for page in document for release in page]
+    else:
+        raw_releases = document
+
+    releases: list[dict[str, Any]] = []
+    for release in raw_releases:
+        if not isinstance(release, dict) or not isinstance(release.get("tag_name"), str):
+            raise ReleaseIntegrityError("The release listing contains an invalid release.")
+        _positive_id(release.get("id"), "listed release ID")
+        releases.append(release)
+    return releases
 
 
-def _require_owned_graphql_draft(
-    release: dict[str, Any], tag: str, marker: str
-) -> dict[str, Any]:
-    if release.get("tagName") != tag:
-        raise ReleaseIntegrityError("The draft release tag differs from the requested tag.")
-    if marker not in (release.get("description") or ""):
-        raise ReleaseIntegrityError("The draft release is not owned by this workflow run.")
-    if release.get("isDraft") is not True:
-        raise ReleaseIntegrityError("The workflow does not mutate an already-published release.")
-    if release.get("isPrerelease") is not False:
-        raise ReleaseIntegrityError("The workflow does not publish a prerelease.")
-    return release
+def require_release_missing(document: Any, tag: str) -> None:
+    if any(release["tag_name"] == tag for release in _listed_releases(document)):
+        raise ReleaseIntegrityError(
+            "Refusing to mutate a preexisting release; remove the stale draft before retrying."
+        )
 
 
-def classify_release(document: dict[str, Any], tag: str, marker: str) -> str:
-    release = _graphql_release(document)
-    if release is None:
-        return "missing"
-    _require_owned_graphql_draft(release, tag, marker)
-    return "draft"
-
-
-def uploaded_draft_id(document: dict[str, Any], tag: str, marker: str) -> int:
-    release = _graphql_release(document)
-    if release is None:
-        raise ReleaseIntegrityError("The workflow-owned draft is missing after upload.")
-    _require_owned_graphql_draft(release, tag, marker)
-    return _positive_id(release.get("databaseId"), "release ID")
+def require_unique_release(document: Any, tag: str, expected_id: int) -> None:
+    expected_id = _positive_id(expected_id, "expected release ID")
+    matches = [
+        release for release in _listed_releases(document)
+        if release["tag_name"] == tag
+    ]
+    if len(matches) != 1 or matches[0]["id"] != expected_id:
+        raise ReleaseIntegrityError(
+            "The workflow-owned release is not the unique release for this tag."
+        )
 
 
 def release_identity(
@@ -153,7 +155,8 @@ def release_identity(
     if release.get("tag_name") != tag:
         raise ReleaseIntegrityError("The release tag changed during verification.")
     body = release.get("body")
-    if not isinstance(body, str) or marker not in body:
+    if (not isinstance(body, str) or
+            (body != marker and not body.startswith(marker + "\n"))):
         raise ReleaseIntegrityError("Release ownership changed during verification.")
     if release.get("draft") is not expected_draft:
         state = "draft" if expected_draft else "published"
@@ -210,6 +213,60 @@ def release_identity(
         "bodyDigest": body_digest,
         "assets": assets,
     }
+
+
+def created_draft_state(
+    release: dict[str, Any], version: str, tag: str, marker: str
+) -> dict[str, int | str]:
+    identity = release_identity(release, set(), tag, marker, True, {})
+    if tag != f"v{version}":
+        raise ReleaseIntegrityError("The release tag and version do not match.")
+    return {
+        "id": _positive_id(identity["id"], "created release ID"),
+        "bodyDigest": identity["bodyDigest"],
+    }
+
+
+def created_draft_id(
+    release: dict[str, Any], version: str, tag: str, marker: str
+) -> int:
+    return int(created_draft_state(release, version, tag, marker)["id"])
+
+
+def download_plan(
+    release: dict[str, Any],
+    version: str,
+    root: Path,
+    tag: str,
+    marker: str,
+    expected_id: int,
+    created_state: dict[str, Any],
+) -> list[tuple[int, str]]:
+    local_assets = verify_local(version, root)
+    expected_digests = {name: digest(path) for name, path in local_assets.items()}
+    identity = release_identity(
+        release,
+        set(local_assets),
+        tag,
+        marker,
+        True,
+        expected_digests,
+    )
+    if identity["id"] != _positive_id(expected_id, "expected release ID"):
+        raise ReleaseIntegrityError("The uploaded draft has an unexpected release ID.")
+    if set(created_state) != {"id", "bodyDigest"}:
+        raise ReleaseIntegrityError("The created draft state is invalid.")
+    created_id = _positive_id(created_state.get("id"), "created release ID")
+    body_digest = created_state.get("bodyDigest")
+    if (not isinstance(body_digest, str) or
+            SHA256_PATTERN.fullmatch(body_digest) is None or
+            identity["id"] != created_id or
+            identity["bodyDigest"] != body_digest):
+        raise ReleaseIntegrityError("The created draft identity changed before download.")
+    return sorted(
+        (_positive_id(values[0], f"asset ID for {name}"), name)
+        for name, values in identity["assets"].items()
+    )
 
 
 def verify_download(
@@ -287,15 +344,30 @@ def _parser() -> argparse.ArgumentParser:
     local.add_argument("--version", required=True)
     local.add_argument("--root", type=Path, default=Path("."))
 
-    classify = commands.add_parser("classify-release")
-    classify.add_argument("--json", type=Path, required=True)
-    classify.add_argument("--tag", required=True)
-    classify.add_argument("--marker", required=True)
+    missing = commands.add_parser("require-release-missing")
+    missing.add_argument("--json", type=Path, required=True)
+    missing.add_argument("--tag", required=True)
 
-    uploaded = commands.add_parser("uploaded-draft-id")
-    uploaded.add_argument("--json", type=Path, required=True)
-    uploaded.add_argument("--tag", required=True)
-    uploaded.add_argument("--marker", required=True)
+    unique = commands.add_parser("require-unique-release")
+    unique.add_argument("--json", type=Path, required=True)
+    unique.add_argument("--tag", required=True)
+    unique.add_argument("--id", type=int, required=True)
+
+    created = commands.add_parser("created-draft-id")
+    created.add_argument("--json", type=Path, required=True)
+    created.add_argument("--version", required=True)
+    created.add_argument("--tag", required=True)
+    created.add_argument("--marker", required=True)
+    created.add_argument("--state-out", type=Path, required=True)
+
+    plan = commands.add_parser("download-plan")
+    plan.add_argument("--json", type=Path, required=True)
+    plan.add_argument("--version", required=True)
+    plan.add_argument("--root", type=Path, default=Path("."))
+    plan.add_argument("--tag", required=True)
+    plan.add_argument("--marker", required=True)
+    plan.add_argument("--id", type=int, required=True)
+    plan.add_argument("--created-state", type=Path, required=True)
 
     download = commands.add_parser("verify-download")
     download.add_argument("--version", required=True)
@@ -322,10 +394,29 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "verify-local":
             verify_local(args.version, args.root)
-        elif args.command == "classify-release":
-            print(classify_release(_load_json(args.json), args.tag, args.marker))
-        elif args.command == "uploaded-draft-id":
-            print(uploaded_draft_id(_load_json(args.json), args.tag, args.marker))
+        elif args.command == "require-release-missing":
+            require_release_missing(_read_json(args.json), args.tag)
+        elif args.command == "require-unique-release":
+            require_unique_release(_read_json(args.json), args.tag, args.id)
+        elif args.command == "created-draft-id":
+            created = created_draft_state(
+                _load_json(args.json), args.version, args.tag, args.marker
+            )
+            args.state_out.write_text(
+                json.dumps(created, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            print(created["id"])
+        elif args.command == "download-plan":
+            for asset_id, name in download_plan(
+                _load_json(args.json),
+                args.version,
+                args.root,
+                args.tag,
+                args.marker,
+                args.id,
+                _load_json(args.created_state),
+            ):
+                print(f"{asset_id}\t{name}")
         elif args.command == "verify-download":
             verify_download(
                 args.version,
