@@ -172,21 +172,23 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Swift 6.3.3
-        uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a # v2.4.0
-        with:
-          swift-version: '6.3.3'
-
-      - name: Install Static Linux SDK
+      - name: Build source and portable Linux archives with Swift 6.3.3
+        env:
+          BUILD_ENVIRONMENT: docker.io/library/swift:6.3.3-rhel-ubi9@sha256:e5bcef9413eb4ff2a5b5d965fcd06329cdccefc31002fe8b4fda50128340e31b
         run: |
+          docker run --rm --platform linux/amd64 \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp/diz-home \
+            -e BUILD_ENVIRONMENT \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            'swift:6.3.3-rhel-ubi9@sha256:e5bcef9413eb4ff2a5b5d965fcd06329cdccefc31002fe8b4fda50128340e31b' \
+            /bin/bash -s <<'DIZ_BUILD'
+          set -euo pipefail
+          mkdir -p "$HOME"
           swift sdk install \
             https://download.swift.org/swift-6.3.3-release/static-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz \
             --checksum 87c3eaf908e67c0e13a84367119e12273cec1d2cd3d81f7d74bb36722d6b607b
-
-      - name: Build source and portable Linux archives
-        env:
-          BUILD_ENVIRONMENT: github-hosted ubuntu-22.04; Swift 6.3.3; swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a
-        run: |
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           export SOURCE_DATE_EPOCH BUILD_ENVIRONMENT
           VERSION="$(python3 - <<'PY'
@@ -198,7 +200,7 @@ jobs:
           ./scripts/package-source.sh dist
           SOURCE_ARCHIVE_PATH="dist/DiskInventoryZed-${VERSION}-corresponding-source.tar.gz"
           SOURCE_ARCHIVE_SHA256="$(sha256sum "$SOURCE_ARCHIVE_PATH" | cut -d ' ' -f 1)"
-          LEGAL_DIRECTORY="$RUNNER_TEMP/DiskInventoryZed-legal"
+          LEGAL_DIRECTORY="/tmp/DiskInventoryZed-legal"
           ./scripts/fetch-verified-files.py \
             Legal/third-party-components.json \
             "$LEGAL_DIRECTORY"
@@ -213,9 +215,10 @@ jobs:
             -C dist/smoke/aarch64 --strip-components=1
           test -x dist/smoke/x86_64/DiskInventoryZed
           test -x dist/smoke/aarch64/DiskInventoryZed
+          ./scripts/test-linux-cli.sh dist/smoke/x86_64/DiskInventoryZed "$VERSION"
+          DIZ_BUILD
           file dist/smoke/x86_64/DiskInventoryZed | grep -Eq 'ELF 64-bit.*x86-64.*statically linked'
           file dist/smoke/aarch64/DiskInventoryZed | grep -Eq 'ELF 64-bit.*ARM aarch64.*statically linked'
-          ./scripts/test-linux-cli.sh dist/smoke/x86_64/DiskInventoryZed "$VERSION"
 
       - name: Enable ARM64 emulation
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0

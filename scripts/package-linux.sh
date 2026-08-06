@@ -143,7 +143,7 @@ archive = Path(sys.argv[1])
 root_name = archive.name.removesuffix(".tar.gz")
 manifest_name = "SOURCE-MANIFEST.json"
 project_name = f"DiskInventoryZed-{sys.argv[2]}.tar.gz"
-actual_files: dict[str, dict[str, int | str]] = {}
+actual_files = {}
 captured_files: dict[str, bytes] = {}
 seen_members: set[str] = set()
 with tarfile.open(archive, "r:gz") as source:
@@ -196,7 +196,7 @@ if manifest.get("sourceTreeState") != "clean" and sys.argv[4] != "true":
 manifest_entries = manifest.get("files")
 if not isinstance(manifest_entries, list):
     raise SystemExit("Corresponding-source manifest has no file inventory")
-expected_files: dict[str, dict[str, int | str]] = {}
+expected_files = {}
 for entry in manifest_entries:
     if not isinstance(entry, dict):
         raise SystemExit("Malformed corresponding-source file entry")
@@ -256,7 +256,7 @@ if sys.argv[6] == "true":
 else:
 
     project_prefix = PurePosixPath(f"DiskInventoryZed-{sys.argv[2]}")
-    expected: dict[str, tuple[str, bytes | str, bool]] = {}
+    expected = {}
     with tarfile.open(fileobj=BytesIO(project_archive), mode="r:gz") as source:
         for member in source.getmembers():
             path = PurePosixPath(member.name)
@@ -278,7 +278,7 @@ else:
     source_directory = Path(sys.argv[5]).resolve()
     output_directory = Path(sys.argv[7]).resolve()
     ignored_roots = {".build", ".git", "dist", "DiskInventoryZed.app", "__pycache__"}
-    actual: dict[str, tuple[str, bytes | str, bool]] = {}
+    actual = {}
     for path in source_directory.rglob("*"):
         relative = path.relative_to(source_directory)
         if relative.parts[0] in ignored_roots or path == output_directory or output_directory in path.parents:
