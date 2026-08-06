@@ -268,7 +268,12 @@ public sealed class DiskScanner
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        DeduplicateHardLinks(state, cancellationToken);
+        // Workers are quiescent, so direct dictionary enumeration is a stable logical view without a full snapshot.
+        var duplicateCount = DeduplicateHardLinks(
+            state.Records.Select(static item => item.Value),
+            state.PathComparer,
+            cancellationToken);
+        state.Diagnostics.SetDuplicateHardLinks(duplicateCount);
         var root = BuildTree(rootPath, state.Records, state.PathComparer, cancellationToken)
             ?? throw new DiskScanException("The scan did not produce a root folder.");
         if (rootRecord.EnumerationFailed && root.Children.Count == 0)
@@ -277,6 +282,7 @@ public sealed class DiskScanner
         }
 
         stopwatch.Stop();
+        cancellationToken.ThrowIfCancellationRequested();
         var diagnostics = state.Diagnostics.Snapshot();
         progress?.Report(new ScanProgress(rootPath, state.FileCount, state.DirectoryCount, diagnostics.UnreadableItems));
         return new DiskScanResult(root, state.FileCount, state.DirectoryCount, stopwatch.Elapsed, diagnostics, options);
@@ -528,31 +534,47 @@ public sealed class DiskScanner
         }
     }
 
-    private static void DeduplicateHardLinks(ScanState state, CancellationToken cancellationToken)
+    internal static int DeduplicateHardLinks(
+        IEnumerable<ScanRecord> records,
+        StringComparer pathComparer,
+        CancellationToken cancellationToken)
     {
         var duplicateCount = 0;
-        var groups = state.Records.Values
-            .Where(record => record.Kind == FileNodeKind.File && record.Identity is not null)
-            .GroupBy(record => record.Identity!.Value);
-
-        foreach (var group in groups)
+        var owners = new Dictionary<FileIdentity, ScanRecord>();
+        foreach (var record in ObserveCancellation(records, cancellationToken))
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var records = group.OrderBy(record => record.Path, state.PathComparer).ToArray();
-            for (var index = 1; index < records.Length; index++)
+            if (record.Kind != FileNodeKind.File ||
+                record.Identity is not { } identity)
             {
-                records[index].AllocatedSize = 0;
-                records[index].IsHardLinkDuplicate = true;
-                duplicateCount++;
+                continue;
             }
+            if (!owners.TryGetValue(identity, out var owner))
+            {
+                owners[identity] = record;
+                continue;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            if (pathComparer.Compare(record.Path, owner.Path) < 0)
+            {
+                owner.AllocatedSize = 0;
+                owner.IsHardLinkDuplicate = true;
+                owners[identity] = record;
+            }
+            else
+            {
+                record.AllocatedSize = 0;
+                record.IsHardLinkDuplicate = true;
+            }
+            duplicateCount = checked(duplicateCount + 1);
         }
 
-        state.Diagnostics.SetDuplicateHardLinks(duplicateCount);
+        return duplicateCount;
     }
 
-    private static FileNode? BuildTree(
+    internal static FileNode? BuildTree(
         string rootPath,
-        ConcurrentDictionary<string, ScanRecord> records,
+        IReadOnlyDictionary<string, ScanRecord> records,
         StringComparer pathComparer,
         CancellationToken cancellationToken)
     {
@@ -578,7 +600,9 @@ public sealed class DiskScanner
                 stack.Push((item.Path, true));
                 for (var index = record.ChildPaths.Count - 1; index >= 0; index--)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     var childPath = record.ChildPaths[index];
+                    cancellationToken.ThrowIfCancellationRequested();
                     if (!built.ContainsKey(childPath))
                     {
                         stack.Push((childPath, false));
@@ -588,35 +612,157 @@ public sealed class DiskScanner
                 continue;
             }
 
-            var children = record.ChildPaths
-                .Select(path => built.GetValueOrDefault(path))
-                .OfType<FileNode>()
-                .OrderByDescending(child => child.AllocatedSize)
-                .ThenBy(child => child.DisplayName, StringComparer.CurrentCultureIgnoreCase)
-                .ToArray();
+            var children = MaterializeChildren(record.ChildPaths, built, cancellationToken);
             var isContainer = record.Kind is FileNodeKind.Directory or FileNodeKind.Package;
-            var logicalSize = isContainer ? children.Sum(child => child.LogicalSize) : record.LogicalSize;
-            var allocatedSize = isContainer ? children.Sum(child => child.AllocatedSize) : record.AllocatedSize;
+            var aggregate = isContainer
+                ? AggregateChildren(children, cancellationToken)
+                : (record.LogicalSize, record.AllocatedSize, 1, 0);
 
             built[record.Path] = new FileNode(
                 record.Path,
                 record.Name,
                 record.Kind,
-                logicalSize,
-                allocatedSize,
-                children,
+                aggregate.Item1,
+                aggregate.Item2,
+                ObserveCancellation(children, cancellationToken),
                 record.CreationDate,
                 record.ModificationDate,
                 record.IsSymbolicLink,
                 record.IsHardLinkDuplicate,
                 record.HasUnverifiedHardLinks,
                 record.Issue,
-                isContainer ? children.Sum(child => child.TotalFileCount) : 1,
-                isContainer ? 1 + children.Sum(child => child.TotalDirectoryCount) : 0,
+                aggregate.Item3,
+                aggregate.Item4,
                 record.IsUnreadable);
+            cancellationToken.ThrowIfCancellationRequested();
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         return built.GetValueOrDefault(rootPath);
+    }
+
+    internal static FileNode[] MaterializeChildren(
+        IReadOnlyList<string> childPaths,
+        IReadOnlyDictionary<string, FileNode> built,
+        CancellationToken cancellationToken)
+    {
+        var children = new List<FileNode>(childPaths.Count);
+        for (var index = 0; index < childPaths.Count; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var childPath = childPaths[index];
+            cancellationToken.ThrowIfCancellationRequested();
+            if (built.TryGetValue(childPath, out var child))
+            {
+                children.Add(child);
+            }
+        }
+
+        return StableSortWithCancellation(
+            children,
+            Comparer<FileNode>.Create(static (left, right) =>
+            {
+                var sizeOrder = right.AllocatedSize.CompareTo(left.AllocatedSize);
+                return sizeOrder != 0
+                    ? sizeOrder
+                    : StringComparer.CurrentCultureIgnoreCase.Compare(left.DisplayName, right.DisplayName);
+            }),
+            cancellationToken);
+    }
+
+    internal static (long LogicalSize, long AllocatedSize, int TotalFileCount, int TotalDirectoryCount)
+        AggregateChildren(IReadOnlyList<FileNode> children, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var logicalSize = 0L;
+        var allocatedSize = 0L;
+        var totalFileCount = 0;
+        var totalDirectoryCount = 1;
+        for (var index = 0; index < children.Count; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var child = children[index];
+            cancellationToken.ThrowIfCancellationRequested();
+            logicalSize = checked(logicalSize + child.LogicalSize);
+            allocatedSize = checked(allocatedSize + child.AllocatedSize);
+            totalFileCount = checked(totalFileCount + child.TotalFileCount);
+            totalDirectoryCount = checked(totalDirectoryCount + child.TotalDirectoryCount);
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+        return (logicalSize, allocatedSize, totalFileCount, totalDirectoryCount);
+    }
+
+    internal static T[] StableSortWithCancellation<T>(
+        IEnumerable<T> source,
+        IComparer<T> comparer,
+        CancellationToken cancellationToken)
+    {
+        var indexed = new List<IndexedValue<T>>();
+        var index = 0;
+        foreach (var item in ObserveCancellation(source, cancellationToken))
+        {
+            indexed.Add(new IndexedValue<T>(item, index));
+            index = checked(index + 1);
+        }
+
+        try
+        {
+            indexed.Sort(new CancellationComparer<IndexedValue<T>>(
+                Comparer<IndexedValue<T>>.Create((left, right) =>
+                {
+                    var order = comparer.Compare(left.Value, right.Value);
+                    return order != 0 ? order : left.Index.CompareTo(right.Index);
+                }),
+                cancellationToken));
+        }
+        catch (InvalidOperationException error) when (
+            error.InnerException is OperationCanceledException && cancellationToken.IsCancellationRequested)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            throw;
+        }
+
+        var result = new T[indexed.Count];
+        for (var resultIndex = 0; resultIndex < indexed.Count; resultIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            result[resultIndex] = indexed[resultIndex].Value;
+        }
+        return result;
+    }
+
+    private static IEnumerable<T> ObserveCancellation<T>(
+        IEnumerable<T> source,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var enumerator = source.GetEnumerator();
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!enumerator.MoveNext())
+            {
+                yield break;
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return enumerator.Current;
+        }
+    }
+
+    private readonly record struct IndexedValue<T>(T Value, int Index);
+
+    private sealed class CancellationComparer<T>(IComparer<T> inner, CancellationToken cancellationToken) : IComparer<T>
+    {
+        private int _comparisons;
+
+        public int Compare(T? left, T? right)
+        {
+            if ((_comparisons++ & 255) == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            return inner.Compare(left!, right!);
+        }
     }
 
     private static long TryGetLogicalSize(string path)
@@ -723,7 +869,7 @@ public sealed class DiskScanner
         public string CurrentPath;
         public int FileCount;
         public int DirectoryCount;
-        private int _retainedEntries = 1;
+        private long _retainedEntries = 1;
 
         public void ReserveRecord()
         {
@@ -767,7 +913,7 @@ public sealed class DiskScanner
         }
     }
 
-    private sealed class ScanRecord(
+    internal sealed class ScanRecord(
         string path,
         string name,
         FileNodeKind kind,
