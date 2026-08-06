@@ -1,0 +1,10 @@
+# Require owner review for release policy and distribution changes when branch
+# protection is configured to require Code Owner approval.
+/.github/workflows/ @neuralnexus
+/.github/CODEOWNERS @neuralnexus
+/scripts/ @neuralnexus
+/Legal/ @neuralnexus
+/LICENSE @neuralnexus
+/Package.swift @neuralnexus
+/Resources/Info.plist @neuralnexus
+/DiskInventoryZed.app.entitlements @neuralnexus

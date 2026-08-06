@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "files": [
+    {
+      "name": "swift-064859e41d68596f486c5d724401cb370f260409.tar.gz",
+      "sha256": "a3a15dfa6e020c4fde3979d1f6839b4b41defd8e186d1b390c2b4b6284e7f45e",
+      "url": "https://codeload.github.com/swiftlang/swift/tar.gz/064859e41d68596f486c5d724401cb370f260409"
+    },
+    {
+      "name": "swift-foundation-dbacc67779dc0a41ddc9493acbaa332d76c9fb03.tar.gz",
+      "sha256": "3bfc570356d631fbebbd63fb298b52ed6df65b7b006926f507208819e78e10c5",
+      "url": "https://codeload.github.com/swiftlang/swift-foundation/tar.gz/dbacc67779dc0a41ddc9493acbaa332d76c9fb03"
+    },
+    {
+      "name": "swift-foundation-icu-e29ee41079d35eae68d98a7479864a19f2928d84.tar.gz",
+      "sha256": "161d968a4cacf7b9f0db981668bf24197fd66521be915fe33aaa4178f25edbfe",
+      "url": "https://codeload.github.com/swiftlang/swift-foundation-icu/tar.gz/e29ee41079d35eae68d98a7479864a19f2928d84"
+    },
+    {
+      "name": "swift-corelibs-foundation-6da8413b9a088eb59badcf0665aa73116db51edf.tar.gz",
+      "sha256": "871c04b478ffd9635544b5811e26508cb37335f4a4e5f1d87dc383c3e5f616b6",
+      "url": "https://codeload.github.com/swiftlang/swift-corelibs-foundation/tar.gz/6da8413b9a088eb59badcf0665aa73116db51edf"
+    },
+    {
+      "name": "swift-corelibs-libdispatch-ffcd1b88af2f923501b16d9718c53275408e0dbf.tar.gz",
+      "sha256": "881047af005344aab2ad27786448929a6f72555cb146f28f6907fc1d5da2019c",
+      "url": "https://codeload.github.com/swiftlang/swift-corelibs-libdispatch/tar.gz/ffcd1b88af2f923501b16d9718c53275408e0dbf"
+    },
+    {
+      "name": "swift-collections-c11818f3cae0780656baa430b49e7f163f08dffd.tar.gz",
+      "sha256": "f65db8d7887de9f23c8e5efe55ccf8c5459134135a93a642aeab40544428619d",
+      "url": "https://codeload.github.com/apple/swift-collections/tar.gz/c11818f3cae0780656baa430b49e7f163f08dffd"
+    },
+    {
+      "name": "llvm-project-82cdc19fa54d566969527b56f587ea8ea30bef51.tar.gz",
+      "sha256": "8453bf8698e7d1dd8b6801f268d0290ff01ca663ffd40806a68197a15a0459d1",
+      "url": "https://codeload.github.com/llvm/llvm-project/tar.gz/82cdc19fa54d566969527b56f587ea8ea30bef51"
+    },
+    {
+      "name": "musl-0784374d561435f7c787a555aeab8ede699ed298.tar.gz",
+      "sha256": "6ad0ee58d5be7b0d8c0f1d8e9773e1d83c761f87c1f527a3e8cdf77128696964",
+      "url": "https://git.musl-libc.org/cgit/musl/snapshot/musl-0784374d561435f7c787a555aeab8ede699ed298.tar.gz"
+    },
+    {
+      "name": "mimalloc-fbd8b99c2b828428947d70fdc046bb55609be93e.tar.gz",
+      "sha256": "083ea3a867ce85d0f552b2333f3629c10f86e29edfdaa944c35e3e0051375b99",
+      "url": "https://codeload.github.com/microsoft/mimalloc/tar.gz/fbd8b99c2b828428947d70fdc046bb55609be93e"
+    },
+    {
+      "name": "apple-ICU-71e88350afd8f8bcbb8a387edafd090de9ff7cca.tar.gz",
+      "sha256": "dc28cfb42e3952d1f7ef8bb20e991d8c5857afe51b0f97fdd3f7cf98bccb3ca7",
+      "url": "https://codeload.github.com/apple-oss-distributions/ICU/tar.gz/71e88350afd8f8bcbb8a387edafd090de9ff7cca"
+    },
+    {
+      "name": "swift-docker-ea31a3331dd0a3346ae7cc114daffe4f6be35415.tar.gz",
+      "sha256": "32f9b1a262554a53a24035244ea0c605085baa551de24fb784e7a4be569ec7e2",
+      "url": "https://codeload.github.com/swiftlang/swift-docker/tar.gz/ea31a3331dd0a3346ae7cc114daffe4f6be35415"
+    }
+  ]
+}

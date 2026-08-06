@@ -17,9 +17,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.1</string>
+    <string>1.2</string>
     <key>CFBundleVersion</key>
-    <string>3</string>
+    <string>4</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSApplicationCategoryType</key>
@@ -32,6 +32,16 @@
     <string>AppIcon</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>Disk Inventory Zed scans this location only when you ask it to analyze disk usage.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Disk Inventory Zed scans this location only when you ask it to analyze disk usage.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>Disk Inventory Zed scans this location only when you ask it to analyze disk usage.</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>Disk Inventory Zed scans this location only when you ask it to analyze disk usage.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>Disk Inventory Zed scans this location only when you ask it to analyze disk usage.</string>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
 </dict>

@@ -1,3 +1,4 @@
+#if !os(Linux)
 import Foundation
 import XCTest
 @testable import DiskInventoryZed
@@ -39,3 +40,4 @@ final class DuplicateVerifierTests: XCTestCase {
         XCTAssertEqual(result.groups[0].potentialSavings, 256_000)
     }
 }
+#endif

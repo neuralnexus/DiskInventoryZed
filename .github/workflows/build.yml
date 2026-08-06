@@ -13,93 +13,313 @@ permissions:
 
 concurrency:
   group: disk-inventory-zed-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
-  build:
-    runs-on: macos-latest
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 30
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-    
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-      
-      - name: Cache Swift packages
-        uses: actions/cache@v4
-        with:
-          path: .build
-          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.swift') }}
-          restore-keys: |
-            ${{ runner.os }}-spm-
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Run unit tests
-        run: swift test
+      - name: Run Swift 6 unit tests
+        run: |
+          swift test \
+            -Xswiftc -swift-version -Xswiftc 6 \
+            -Xswiftc -strict-concurrency=complete \
+            -Xswiftc -warnings-as-errors
 
-      - name: Build debug with concurrency diagnostics
-        run: swift build -Xswiftc -strict-concurrency=complete
-      
+      - name: Build debug in Swift 6 language mode
+        run: |
+          swift build \
+            -Xswiftc -swift-version -Xswiftc 6 \
+            -Xswiftc -strict-concurrency=complete \
+            -Xswiftc -warnings-as-errors
+
       - name: Build universal binary
-        run: |
-          swift build -c release --arch arm64 --arch x86_64
-      
-      - name: Package and verify app bundle
+        run: swift build -c release --arch arm64 --arch x86_64
+
+      - name: Package unsigned CI app
         env:
-          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          SIGNING_IDENTITY: '-'
         run: ./scripts/package-app.sh
-      
-      - name: Create DMG
-        run: |
-          ./scripts/create-dmg.sh
 
-      - name: Notarize tagged release when credentials are configured
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Create and verify unsigned CI DMG
         env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          SIGNING_IDENTITY: '-'
+          APP_VERIFICATION_MODE: adhoc
         run: |
-          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_TEAM_ID" ] && [ -n "$APPLE_APP_PASSWORD" ]; then
-            ./scripts/notarize.sh DiskInventoryZed-*.dmg
-          else
-            echo "Notarization credentials are not configured; publishing an unnotarized build."
-          fi
+          mkdir -p dist/ci
+          ./scripts/create-dmg.sh \
+            DiskInventoryZed.app \
+            dist/ci/DiskInventoryZed-unsigned-ci.dmg
+          ./scripts/verify-macos-dmg.sh \
+            dist/ci/DiskInventoryZed-unsigned-ci.dmg \
+            adhoc
+          ditto -c -k --sequesterRsrc --keepParent \
+            DiskInventoryZed.app \
+            dist/ci/DiskInventoryZed-unsigned-ci.app.zip
+          (
+            cd dist/ci
+            shasum -a 256 \
+              DiskInventoryZed-unsigned-ci.dmg \
+              DiskInventoryZed-unsigned-ci.app.zip \
+              > DiskInventoryZed-unsigned-ci-checksums.txt
+          )
 
-      - name: Generate release checksums
-        run: shasum -a 256 DiskInventoryZed-*.dmg > DiskInventoryZed-checksums.txt
-
-      - name: Upload DMG artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload non-distributable macOS artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: DiskInventoryZed-DMG
+          name: DiskInventoryZed-UNSIGNED-CI-NOT-FOR-DISTRIBUTION
           path: |
-            DiskInventoryZed-*.dmg
-            DiskInventoryZed-checksums.txt
+            dist/ci/DiskInventoryZed-unsigned-ci.dmg
+            dist/ci/DiskInventoryZed-unsigned-ci.app.zip
+            dist/ci/DiskInventoryZed-unsigned-ci-checksums.txt
           if-no-files-found: error
-      
-      - name: Upload app bundle artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: DiskInventoryZed-App
-          path: DiskInventoryZed.app
-          if-no-files-found: error
+          compression-level: 0
 
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    permissions:
-      contents: write
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-    
-    steps:
-      - name: Checkout release metadata
-        uses: actions/checkout@v4
 
-      - name: Resolve release version
-        id: version
-        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Swift 5.9
+        uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a # v2.4.0
+        with:
+          swift-version: '5.9'
+
+      - name: Compile and test signal bridge
+        run: |
+          clang -std=c11 -Wall -Wextra -Werror -pedantic \
+            -I CLinuxSignals/include \
+            -c CLinuxSignals/CLinuxSignals.c \
+            -o "$RUNNER_TEMP/CLinuxSignals.o"
+          clang -std=c11 -Wall -Wextra -Werror -pedantic \
+            -DDIZ_SIGNAL_GRACE_SECONDS=1 \
+            -pthread \
+            -I CLinuxSignals/include \
+            CLinuxSignals/CLinuxSignals.c \
+            scripts/test-linux-signals.c \
+            -o "$RUNNER_TEMP/test-linux-signals"
+          "$RUNNER_TEMP/test-linux-signals"
+
+      - name: Run Linux unit tests
+        run: swift test -Xswiftc -strict-concurrency=complete
+
+      - name: Build Linux CLI with concurrency diagnostics
+        run: swift build -c release -Xswiftc -strict-concurrency=complete
+
+      - name: Run Linux CLI acceptance tests
+        run: |
+          BIN="$(swift build -c release --show-bin-path)/DiskInventoryZed"
+          ./scripts/test-linux-cli.sh "$BIN"
+
+  linux-distributions:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 24.04
+            image: swift:6.3.3-noble@sha256:69bf1f0281e13d82c9e49d67c2dd1dcc8c00bad738c860f4323d7078787ec8ea
+          - name: Debian 12
+            image: swift:6.3.3-bookworm@sha256:eefe3757e5e9b760628212943c3b5c7c7e3e7e5b9cf549bedb547689e6ef0b4c
+          - name: Amazon Linux 2
+            image: swift:6.3.3-amazonlinux2@sha256:55a6bce14b71defeccf53b5ae5394b4605b0906e2a501f1cc2bc048e5f6e68c7
+          - name: Red Hat UBI 9
+            image: swift:6.3.3-rhel-ubi9@sha256:e5bcef9413eb4ff2a5b5d965fcd06329cdccefc31002fe8b4fda50128340e31b
+
+    name: Linux source smoke (${{ matrix.name }})
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build and smoke test CLI
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" \
+            -w /workspace \
+            "${{ matrix.image }}" \
+            /bin/bash -lc '
+              swift build -c release --scratch-path /tmp/diz-build -Xswiftc -strict-concurrency=complete &&
+              mkdir -p /tmp/diz-input/nested &&
+              printf "distribution smoke test\n" > /tmp/diz-input/nested/file.txt &&
+              /tmp/diz-build/x86_64-unknown-linux-gnu/release/DiskInventoryZed --json /tmp/scan.json /tmp/diz-input >/dev/null &&
+              test -s /tmp/scan.json
+            '
+
+  linux-portable:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Build source and portable Linux archives with Swift 6.3.3
+        env:
+          BUILD_ENVIRONMENT: docker.io/library/swift:6.3.3-rhel-ubi9@sha256:e5bcef9413eb4ff2a5b5d965fcd06329cdccefc31002fe8b4fda50128340e31b
+        run: |
+          docker run --rm --interactive --platform linux/amd64 \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp/diz-home \
+            -e BUILD_ENVIRONMENT \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            'swift:6.3.3-rhel-ubi9@sha256:e5bcef9413eb4ff2a5b5d965fcd06329cdccefc31002fe8b4fda50128340e31b' \
+            /bin/bash -s <<'DIZ_BUILD'
+          set -euo pipefail
+          mkdir -p "$HOME"
+          swift sdk install \
+            https://download.swift.org/swift-6.3.3-release/static-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz \
+            --checksum 87c3eaf908e67c0e13a84367119e12273cec1d2cd3d81f7d74bb36722d6b607b
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH BUILD_ENVIRONMENT
+          VERSION="$(python3 - <<'PY'
+          import plistlib
+          with open("Resources/Info.plist", "rb") as source:
+              print(plistlib.load(source)["CFBundleShortVersionString"])
+          PY
+          )"
+          ./scripts/package-source.sh dist
+          SOURCE_ARCHIVE_PATH="dist/DiskInventoryZed-${VERSION}-corresponding-source.tar.gz"
+          SOURCE_ARCHIVE_SHA256="$(sha256sum "$SOURCE_ARCHIVE_PATH" | cut -d ' ' -f 1)"
+          LEGAL_DIRECTORY="/tmp/DiskInventoryZed-legal"
+          ./scripts/fetch-verified-files.py \
+            Legal/third-party-components.json \
+            "$LEGAL_DIRECTORY"
+          export SOURCE_ARCHIVE_PATH SOURCE_ARCHIVE_SHA256 LEGAL_DIRECTORY
+          ./scripts/package-linux.sh x86_64-swift-linux-musl dist
+          ./scripts/package-linux.sh aarch64-swift-linux-musl dist
+
+          mkdir -p dist/smoke/x86_64 dist/smoke/aarch64
+          tar -xzf "dist/DiskInventoryZed-${VERSION}-linux-x86_64.tar.gz" \
+            -C dist/smoke/x86_64 --strip-components=1
+          tar -xzf "dist/DiskInventoryZed-${VERSION}-linux-aarch64.tar.gz" \
+            -C dist/smoke/aarch64 --strip-components=1
+          test -x dist/smoke/x86_64/DiskInventoryZed
+          test -x dist/smoke/aarch64/DiskInventoryZed
+          ./scripts/test-linux-cli.sh dist/smoke/x86_64/DiskInventoryZed "$VERSION"
+          DIZ_BUILD
+          file dist/smoke/x86_64/DiskInventoryZed | grep -Eq 'ELF 64-bit.*x86-64.*statically linked'
+          file dist/smoke/aarch64/DiskInventoryZed | grep -Eq 'ELF 64-bit.*ARM aarch64.*statically linked'
+
+      - name: Enable ARM64 emulation
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          platforms: arm64
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+
+      - name: Smoke test portable binaries
+        run: |
+          smoke_binary() {
+            local platform="$1"
+            local image="$2"
+            local binary="$3"
+            docker run --rm --platform "$platform" \
+              -v "$GITHUB_WORKSPACE/$binary:/opt/DiskInventoryZed:ro" \
+              "$image" /bin/sh -c '
+                mkdir -p /tmp/diz-input/nested &&
+                printf "portable smoke test\n" > /tmp/diz-input/nested/file.txt &&
+                /opt/DiskInventoryZed --json /tmp/scan.json /tmp/diz-input >/dev/null &&
+                test -s /tmp/scan.json
+              '
+          }
+
+          for image in \
+            'ubuntu:22.04@sha256:3b06811b2afd352be909dd088a004166d665dc76d38b13eada33522a9d915c6f' \
+            'ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea' \
+            'debian:12@sha256:9344f8b8992482f80cba753f323adeaf17690076c095ccff6cc9536be98185dc' \
+            'fedora:42@sha256:99e203b80b1c3d8f7e161ec10a68fd02b081ef83a3963553e513c82846b97814' \
+            'rockylinux:9@sha256:d7be1c094cc5845ee815d4632fe377514ee6ebcf8efaed6892889657e5ddaaa6' \
+            'alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40'; do
+            smoke_binary linux/amd64 "$image" dist/smoke/x86_64/DiskInventoryZed
+          done
+          smoke_binary \
+            linux/arm64 \
+            'ubuntu:22.04@sha256:a8cdd2158a73d7e5c02aa351fe269f48f57cf710a241db86e9ede371fc150149' \
+            dist/smoke/aarch64/DiskInventoryZed
+          smoke_binary \
+            linux/arm64 \
+            'alpine:3.23@sha256:d858bb5442632a31bd4bca6c5e601dbe6b536fd7942092ea6a08a0a95805693c' \
+            dist/smoke/aarch64/DiskInventoryZed
+
+      - name: Verify portable signal cancellation
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v "$GITHUB_WORKSPACE/dist/smoke/x86_64/DiskInventoryZed:/opt/DiskInventoryZed:ro" \
+            'alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40' \
+            /bin/sh -c '
+              set -eu
+              mkdir -p /tmp/diz-input
+              index=0
+              while [ "$index" -lt 50000 ]; do
+                : > "/tmp/diz-input/file-$index"
+                index=$((index + 1))
+              done
+              probe_signal() {
+                signal_name="$1"
+                expected_status="$2"
+                output="/tmp/scan-$signal_name.json"
+                errors="/tmp/errors-$signal_name.txt"
+                /opt/DiskInventoryZed --json "$output" /tmp/diz-input \
+                  >/dev/null 2>"$errors" &
+                process_id=$!
+                handlers_ready=false
+                attempt=0
+                while [ "$attempt" -lt 500 ]; do
+                  if ! kill -0 "$process_id" 2>/dev/null; then
+                    break
+                  fi
+                  caught_mask="$(grep "^SigCgt:" "/proc/$process_id/status" 2>/dev/null | cut -f2 || true)"
+                  if printf "%s\n" "$caught_mask" |
+                    grep -Eq "[4567cdefCDEF][0-9a-fA-F]{2}[2367abefABEF]$"; then
+                    handlers_ready=true
+                    break
+                  fi
+                  attempt=$((attempt + 1))
+                  sleep 0.01
+                done
+                test "$handlers_ready" = true
+                kill -s "$signal_name" "$process_id"
+                set +e
+                wait "$process_id"
+                status=$?
+                set -e
+                test "$status" -eq "$expected_status"
+                test ! -e "$output"
+                grep -q "Operation cancelled" "$errors"
+              }
+              probe_signal INT 130
+              probe_signal TERM 143
+            '
+
+      - name: Generate portable checksums
+        run: |
+          cd dist
+          sha256sum -- \
+            DiskInventoryZed-*.tar.gz \
+            DiskInventoryZed-*.spdx.json \
+            > DiskInventoryZed-linux-checksums.txt
+
+      - name: Validate tagged build provenance
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         run: |
           VERSION="$(python3 - <<'PY'
           import plistlib
@@ -107,35 +327,553 @@ jobs:
               print(plistlib.load(source)["CFBundleShortVersionString"])
           PY
           )"
-          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Check whether release exists
-        id: existing
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ steps.version.outputs.tag }}
-        run: |
-          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "Release tag does not match Info.plist version." >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if [ "$GITHUB_SHA" != "$(git rev-parse 'origin/main^{commit}')" ]; then
+            echo "Tagged release commit must be the current origin/main commit." >&2
+            exit 1
           fi
 
-      - name: Download artifacts
-        if: steps.existing.outputs.publish == 'true'
-        uses: actions/download-artifact@v4
+      - name: Upload portable Linux artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: DiskInventoryZed-DMG
-      
-      - name: Create Release
-        if: steps.existing.outputs.publish == 'true'
-        uses: softprops/action-gh-release@v2
+          name: DiskInventoryZed-Linux
+          path: |
+            dist/DiskInventoryZed-*.tar.gz
+            dist/DiskInventoryZed-*.spdx.json
+            dist/DiskInventoryZed-linux-checksums.txt
+          if-no-files-found: error
+          compression-level: 0
+
+  linux-attest:
+    needs: linux-portable
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          files: |
-            DiskInventoryZed-*.dmg
-            DiskInventoryZed-checksums.txt
-          generate_release_notes: true
+          fetch-depth: 0
+
+      - name: Validate tagged build provenance
+        run: |
+          VERSION="$(python3 - <<'PY'
+          import plistlib
+          with open("Resources/Info.plist", "rb") as source:
+              print(plistlib.load(source)["CFBundleShortVersionString"])
+          PY
+          )"
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "Release tag does not match Info.plist version." >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if [ "$GITHUB_SHA" != "$(git rev-parse 'origin/main^{commit}')" ]; then
+            echo "Tagged release commit must be the current origin/main commit." >&2
+            exit 1
+          fi
+
+      - name: Download portable Linux artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: DiskInventoryZed-Linux
+          path: dist/linux
+
+      - name: Verify portable checksums
+        run: |
+          cd dist/linux
+          sha256sum -c DiskInventoryZed-linux-checksums.txt
+
+      - name: Attest portable build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: |
+            dist/linux/DiskInventoryZed-*.tar.gz
+            dist/linux/DiskInventoryZed-*.spdx.json
+
+      - name: Attest x86_64 SBOM
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
+        with:
+          subject-path: dist/linux/DiskInventoryZed-*-linux-x86_64.tar.gz
+          sbom-path: dist/linux/DiskInventoryZed-*-linux-x86_64.spdx.json
+
+      - name: Attest ARM64 SBOM
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
+        with:
+          subject-path: dist/linux/DiskInventoryZed-*-linux-aarch64.tar.gz
+          sbom-path: dist/linux/DiskInventoryZed-*-linux-aarch64.spdx.json
+
+  release-sign:
+    needs: [macos, linux, linux-distributions, linux-portable, linux-attest]
+    runs-on: macos-15
+    timeout-minutes: 120
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment: release
+    permissions:
+      contents: read
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      EXPECTED_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate release provenance and credentials
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_SIGNING_CERTIFICATE_BASE64: ${{ secrets.APPLE_SIGNING_CERTIFICATE_BASE64 }}
+          APPLE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+          EXPECTED_TAG="v${VERSION}"
+          if [ "$GITHUB_REF_NAME" != "$EXPECTED_TAG" ]; then
+            echo "Release tag '$GITHUB_REF_NAME' must match Info.plist version '$EXPECTED_TAG'." >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          MAIN_SHA="$(git rev-parse origin/main)"
+          if [ "$GITHUB_SHA" != "$MAIN_SHA" ]; then
+            echo "Tagged release commit must be the current origin/main commit." >&2
+            exit 1
+          fi
+          : "${EXPECTED_TEAM_ID:?The release environment APPLE_TEAM_ID variable is required}"
+          : "${APPLE_ID:?APPLE_ID secret is required for tagged releases}"
+          : "${APPLE_TEAM_ID:?APPLE_TEAM_ID secret is required for tagged releases}"
+          : "${APPLE_APP_PASSWORD:?APPLE_APP_PASSWORD secret is required for tagged releases}"
+          : "${APPLE_SIGNING_IDENTITY:?APPLE_SIGNING_IDENTITY secret is required for tagged releases}"
+          : "${APPLE_SIGNING_CERTIFICATE_BASE64:?APPLE_SIGNING_CERTIFICATE_BASE64 secret is required for tagged releases}"
+          : "${APPLE_SIGNING_CERTIFICATE_PASSWORD:?APPLE_SIGNING_CERTIFICATE_PASSWORD secret is required for tagged releases}"
+          if [[ ! "$EXPECTED_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || [ "$APPLE_TEAM_ID" != "$EXPECTED_TEAM_ID" ]; then
+            echo "The signing Team ID does not match the pinned release-environment value." >&2
+            exit 1
+          fi
+          echo "RELEASE_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Download portable Linux artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: DiskInventoryZed-Linux
+          path: dist/linux
+
+      - name: Verify portable release payload
+        run: |
+          python3 - \
+            dist/linux/DiskInventoryZed-linux-checksums.txt \
+            dist/linux \
+            "$RELEASE_VERSION" <<'PY'
+          import hashlib
+          from pathlib import Path
+          import string
+          import sys
+
+          manifest_path = Path(sys.argv[1])
+          directory = Path(sys.argv[2])
+          version = sys.argv[3]
+          expected_names = {
+              f"DiskInventoryZed-{version}-corresponding-source.tar.gz",
+              f"DiskInventoryZed-{version}-linux-x86_64.tar.gz",
+              f"DiskInventoryZed-{version}-linux-aarch64.tar.gz",
+              f"DiskInventoryZed-{version}-linux-x86_64.spdx.json",
+              f"DiskInventoryZed-{version}-linux-aarch64.spdx.json",
+          }
+          files = {path.name: path for path in directory.iterdir() if path.name != manifest_path.name}
+          if set(files) != expected_names:
+              raise SystemExit(f"Unexpected portable payload: {sorted(files)}")
+          expected = {}
+          for line in manifest_path.read_text(encoding="utf-8").splitlines():
+              fields = line.split(maxsplit=1)
+              if len(fields) != 2 or len(fields[0]) != 64 or any(
+                  character not in string.hexdigits for character in fields[0]
+              ):
+                  raise SystemExit(f"Malformed checksum line: {line!r}")
+              if fields[1] in expected:
+                  raise SystemExit(f"Duplicate checksum entry: {fields[1]}")
+              expected[fields[1]] = fields[0].lower()
+          if set(expected) != expected_names:
+              raise SystemExit("Portable checksum manifest does not match its payload")
+          for name, path in files.items():
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if digest != expected[name]:
+                  raise SystemExit(f"Checksum mismatch: {name}")
+          PY
+          SOURCE_ARCHIVE_NAME="DiskInventoryZed-${RELEASE_VERSION}-corresponding-source.tar.gz"
+          SOURCE_ARCHIVE_SHA256="$(shasum -a 256 "dist/linux/$SOURCE_ARCHIVE_NAME" | cut -d ' ' -f 1)"
+          echo "SOURCE_ARCHIVE_NAME=$SOURCE_ARCHIVE_NAME" >> "$GITHUB_ENV"
+          echo "SOURCE_ARCHIVE_SHA256=$SOURCE_ARCHIVE_SHA256" >> "$GITHUB_ENV"
+
+      - name: Import Developer ID certificate
+        env:
+          APPLE_SIGNING_CERTIFICATE_BASE64: ${{ secrets.APPLE_SIGNING_CERTIFICATE_BASE64 }}
+          APPLE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          umask 077
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id-certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/disk-inventory-zed-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "SIGNING_CERTIFICATE_PATH=$CERTIFICATE_PATH" >> "$GITHUB_ENV"
+          echo "SIGNING_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          printf '%s' "$APPLE_SIGNING_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" \
+            -P "$APPLE_SIGNING_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" |
+            grep -Fq "\"$APPLE_SIGNING_IDENTITY\""
+          rm -f "$CERTIFICATE_PATH"
+
+      - name: Build and verify signed universal app
+        env:
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          DISTRIBUTION_BUILD: true
+          EXPECTED_VERSION: ${{ env.RELEASE_VERSION }}
+        run: |
+          swift build -c release --arch arm64 --arch x86_64
+          ./scripts/package-app.sh
+
+      - name: Notarize and verify app
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          EXPECTED_VERSION: ${{ env.RELEASE_VERSION }}
+        run: |
+          ./scripts/notarize.sh DiskInventoryZed.app
+          ./scripts/verify-macos-app.sh DiskInventoryZed.app notarized
+
+      - name: Create signed DMG candidate
+        env:
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APP_VERIFICATION_MODE: notarized
+          DISTRIBUTION_BUILD: true
+          EXPECTED_VERSION: ${{ env.RELEASE_VERSION }}
+        run: |
+          mkdir -p dist/macos/.staging
+          ./scripts/create-dmg.sh \
+            DiskInventoryZed.app \
+            "dist/macos/.staging/DiskInventoryZed-${RELEASE_VERSION}.dmg"
+
+      - name: Notarize and verify final DMG
+        id: finalize-macos
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          EXPECTED_VERSION: ${{ env.RELEASE_VERSION }}
+        run: |
+          STAGED_DMG="dist/macos/.staging/DiskInventoryZed-${RELEASE_VERSION}.dmg"
+          FINAL_DMG="dist/macos/DiskInventoryZed-${RELEASE_VERSION}.dmg"
+          ./scripts/notarize.sh "$STAGED_DMG"
+          ./scripts/verify-macos-dmg.sh "$STAGED_DMG" notarized
+          if [ -e "$FINAL_DMG" ] || [ -L "$FINAL_DMG" ]; then
+            echo "Final DMG path unexpectedly exists: $FINAL_DMG" >&2
+            exit 1
+          fi
+          ./scripts/atomic-publish.py "$STAGED_DMG" "$FINAL_DMG"
+          (
+            cd dist/macos
+            shasum -a 256 "$(basename "$FINAL_DMG")" \
+              > DiskInventoryZed-macos-checksums.txt
+          )
+          echo "path=$FINAL_DMG" >> "$GITHUB_OUTPUT"
+
+      - name: Remove signing keychain before external actions
+        run: |
+          if [ -n "${SIGNING_CERTIFICATE_PATH:-}" ]; then
+            rm -f "$SIGNING_CERTIFICATE_PATH"
+          fi
+          if [ -n "${SIGNING_KEYCHAIN_PATH:-}" ]; then
+            security delete-keychain "$SIGNING_KEYCHAIN_PATH"
+          fi
+
+      - name: Upload signed macOS candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: DiskInventoryZed-Signed-macOS
+          path: |
+            ${{ steps.finalize-macos.outputs.path }}
+            dist/macos/DiskInventoryZed-macos-checksums.txt
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Remove signing keychain
+        if: always()
+        run: |
+          if [ -n "${SIGNING_CERTIFICATE_PATH:-}" ]; then
+            rm -f "$SIGNING_CERTIFICATE_PATH"
+          fi
+          if [ -n "${SIGNING_KEYCHAIN_PATH:-}" ]; then
+            security delete-keychain "$SIGNING_KEYCHAIN_PATH" || true
+          fi
+
+  macos-attest:
+    needs: release-sign
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate tagged build provenance
+        run: |
+          VERSION="$(python3 - <<'PY'
+          import plistlib
+          with open("Resources/Info.plist", "rb") as source:
+              print(plistlib.load(source)["CFBundleShortVersionString"])
+          PY
+          )"
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "Release tag does not match Info.plist version." >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if [ "$GITHUB_SHA" != "$(git rev-parse 'origin/main^{commit}')" ]; then
+            echo "Tagged release commit must be the current origin/main commit." >&2
+            exit 1
+          fi
+
+      - name: Download signed macOS candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: DiskInventoryZed-Signed-macOS
+          path: dist/macos
+
+      - name: Verify signed candidate checksum
+        run: |
+          cd dist/macos
+          sha256sum -c DiskInventoryZed-macos-checksums.txt
+
+      - name: Attest signed DMG provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/macos/DiskInventoryZed-*.dmg
+
+  release-publish:
+    needs: [linux-attest, macos-attest]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment: release
+    permissions:
+      actions: read
+      contents: write
+      attestations: read
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Download portable Linux artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: DiskInventoryZed-Linux
+          path: dist/linux
+
+      - name: Download signed macOS candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: DiskInventoryZed-Signed-macOS
+          path: dist/macos
+
+      - name: Verify release candidates and attestations
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="$(python3 - <<'PY'
+          import plistlib
+          with open("Resources/Info.plist", "rb") as source:
+              print(plistlib.load(source)["CFBundleShortVersionString"])
+          PY
+          )"
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "Release tag does not match Info.plist version." >&2
+            exit 1
+          fi
+          (
+            cd dist/linux
+            sha256sum -c DiskInventoryZed-linux-checksums.txt
+          )
+          (
+            cd dist/macos
+            shasum -a 256 -c DiskInventoryZed-macos-checksums.txt
+          )
+
+          mkdir -p release-assets
+          cp "dist/macos/DiskInventoryZed-${VERSION}.dmg" release-assets/
+          cp "dist/linux/DiskInventoryZed-${VERSION}-corresponding-source.tar.gz" release-assets/
+          cp "dist/linux/DiskInventoryZed-${VERSION}-linux-x86_64.tar.gz" release-assets/
+          cp "dist/linux/DiskInventoryZed-${VERSION}-linux-aarch64.tar.gz" release-assets/
+          cp "dist/linux/DiskInventoryZed-${VERSION}-linux-x86_64.spdx.json" release-assets/
+          cp "dist/linux/DiskInventoryZed-${VERSION}-linux-aarch64.spdx.json" release-assets/
+
+          verify_attestation() {
+            local artifact="$1"
+            local predicate="$2"
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if gh attestation verify "$artifact" \
+                --repo "$GITHUB_REPOSITORY" \
+                --predicate-type "$predicate" \
+                --cert-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+                --source-digest "$GITHUB_SHA" \
+                --source-ref "$GITHUB_REF" \
+                --signer-digest "$GITHUB_WORKFLOW_SHA" \
+                --deny-self-hosted-runners; then
+                return 0
+              fi
+              [ "$attempt" -eq 5 ] || sleep 3
+            done
+            return 1
+          }
+          for artifact in release-assets/*; do
+            verify_attestation "$artifact" 'https://slsa.dev/provenance/v1'
+          done
+          verify_attestation \
+            "release-assets/DiskInventoryZed-${VERSION}-linux-x86_64.tar.gz" \
+            'https://spdx.dev/Document/v2.3'
+          verify_attestation \
+            "release-assets/DiskInventoryZed-${VERSION}-linux-aarch64.tar.gz" \
+            'https://spdx.dev/Document/v2.3'
+          (
+            cd release-assets
+            sha256sum -- \
+              "DiskInventoryZed-${VERSION}.dmg" \
+              "DiskInventoryZed-${VERSION}-corresponding-source.tar.gz" \
+              "DiskInventoryZed-${VERSION}-linux-x86_64.tar.gz" \
+              "DiskInventoryZed-${VERSION}-linux-aarch64.tar.gz" \
+              "DiskInventoryZed-${VERSION}-linux-x86_64.spdx.json" \
+              "DiskInventoryZed-${VERSION}-linux-aarch64.spdx.json" \
+              > DiskInventoryZed-checksums.txt
+          )
+          echo "RELEASE_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Revalidate current main commit
+        run: |
+          git fetch --no-tags origin main
+          if [ "$GITHUB_SHA" != "$(git rev-parse origin/main)" ]; then
+            echo "Tagged release commit is no longer the current origin/main commit." >&2
+            exit 1
+          fi
+
+      - name: Require immutable GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_POLICY_TOKEN }}
+        run: |
+          : "${GH_TOKEN:?A fine-grained RELEASE_POLICY_TOKEN with Administration: read is required}"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/immutable-releases" \
+            --jq '
+              if .enabled == true then
+                {enabled, enforced_by_owner}
+              else
+                error("immutable releases are disabled")
+              end
+            '
+
+      - name: Create and publish immutable candidate release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          ./scripts/publish-release.sh \
+            "release-assets/DiskInventoryZed-${RELEASE_VERSION}.dmg" \
+            "release-assets/DiskInventoryZed-${RELEASE_VERSION}-corresponding-source.tar.gz" \
+            "release-assets/DiskInventoryZed-${RELEASE_VERSION}-linux-x86_64.tar.gz" \
+            "release-assets/DiskInventoryZed-${RELEASE_VERSION}-linux-aarch64.tar.gz" \
+            "release-assets/DiskInventoryZed-${RELEASE_VERSION}-linux-x86_64.spdx.json" \
+            "release-assets/DiskInventoryZed-${RELEASE_VERSION}-linux-aarch64.spdx.json" \
+            release-assets/DiskInventoryZed-checksums.txt
+
+      - name: Verify immutable release attestation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          verification=''
+          for attempt in 1 2 3 4 5 6; do
+            if verification="$(
+              gh release verify "$TAG_NAME" \
+                --repo "$GITHUB_REPOSITORY" \
+                --format json
+            )"; then
+              break
+            fi
+            if [ "$attempt" -eq 6 ]; then
+              echo "Release attestation could not be verified." >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}")"
+          release_id="$(jq -r '.id | tostring' <<<"$release")"
+          tag_sha="$(
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG_NAME}" --jq '.object.sha'
+          )"
+          jq -e \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg tag "$TAG_NAME" \
+            --arg release_id "$release_id" \
+            --arg tag_sha "$tag_sha" \
+            --argjson release "$release" '
+              .verificationResult.statement as $statement
+              | $statement.predicateType == "https://in-toto.io/attestation/release/v0.2"
+              and $statement.predicate.repository == $repo
+              and $statement.predicate.tag == $tag
+              and (($statement.predicate.databaseId | tostring) == $release_id)
+              and ([
+                $statement.subject[]
+                | select(
+                    .uri == ("pkg:github/" + $repo + "@" + $tag)
+                    and .digest.sha1 == $tag_sha
+                  )
+              ] | length == 1)
+              and (([
+                $release.assets[]
+                | {name, digest: (.digest | sub("^sha256:"; ""))}
+              ] | sort_by(.name)) == ([
+                $statement.subject[]
+                | select(.name != null)
+                | {name, digest: .digest.sha256}
+              ] | sort_by(.name)))
+            ' <<<"$verification" >/dev/null
