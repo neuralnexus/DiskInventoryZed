@@ -1,10 +1,16 @@
 using System.Runtime.InteropServices;
 using System.ComponentModel;
+using System.Runtime.Versioning;
 using Microsoft.Win32.SafeHandles;
 
 namespace DiskInventoryZed.Core.Scanning;
 
 internal readonly record struct FileIdentity(ulong VolumeSerialNumber, Guid FileId);
+internal readonly record struct FileVersion(
+    FileIdentity Identity,
+    long ChangeTime,
+    long LastWriteTime,
+    long Length);
 
 internal enum ReparsePointClassification
 {
@@ -395,6 +401,33 @@ internal static partial class WindowsFileMetadata
         {
             return null;
         }
+    }
+
+    [SupportedOSPlatform("windows")]
+    internal static unsafe bool TryReadVersion(SafeFileHandle handle, out FileVersion version)
+    {
+        if (TryReadIdentity(handle, out var identity) &&
+            GetFileBasicInformationByHandle(
+                handle,
+                FileBasicInfoClass,
+                out var basicInformation,
+                (uint)sizeof(FileBasicInfo)) &&
+            GetFileStandardInformationByHandle(
+                handle,
+                FileStandardInfoClass,
+                out var standardInformation,
+                (uint)sizeof(FileStandardInfo)))
+        {
+            version = new FileVersion(
+                identity,
+                basicInformation.ChangeTime,
+                basicInformation.LastWriteTime,
+                standardInformation.EndOfFile);
+            return true;
+        }
+
+        version = default;
+        return false;
     }
 
     private static unsafe bool TryReadIdentity(SafeFileHandle handle, out FileIdentity identity)

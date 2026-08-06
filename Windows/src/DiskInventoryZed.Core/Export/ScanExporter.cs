@@ -1,8 +1,11 @@
+using System.ComponentModel;
+using System.Globalization;
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
-using System.Globalization;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
 using DiskInventoryZed.Core.Models;
 using DiskInventoryZed.Core.Scanning;
 
@@ -10,8 +13,8 @@ namespace DiskInventoryZed.Core.Export;
 
 public static partial class ScanExporter
 {
-    private const uint MoveFileReplaceExisting = 0x00000001;
     private const uint MoveFileWriteThrough = 0x00000008;
+    private const int ErrorUnableToMoveReplacement2 = 1177;
 
     public static async Task ExportJsonAsync(
         FileNode root,
@@ -212,8 +215,25 @@ public static partial class ScanExporter
         var fullPath = Path.GetFullPath(destinationPath);
         var directory = Path.GetDirectoryName(fullPath)
             ?? throw new IOException("The export destination does not have a parent folder.");
+        cancellationToken.ThrowIfCancellationRequested();
         Directory.CreateDirectory(directory);
-        var temporaryPath = Path.Combine(directory, $".diz-{Guid.NewGuid():N}.tmp");
+        var operationId = Guid.NewGuid().ToString("N");
+        var temporaryPath = Path.Combine(directory, $".diz-{operationId}.tmp");
+        if (OperatingSystem.IsWindows())
+        {
+            var backupPath = Path.Combine(directory, $".diz-{operationId}.bak");
+            var securityTemplatePath = Path.Combine(directory, $".diz-{operationId}.acl");
+            await WriteAtomicallyWindowsAsync(
+                temporaryPath,
+                backupPath,
+                securityTemplatePath,
+                fullPath,
+                write,
+                cancellationToken,
+                beforeCommit);
+            return;
+        }
+
         try
         {
             await using (var stream = new FileStream(
@@ -234,7 +254,7 @@ public static partial class ScanExporter
                 await beforeCommit(cancellationToken);
             }
             cancellationToken.ThrowIfCancellationRequested();
-            CommitTemporaryFile(temporaryPath, fullPath);
+            File.Move(temporaryPath, fullPath, overwrite: true);
         }
         catch
         {
@@ -243,24 +263,362 @@ public static partial class ScanExporter
         }
     }
 
-    private static void CommitTemporaryFile(string temporaryPath, string destinationPath)
+    [SupportedOSPlatform("windows")]
+    private static async Task WriteAtomicallyWindowsAsync(
+        string temporaryPath,
+        string backupPath,
+        string securityTemplatePath,
+        string destinationPath,
+        Func<FileStream, Task> write,
+        CancellationToken cancellationToken,
+        Func<CancellationToken, Task>? beforeCommit)
     {
-        if (!OperatingSystem.IsWindows())
+        using var identity = WindowsIdentity.GetCurrent();
+        var caller = identity.User
+            ?? throw new IOException("The current Windows token does not have a user identity.");
+        var temporarySecurity = CreatePrivateFileSecurity(caller);
+        var originalDestination = TryGetFileSnapshot(destinationPath, FileShare.ReadWrite | FileShare.Delete);
+        var defaultSecurity = originalDestination is null
+            ? CaptureDefaultFileSecurity(securityTemplatePath)
+            : null;
+        var defaultOwner = defaultSecurity is null
+            ? caller
+            : GetRequiredOwner(defaultSecurity);
+        var defaultGroup = defaultSecurity is null
+            ? caller
+            : GetRequiredGroup(defaultSecurity);
+
+        try
         {
-            File.Move(temporaryPath, destinationPath, overwrite: true);
-            return;
+            FileIdentity stagedIdentity;
+            await using (var stream = new FileInfo(temporaryPath).Create(
+                FileMode.CreateNew,
+                FileSystemRights.FullControl,
+                FileShare.None,
+                64 * 1024,
+                FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.WriteThrough,
+                temporarySecurity))
+            {
+                VerifyPrivateFileSecurity(stream, caller);
+                stagedIdentity = ReadFileVersion(stream).Identity;
+                await write(stream);
+                await stream.FlushAsync(cancellationToken);
+                stream.Flush(flushToDisk: true);
+            }
+
+            FileVersion completedVersion;
+            using (var completedStream = new FileStream(
+                temporaryPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read))
+            {
+                VerifyPrivateFileSecurity(completedStream, caller);
+                completedVersion = ReadFileVersion(completedStream);
+                if (completedVersion.Identity != stagedIdentity)
+                {
+                    throw new IOException("The export staging file identity changed while it was written.");
+                }
+            }
+
+            if (beforeCommit is not null)
+            {
+                await beforeCommit(cancellationToken);
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+
+            using (var completedStream = new FileStream(
+                temporaryPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read))
+            {
+                VerifyPrivateFileSecurity(completedStream, caller);
+                if (ReadFileVersion(completedStream) != completedVersion)
+                {
+                    throw new IOException("The export staging file changed before commit.");
+                }
+
+                if (originalDestination is null)
+                {
+                    SetFileIdentity(temporaryPath, defaultOwner, defaultGroup);
+                }
+                else
+                {
+                    using var destinationStream = new FileStream(
+                        destinationPath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.Read);
+                    var currentDestination = ReadFileSnapshot(destinationStream);
+                    if (currentDestination != originalDestination.Value)
+                    {
+                        throw new IOException(
+                            "The export destination changed while the export was written.");
+                    }
+
+                    SetFileIdentity(
+                        temporaryPath,
+                        originalDestination.Value.Owner,
+                        originalDestination.Value.Group);
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            if (originalDestination is null)
+            {
+                CommitNewWindowsFile(temporaryPath, destinationPath);
+                TryApplyDefaultFileSecurity(destinationPath, defaultSecurity!);
+                return;
+            }
+
+            // ReplaceFileW has no handle form; the final rename assumes the caller controls the parent folder.
+            CommitExistingWindowsFile(temporaryPath, destinationPath, backupPath);
+        }
+        catch
+        {
+            TryDelete(temporaryPath);
+            throw;
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static FileSecurity CreatePrivateFileSecurity(SecurityIdentifier caller)
+    {
+        var security = new FileSecurity();
+        security.SetOwner(caller);
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        security.AddAccessRule(new FileSystemAccessRule(
+            caller,
+            FileSystemRights.FullControl,
+            InheritanceFlags.None,
+            PropagationFlags.None,
+            AccessControlType.Allow));
+        return security;
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void VerifyPrivateFileSecurity(FileStream stream, SecurityIdentifier caller)
+    {
+        var security = stream.GetAccessControl();
+        var descriptor = new RawSecurityDescriptor(
+            security.GetSecurityDescriptorBinaryForm(),
+            0);
+        var access = descriptor.DiscretionaryAcl;
+        var isPrivate =
+            descriptor.ControlFlags.HasFlag(ControlFlags.DiscretionaryAclProtected) &&
+            descriptor.Owner is not null &&
+            caller.Equals(descriptor.Owner) &&
+            access is { Count: 1 } &&
+            access[0] is CommonAce
+            {
+                AceFlags: AceFlags.None,
+                AceQualifier: AceQualifier.AccessAllowed,
+                IsCallback: false,
+                AccessMask: (int)FileSystemRights.FullControl
+            } rule &&
+            caller.Equals(rule.SecurityIdentifier);
+        if (!isPrivate)
+        {
+            throw new IOException(
+                "The destination filesystem did not enforce a private export staging file.");
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static DestinationSnapshot? TryGetFileSnapshot(string path, FileShare share)
+    {
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, share);
+            return ReadFileSnapshot(stream);
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException error)
+        {
+            throw new IOException(
+                "The export destination is not an accessible regular file.",
+                error);
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static DestinationSnapshot ReadFileSnapshot(FileStream stream)
+    {
+        var security = stream.GetAccessControl();
+        var owner = security.GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier
+            ?? throw new IOException("The export destination does not have a retrievable owner.");
+        var group = security.GetGroup(typeof(SecurityIdentifier)) as SecurityIdentifier
+            ?? throw new IOException("The export destination does not have a retrievable group.");
+        var descriptor = security.GetSecurityDescriptorSddlForm(
+            AccessControlSections.Owner |
+            AccessControlSections.Group |
+            AccessControlSections.Access);
+        return new DestinationSnapshot(owner, group, descriptor, ReadFileVersion(stream));
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static FileVersion ReadFileVersion(FileStream stream)
+    {
+        if (!WindowsFileMetadata.TryReadVersion(stream.SafeFileHandle, out var version))
+        {
+            throw new IOException("The file identity could not be validated for atomic export.");
         }
 
+        return version;
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static byte[] CaptureDefaultFileSecurity(string path)
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.CreateNew,
+            FileAccess.ReadWrite,
+            FileShare.None,
+            1,
+            FileOptions.DeleteOnClose);
+        return stream.GetAccessControl().GetSecurityDescriptorBinaryForm();
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static SecurityIdentifier GetRequiredOwner(byte[] securityDescriptor)
+    {
+        var descriptor = new RawSecurityDescriptor(securityDescriptor, 0);
+        return descriptor.Owner
+            ?? throw new IOException("The default export security descriptor has no owner.");
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static SecurityIdentifier GetRequiredGroup(byte[] securityDescriptor)
+    {
+        var descriptor = new RawSecurityDescriptor(securityDescriptor, 0);
+        return descriptor.Group
+            ?? throw new IOException("The default export security descriptor has no primary group.");
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void SetFileIdentity(
+        string path,
+        SecurityIdentifier destinationOwner,
+        SecurityIdentifier destinationGroup)
+    {
+        try
+        {
+            var security = new FileSecurity();
+            security.SetOwner(destinationOwner);
+            security.SetGroup(destinationGroup);
+            new FileInfo(path).SetAccessControl(security);
+            var appliedSecurity = new FileInfo(path).GetAccessControl(
+                AccessControlSections.Owner | AccessControlSections.Group);
+            var appliedOwner = appliedSecurity.GetOwner(typeof(SecurityIdentifier));
+            var appliedGroup = appliedSecurity.GetGroup(typeof(SecurityIdentifier));
+            if (!destinationOwner.Equals(appliedOwner) ||
+                !destinationGroup.Equals(appliedGroup))
+            {
+                throw new IOException("The export staging owner or group could not be preserved.");
+            }
+        }
+        catch (Exception error) when (error is UnauthorizedAccessException
+            or InvalidOperationException
+            or NotSupportedException
+            or System.Security.SecurityException)
+        {
+            throw new IOException(
+                "The export destination owner or group cannot be preserved.",
+                error);
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void CommitNewWindowsFile(string temporaryPath, string destinationPath)
+    {
         if (!MoveFileExW(
                 ToExtendedPath(temporaryPath),
                 ToExtendedPath(destinationPath),
-                MoveFileReplaceExisting | MoveFileWriteThrough))
+                MoveFileWriteThrough))
         {
-            throw new IOException(
-                "The completed export could not replace the destination.",
-                new Win32Exception(Marshal.GetLastPInvokeError()));
+            throw WindowsIOException(
+                "The completed export could not be installed at the new destination.",
+                Marshal.GetLastPInvokeError());
         }
     }
+
+    [SupportedOSPlatform("windows")]
+    private static void CommitExistingWindowsFile(
+        string temporaryPath,
+        string destinationPath,
+        string backupPath)
+    {
+        if (ReplaceFileW(
+                ToExtendedPath(destinationPath),
+                ToExtendedPath(temporaryPath),
+                ToExtendedPath(backupPath),
+                0,
+                0,
+                0))
+        {
+            TryDelete(backupPath);
+            return;
+        }
+
+        var replaceError = Marshal.GetLastPInvokeError();
+        if (replaceError == ErrorUnableToMoveReplacement2)
+        {
+            if (MoveFileExW(
+                    ToExtendedPath(backupPath),
+                    ToExtendedPath(destinationPath),
+                    MoveFileWriteThrough))
+            {
+                throw WindowsIOException(
+                    "The export replacement failed; the previous destination was restored.",
+                    replaceError);
+            }
+
+            var restoreError = Marshal.GetLastPInvokeError();
+            throw new IOException(
+                $"The export replacement and automatic recovery failed. " +
+                $"The previous destination remains at '{backupPath}'.",
+                new AggregateException(
+                    new Win32Exception(replaceError),
+                    new Win32Exception(restoreError)));
+        }
+
+        throw WindowsIOException(
+            "The completed export could not replace the destination.",
+            replaceError);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void TryApplyDefaultFileSecurity(string path, byte[] securityDescriptor)
+    {
+        try
+        {
+            var file = new FileInfo(path);
+            var security = new FileSecurity();
+            security.SetSecurityDescriptorBinaryForm(
+                securityDescriptor,
+                AccessControlSections.Owner |
+                AccessControlSections.Group |
+                AccessControlSections.Access);
+            file.SetAccessControl(security);
+        }
+        catch
+        {
+            // Installation already committed; retain the safer private ACL on failure.
+        }
+    }
+
+    private static IOException WindowsIOException(string message, int error) =>
+        new(message, new Win32Exception(error));
 
     private static string ToExtendedPath(string path)
     {
@@ -280,14 +638,46 @@ public static partial class ScanExporter
         try
         {
             File.Delete(path);
+            return;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // ReplaceFileW backups can retain the old destination's read-only attribute.
         }
         catch
         {
-            // Preserve the operation failure; a complete recovery artifact may remain.
+            return;
+        }
+
+        try
+        {
+            var attributes = File.GetAttributes(path) & ~FileAttributes.ReadOnly;
+            File.SetAttributes(path, attributes == 0 ? FileAttributes.Normal : attributes);
+            File.Delete(path);
+        }
+        catch
+        {
+            // Preserve the operation result; a complete recovery artifact may remain.
         }
     }
+
+    [LibraryImport("kernel32.dll", EntryPoint = "ReplaceFileW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool ReplaceFileW(
+        string replacedFileName,
+        string replacementFileName,
+        string backupFileName,
+        uint replaceFlags,
+        nint exclude,
+        nint reserved);
 
     [LibraryImport("kernel32.dll", EntryPoint = "MoveFileExW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool MoveFileExW(string existingFileName, string newFileName, uint flags);
+
+    private readonly record struct DestinationSnapshot(
+        SecurityIdentifier Owner,
+        SecurityIdentifier Group,
+        string SecurityDescriptor,
+        FileVersion Version);
 }
