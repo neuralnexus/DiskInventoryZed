@@ -10,6 +10,28 @@ import XCTest
 @testable import DiskInventoryZed
 
 final class DiskScannerTests: XCTestCase {
+    func testDirectoryPathBudgetIsEnforcedBeforeRetainingAnotherPath() throws {
+        let limit = 8 * 1_024 * 1_024
+
+        XCTAssertEqual(
+            try DiskScanner.validatedDirectoryPathByteCount(
+                limit - 1,
+                adding: 1,
+                directoryPath: "/scan"
+            ),
+            limit
+        )
+        XCTAssertThrowsError(try DiskScanner.validatedDirectoryPathByteCount(
+            limit,
+            adding: 1,
+            directoryPath: "/scan"
+        )) { error in
+            guard case DiskScanner.ScanError.directoryPathByteLimitExceeded = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
     func testScanBuildsCompleteImmutableTree() async throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -93,6 +115,34 @@ final class DiskScannerTests: XCTestCase {
     }
 
 #if os(Linux)
+    func testLinuxRejectsExcessivePathDepthBeforeOpeningIt() async throws {
+        let path = "/" + Array(repeating: "directory", count: 257).joined(separator: "/")
+
+        do {
+            _ = try await DiskScanner().scan(
+                url: URL(fileURLWithPath: path, isDirectory: true),
+                options: .default
+            ) { _ in }
+            XCTFail("Expected the path depth limit to be enforced")
+        } catch DiskScanner.ScanError.pathDepthLimitExceeded {
+            // Expected.
+        }
+    }
+
+    func testLinuxRejectsExcessivePathBytesBeforeOpeningIt() async throws {
+        let path = "/" + String(repeating: "a", count: 16 * 1_024)
+
+        do {
+            _ = try await DiskScanner().scan(
+                url: URL(fileURLWithPath: path, isDirectory: true),
+                options: .default
+            ) { _ in }
+            XCTFail("Expected the path byte limit to be enforced")
+        } catch DiskScanner.ScanError.pathByteLimitExceeded {
+            // Expected.
+        }
+    }
+
     func testSparseFileUsesLinuxAllocatedBlockCount() async throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

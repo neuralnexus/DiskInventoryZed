@@ -1,0 +1,178 @@
+{
+  "schemaVersion": 1,
+  "files": [
+    {
+      "name": "Swift-Apache-2.0-runtime-exception.txt",
+      "sha256": "770af8291f708538d8ff885a0bbc4e045cd700531741c4f99528d435c14d7f55",
+      "url": "https://raw.githubusercontent.com/swiftlang/swift/064859e41d68596f486c5d724401cb370f260409/LICENSE.txt"
+    },
+    {
+      "name": "Swift-Unicode-DFS-2015.txt",
+      "sha256": "a7dc1de7052d8122e9fa216a563885a8d90d07195610c94e95324838a06cfc6f",
+      "url": "https://raw.githubusercontent.com/swiftlang/swift/064859e41d68596f486c5d724401cb370f260409/utils/UnicodeData/COPYRIGHT.txt"
+    },
+    {
+      "name": "Foundation-NOTICE.txt",
+      "sha256": "c2e757911b86a76230099804831d8d847a865e88b5912171627492a7a49f0456",
+      "url": "https://raw.githubusercontent.com/swiftlang/swift-foundation/dbacc67779dc0a41ddc9493acbaa332d76c9fb03/NOTICE.txt"
+    },
+    {
+      "name": "Foundation-UUID-source.txt",
+      "sha256": "a4b4d6be2e3a8c2b1c579030d39266f3594ff43b313046ac5ea60de9a92e67c5",
+      "url": "https://raw.githubusercontent.com/swiftlang/swift-foundation/dbacc67779dc0a41ddc9493acbaa332d76c9fb03/Sources/_FoundationCShims/uuid.c"
+    },
+    {
+      "name": "ICU-76104.3-LICENSE.txt",
+      "sha256": "92841ff27a1b2d1030b00e0958af4d1f70353ff42c5dad7041f1950e909ccc5e",
+      "url": "https://raw.githubusercontent.com/apple-oss-distributions/ICU/71e88350afd8f8bcbb8a387edafd090de9ff7cca/icu/LICENSE"
+    },
+    {
+      "name": "LLVM-compiler-rt-LICENSE.txt",
+      "sha256": "1a8f1058753f1ba890de984e48f0242a3a5c29a6a8f2ed9fd813f36985387e8d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/82cdc19fa54d566969527b56f587ea8ea30bef51/compiler-rt/LICENSE.TXT"
+    },
+    {
+      "name": "LLVM-libcxx-LICENSE.txt",
+      "sha256": "539dd7aed86e8a4f12cbdd0e6c50c189c7d74847e4fecc64ce2c6ee3a01da38b",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/82cdc19fa54d566969527b56f587ea8ea30bef51/libcxx/LICENSE.TXT"
+    },
+    {
+      "name": "LLVM-libcxxabi-LICENSE.txt",
+      "sha256": "e2b35be49f7284a45b7baca8fc7b3ab7440e7902392b2528a457816b5bb2a15c",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/82cdc19fa54d566969527b56f587ea8ea30bef51/libcxxabi/LICENSE.TXT"
+    },
+    {
+      "name": "LLVM-libunwind-LICENSE.txt",
+      "sha256": "b5efebcaca80879234098e52d1725e6d9eb8fb96a19fce625d39184b705f7b6d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/82cdc19fa54d566969527b56f587ea8ea30bef51/libunwind/LICENSE.TXT"
+    },
+    {
+      "name": "musl-COPYRIGHT.txt",
+      "sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af",
+      "url": "https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?id=0784374d561435f7c787a555aeab8ede699ed298"
+    },
+    {
+      "name": "musl-fts-BSD-3-Clause.txt",
+      "sha256": "2d7271f76a43b862c82b73e94eec1316242f29e9bd97b40daf1c51dfe790f4ae",
+      "url": "https://raw.githubusercontent.com/swiftlang/swift-docker/ea31a3331dd0a3346ae7cc114daffe4f6be35415/swift-ci/sdks/static-linux/resources/fts/README.md"
+    },
+    {
+      "name": "mimalloc-MIT.txt",
+      "sha256": "82ade5d7d9b029044b5fbbc326207fc47c2d44ee4dd71e8a559c36d728217de9",
+      "url": "https://raw.githubusercontent.com/microsoft/mimalloc/fbd8b99c2b828428947d70fdc046bb55609be93e/LICENSE"
+    }
+  ],
+  "components": [
+    {
+      "SPDXID": "SPDXRef-Package-Swift",
+      "name": "Swift runtime",
+      "versionInfo": "6.3.3-064859e41d68596f486c5d724401cb370f260409",
+      "revision": "064859e41d68596f486c5d724401cb370f260409",
+      "downloadLocation": "git+https://github.com/swiftlang/swift.git@064859e41d68596f486c5d724401cb370f260409",
+      "licenseConcluded": "(Apache-2.0 WITH Swift-exception) AND Unicode-DFS-2015",
+      "licenseFiles": ["Swift-Apache-2.0-runtime-exception.txt", "Swift-Unicode-DFS-2015.txt"],
+      "purl": "pkg:github/swiftlang/swift@064859e41d68596f486c5d724401cb370f260409"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-SwiftFoundation",
+      "name": "Swift Foundation",
+      "versionInfo": "6.3.3-dbacc67779dc0a41ddc9493acbaa332d76c9fb03",
+      "revision": "dbacc67779dc0a41ddc9493acbaa332d76c9fb03",
+      "downloadLocation": "git+https://github.com/swiftlang/swift-foundation.git@dbacc67779dc0a41ddc9493acbaa332d76c9fb03",
+      "licenseConcluded": "(Apache-2.0 WITH Swift-exception) AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND MIT",
+      "licenseFiles": ["Swift-Apache-2.0-runtime-exception.txt", "Foundation-NOTICE.txt", "Foundation-UUID-source.txt"],
+      "purl": "pkg:github/swiftlang/swift-foundation@dbacc67779dc0a41ddc9493acbaa332d76c9fb03"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-SwiftFoundationICU",
+      "name": "Swift Foundation ICU",
+      "versionInfo": "76.1-e29ee41079d35eae68d98a7479864a19f2928d84",
+      "revision": "e29ee41079d35eae68d98a7479864a19f2928d84",
+      "downloadLocation": "git+https://github.com/swiftlang/swift-foundation-icu.git@e29ee41079d35eae68d98a7479864a19f2928d84",
+      "licenseConcluded": "(Apache-2.0 WITH Swift-exception) AND LicenseRef-ICU-76104.3-ThirdParty",
+      "licenseFiles": ["Swift-Apache-2.0-runtime-exception.txt", "ICU-76104.3-LICENSE.txt"],
+      "purl": "pkg:github/swiftlang/swift-foundation-icu@e29ee41079d35eae68d98a7479864a19f2928d84"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-CorelibsFoundation",
+      "name": "Swift Corelibs Foundation",
+      "versionInfo": "6.3.3-6da8413b9a088eb59badcf0665aa73116db51edf",
+      "revision": "6da8413b9a088eb59badcf0665aa73116db51edf",
+      "downloadLocation": "git+https://github.com/swiftlang/swift-corelibs-foundation.git@6da8413b9a088eb59badcf0665aa73116db51edf",
+      "licenseConcluded": "(Apache-2.0 WITH Swift-exception) AND BSD-3-Clause",
+      "licenseFiles": ["Swift-Apache-2.0-runtime-exception.txt", "Foundation-UUID-source.txt"],
+      "purl": "pkg:github/swiftlang/swift-corelibs-foundation@6da8413b9a088eb59badcf0665aa73116db51edf"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-Libdispatch",
+      "name": "Swift Corelibs libdispatch and BlocksRuntime",
+      "versionInfo": "6.3.3-ffcd1b88af2f923501b16d9718c53275408e0dbf",
+      "revision": "ffcd1b88af2f923501b16d9718c53275408e0dbf",
+      "downloadLocation": "git+https://github.com/swiftlang/swift-corelibs-libdispatch.git@ffcd1b88af2f923501b16d9718c53275408e0dbf",
+      "licenseConcluded": "Apache-2.0 WITH Swift-exception",
+      "licenseFiles": ["Swift-Apache-2.0-runtime-exception.txt"],
+      "purl": "pkg:github/swiftlang/swift-corelibs-libdispatch@ffcd1b88af2f923501b16d9718c53275408e0dbf"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-SwiftCollections",
+      "name": "Swift Collections",
+      "versionInfo": "1.1.6",
+      "revision": "c11818f3cae0780656baa430b49e7f163f08dffd",
+      "downloadLocation": "git+https://github.com/apple/swift-collections.git@c11818f3cae0780656baa430b49e7f163f08dffd",
+      "licenseConcluded": "Apache-2.0 WITH Swift-exception",
+      "licenseFiles": ["Swift-Apache-2.0-runtime-exception.txt"],
+      "purl": "pkg:github/apple/swift-collections@c11818f3cae0780656baa430b49e7f163f08dffd"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-LLVMRuntimes",
+      "name": "LLVM compiler and C++ runtimes",
+      "versionInfo": "82cdc19fa54d566969527b56f587ea8ea30bef51",
+      "revision": "82cdc19fa54d566969527b56f587ea8ea30bef51",
+      "downloadLocation": "git+https://github.com/llvm/llvm-project.git@82cdc19fa54d566969527b56f587ea8ea30bef51",
+      "licenseConcluded": "Apache-2.0 WITH LLVM-exception",
+      "licenseFiles": ["LLVM-compiler-rt-LICENSE.txt", "LLVM-libcxx-LICENSE.txt", "LLVM-libcxxabi-LICENSE.txt", "LLVM-libunwind-LICENSE.txt"],
+      "purl": "pkg:github/llvm/llvm-project@82cdc19fa54d566969527b56f587ea8ea30bef51"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-musl",
+      "name": "musl",
+      "versionInfo": "1.2.5",
+      "revision": "0784374d561435f7c787a555aeab8ede699ed298",
+      "downloadLocation": "https://git.musl-libc.org/cgit/musl/commit/?id=0784374d561435f7c787a555aeab8ede699ed298",
+      "licenseConcluded": "LicenseRef-musl-1.2.5",
+      "licenseFiles": ["musl-COPYRIGHT.txt"],
+      "purl": "pkg:generic/musl@1.2.5"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-musl-fts",
+      "name": "vendored musl fts",
+      "versionInfo": "1.2.7",
+      "revision": "ea31a3331dd0a3346ae7cc114daffe4f6be35415",
+      "sourceInfo": "Path swift-ci/sdks/static-linux/resources/fts; Git tree 088b85e6aa0a045ee95ba0d2e75c22e9ea65dc7a",
+      "downloadLocation": "git+https://github.com/swiftlang/swift-docker.git@ea31a3331dd0a3346ae7cc114daffe4f6be35415#swift-ci/sdks/static-linux/resources/fts",
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseFiles": ["musl-fts-BSD-3-Clause.txt"],
+      "purl": "pkg:github/swiftlang/swift-docker@ea31a3331dd0a3346ae7cc114daffe4f6be35415#swift-ci/sdks/static-linux/resources/fts"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-mimalloc",
+      "name": "mimalloc",
+      "versionInfo": "2.2.4",
+      "revision": "fbd8b99c2b828428947d70fdc046bb55609be93e",
+      "downloadLocation": "git+https://github.com/microsoft/mimalloc.git@fbd8b99c2b828428947d70fdc046bb55609be93e",
+      "licenseConcluded": "MIT",
+      "licenseFiles": ["mimalloc-MIT.txt"],
+      "purl": "pkg:github/microsoft/mimalloc@fbd8b99c2b828428947d70fdc046bb55609be93e"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-AppleICU",
+      "name": "Apple ICU",
+      "versionInfo": "76.1-76104.3",
+      "revision": "71e88350afd8f8bcbb8a387edafd090de9ff7cca",
+      "downloadLocation": "git+https://github.com/apple-oss-distributions/ICU.git@71e88350afd8f8bcbb8a387edafd090de9ff7cca",
+      "licenseConcluded": "LicenseRef-ICU-76104.3-ThirdParty",
+      "licenseFiles": ["ICU-76104.3-LICENSE.txt"],
+      "purl": "pkg:github/apple-oss-distributions/ICU@71e88350afd8f8bcbb8a387edafd090de9ff7cca"
+    }
+  ]
+}

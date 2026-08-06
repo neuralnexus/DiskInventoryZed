@@ -105,9 +105,16 @@ its matching Static Linux SDK, then build either architecture:
 swift sdk install \
   https://download.swift.org/swift-6.3.3-release/static-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz \
   --checksum 87c3eaf908e67c0e13a84367119e12273cec1d2cd3d81f7d74bb36722d6b607b
-./scripts/package-linux.sh x86_64-swift-linux-musl
-./scripts/package-linux.sh aarch64-swift-linux-musl
+export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+./scripts/package-source.sh dist
+./scripts/package-linux.sh x86_64-swift-linux-musl dist
+./scripts/package-linux.sh aarch64-swift-linux-musl dist
 ```
+
+The source packager downloads commit-pinned upstream source archives and rejects any SHA-256
+mismatch. Each portable archive includes the full GPL, third-party notices, exact build metadata,
+and corresponding-source directions. Per-architecture SPDX 2.3 JSON documents are emitted beside
+the binary archives.
 
 ### Installing a Linux Release
 
@@ -122,44 +129,46 @@ DiskInventoryZed --help
 
 On ARM64, use the corresponding `linux-aarch64` archive and directory names.
 
-## macOS First Launch
+Official releases also publish GitHub artifact attestations. Verify a downloaded artifact with:
 
-Starting with v1.2, official tagged releases produced by the current workflow are Developer ID signed
-and notarized. The existing v1.1 release, developer builds, and ordinary CI builds may trigger a macOS
-Gatekeeper warning. Future release tags require the current `main` commit plus signing and notarization
-credentials in a protected repository `release` environment:
+```bash
+gh attestation verify DiskInventoryZed-1.2-linux-x86_64.tar.gz \
+  --repo neuralnexus/DiskInventoryZed
+```
 
-> **"Apple could not verify 'DiskInventoryZed' is free of malware that may harm your Mac or compromise your privacy."**
+## Installing the macOS Release
 
-### Downloading the DMG
+Starting with v1.2, official tagged releases are Developer ID signed, hardened-runtime enabled,
+notarized, and stapled. The release gate verifies the final mounted DMG and the exact app delivered
+inside it before publication.
 
-The DMG installer includes:
-- **DiskInventoryZed.app** — the main application
-- **First-Run-Helper.app** — click this to open Security & Privacy settings automatically
-- **README.txt** — detailed first-launch instructions
+The DMG contains exactly `DiskInventoryZed.app` and an `Applications` symlink. Open the DMG, drag the
+app to Applications, and launch it from `/Applications`.
 
-### Quick Method: Right-click to Open
+If Gatekeeper rejects an official v1.2-or-later artifact, do not use **Open Anyway**, remove
+quarantine manually, or disable Gatekeeper. Delete the download, verify its release checksum and
+GitHub attestation, and report the failed release artifact.
 
-1. **Right-click** (or Control-click) the `DiskInventoryZed.app`
-2. Select **"Open"** from the context menu
-3. Click **"Open"** in the dialog that appears
+Protected locations may require Full Disk Access. Grant it only if needed under **System Settings >
+Privacy & Security > Full Disk Access**, then restart Disk Inventory Zed.
 
-### Using the First-Run-Helper
+Developer and ordinary CI builds are ad-hoc signed and explicitly labeled
+`UNSIGNED-CI-NOT-FOR-DISTRIBUTION`; they are not release artifacts.
 
-1. Double-click **"First-Run-Helper.app"** in the DMG
-2. Click **"Open Security Settings"** in the dialog
-3. System Settings will open to the Security pane
-4. Click **"Open Anyway"** next to DiskInventoryZed
-5. Click **"Open"** in the confirmation dialog
+### Release Controls
 
-### Manual Method
+Tagged publication requires all build jobs to pass and the tag to match the version on the current
+`main` commit. The protected GitHub `release` environment must define the public `APPLE_TEAM_ID`
+environment variable and the Apple signing/notarization secrets used by the workflow. The variable
+is independently compared with the notarization Team ID and every delivered code signature.
+The environment must also provide a narrowly scoped `RELEASE_POLICY_TOKEN` with repository
+**Administration: read** permission so publication can fail closed unless immutable Releases are
+enabled.
 
-1. Go to **System Settings > Privacy & Security**
-2. Scroll down to the **Security** section
-3. Click **"Open Anyway"** next to DiskInventoryZed
-4. Click **"Open"** in the confirmation dialog
-
-*Note: You only need to do this once. After the first launch, the app will open normally.*
+Repository administration must protect `main`, require the build workflow, require review for the
+`release` environment, restrict workflow changes with `CODEOWNERS`, protect `v*` tags, and enable
+immutable GitHub Releases. These controls are external to this repository and are required before a
+production tag is created.
 
 ## macOS Usage
 
@@ -178,10 +187,10 @@ Scan a directory and print a storage summary:
 DiskInventoryZed /home/user
 ```
 
-Create a JSON export that includes hidden files:
+Create a JSON export. Hidden entries are included by default so disk totals are complete:
 
 ```bash
-DiskInventoryZed --show-hidden --json scan.json /home/user
+DiskInventoryZed --json scan.json /home/user
 ```
 
 Create a CSV export in a separate scan:
@@ -190,11 +199,13 @@ Create a CSV export in a separate scan:
 DiskInventoryZed --csv scan.csv /home/user
 ```
 
-Use `--skip-developer-folders` to omit folders such as `.git`, `node_modules`, and `.build`.
+Use `--exclude-hidden` to omit hidden entries or `--skip-developer-folders` to omit folders such as
+`.git`, `node_modules`, and `.build`. Use `--version` to print the installed release version.
 The Linux CLI lists symlinks but never follows them, and it never deletes or moves files. Use one
 export option per scan and place the output outside the scanned directory. If any entry cannot be
 read or represented safely, the command exits nonzero and does not write the requested export.
-`SIGINT` and `SIGTERM` cancel scans cooperatively so temporary export state can be removed.
+`SIGINT` and `SIGTERM` cancel work cooperatively so temporary export state can be removed. If
+shutdown stalls, a forced-exit watchdog preserves the conventional 130 or 143 status.
 The selected scan root must not contain `..` or pass through a symbolic-link path component.
 Linux exports are create-only, refuse to replace any existing path, and use owner-only permissions
 (`0600`). Export directory ancestry must be owned by the current user or root; group- or
@@ -234,8 +245,11 @@ The macOS analysis sidebar goes beyond the classic Disk Inventory X workflow:
 - Totals sum file allocation and do not include filesystem directory-entry metadata.
 - Multiple hard links to the same file are shown, but their allocated storage is counted once.
 - Linux filenames that are not valid UTF-8 are reported as unreadable, and prevent export, because exported paths are UTF-8 strings.
-- Scans and exports are capped at 1,000,000 examined entries, individual directories at 100,000
-  examined entries including hidden entries, and imported JSON snapshots at 256 MiB.
+- Scans and exports are capped at 250,000 examined entries, individual directories at 25,000
+  examined entries including hidden entries, 8 MiB of retained paths per directory, and 64 MiB of
+  retained file-system paths per scan.
+- Linux scan paths are capped at 256 components and 16 KiB per path. Imported JSON snapshots are
+  capped at 256 MiB.
 - APFS clones and Linux reflinks or deduplicated extents can share physical blocks without exposing
   enough portable per-file metadata to measure exact exclusive ownership. Disk Inventory Zed reports
   per-inode allocated blocks and does not claim clone-level or reflink-level reclaimable bytes.
@@ -246,7 +260,8 @@ The macOS analysis sidebar goes beyond the classic Disk Inventory X workflow:
 
 Copyright (C) 2026 Matt Ivan.
 
-This project is licensed under the GNU General Public License v3.0 (GPL-3.0) — see the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU General Public License v3.0 or later
+(`GPL-3.0-or-later`). See the complete [LICENSE](LICENSE) text for details.
 
 ## Acknowledgments
 

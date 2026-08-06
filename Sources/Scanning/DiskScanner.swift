@@ -16,8 +16,14 @@ import Musl
 private let linuxOPath = Int32(0o10000000)
 #endif
 
-private let maximumScanEntries = 1_000_000
-private let maximumDirectoryEntries = 100_000
+private let maximumScanEntries = 250_000
+private let maximumDirectoryEntries = 25_000
+private let maximumScanPathBytes = 64 * 1_024 * 1_024
+private let maximumDirectoryPathBytes = 8 * 1_024 * 1_024
+#if os(Linux)
+private let maximumLinuxPathDepth = 256
+private let maximumLinuxPathBytes = 16 * 1_024
+#endif
 
 struct ScanDiagnostics: Sendable, Equatable {
     var unreadableItems = 0
@@ -69,6 +75,10 @@ final class DiskScanner: Sendable {
         case directoryChanged(String)
         case directoryEntryLimitExceeded(String, Int)
         case scanEntryLimitExceeded(Int)
+        case pathDepthLimitExceeded(String, Int)
+        case pathByteLimitExceeded(String, Int)
+        case directoryPathByteLimitExceeded(String, Int)
+        case scanPathByteLimitExceeded(Int)
 
         var errorDescription: String? {
             switch self {
@@ -86,6 +96,14 @@ final class DiskScanner: Sendable {
                 return "The directory contains more than \(limit) entries and could not be scanned safely: \(path)"
             case .scanEntryLimitExceeded(let limit):
                 return "The scan contains more than \(limit) entries and could not be completed safely."
+            case .pathDepthLimitExceeded(let path, let limit):
+                return "The directory path exceeds the \(limit)-component safety limit: \(path)"
+            case .pathByteLimitExceeded(let path, let limit):
+                return "The directory path exceeds the \(limit)-byte safety limit: \(path)"
+            case .directoryPathByteLimitExceeded(let path, let limit):
+                return "The directory entries contain more than \(limit) bytes of paths and could not be scanned safely: \(path)"
+            case .scanPathByteLimitExceeded(let limit):
+                return "The scan contains more than \(limit) bytes of file-system paths and could not be completed safely."
             }
         }
     }
@@ -118,7 +136,16 @@ final class DiskScanner: Sendable {
         guard let rootURL = Self.linuxLexicallyStandardizedURL(url) else {
             throw ScanError.invalidURL
         }
-        let rootMetadata = try? Self.linuxDirectoryMetadata(for: rootURL)
+        try Self.validateLinuxPathLimits(rootURL)
+        let rootMetadata: FileSystemMetadata?
+        do {
+            try Task.checkCancellation()
+            rootMetadata = try Self.linuxDirectoryMetadata(for: rootURL)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw ScanError.accessDenied("\(rootURL.path) (\(error.localizedDescription))")
+        }
         guard rootMetadata?.isDirectory == true,
               rootMetadata?.isSymbolicLink == false else {
             throw ScanError.invalidURL
@@ -212,8 +239,15 @@ final class DiskScanner: Sendable {
                                     if work.record.id == rootRecord.id {
                                         throw error
                                     }
-                                    if case .scanEntryLimitExceeded = error {
+                                    switch error {
+                                    case .scanEntryLimitExceeded,
+                                         .pathDepthLimitExceeded,
+                                         .pathByteLimitExceeded,
+                                         .directoryPathByteLimitExceeded,
+                                         .scanPathByteLimitExceeded:
                                         throw error
+                                    default:
+                                        break
                                     }
                                     try await queue.completeFailure(
                                         work,
@@ -281,6 +315,7 @@ final class DiskScanner: Sendable {
         examinedEntryCount: inout Int
     ) throws -> DirectoryOutput {
 #if os(Linux)
+        try validateLinuxPathLimits(work.record.url)
         let listing = try linuxDirectoryEntries(
             for: work,
             options: options,
@@ -304,6 +339,7 @@ final class DiskScanner: Sendable {
             throw CocoaError(.fileReadUnknown)
         }
         var entries: [ScannedDirectoryEntry] = []
+        var retainedPathByteCount = 0
         while let value = enumerator.nextObject() {
             try Task.checkCancellation()
             guard let url = value as? URL else { continue }
@@ -320,6 +356,11 @@ final class DiskScanner: Sendable {
                     continue
                 }
             }
+            retainedPathByteCount = try validatedDirectoryPathByteCount(
+                retainedPathByteCount,
+                adding: url.path.utf8.count,
+                directoryPath: work.record.url.path
+            )
             entries.append(ScannedDirectoryEntry(
                 url: url,
                 metadata: nil
@@ -454,7 +495,10 @@ final class DiskScanner: Sendable {
             directory: parent,
             children: children,
             skippedDirectories: skippedDirectories,
-            observedDirectoryIdentities: observedDirectoryIdentities
+            observedDirectoryIdentities: observedDirectoryIdentities,
+            pathByteCount: children.reduce(0) {
+                saturatingAdd($0, $1.record.url.path.utf8.count)
+            }
         )
     }
 
@@ -471,6 +515,22 @@ final class DiskScanner: Sendable {
 #else
         url.resolvingSymlinksInPath().standardizedFileURL.path
 #endif
+    }
+
+    static func validatedDirectoryPathByteCount(
+        _ currentCount: Int,
+        adding pathByteCount: Int,
+        directoryPath: String
+    ) throws -> Int {
+        guard currentCount >= 0,
+              pathByteCount >= 0,
+              pathByteCount <= maximumDirectoryPathBytes - currentCount else {
+            throw ScanError.directoryPathByteLimitExceeded(
+                directoryPath,
+                maximumDirectoryPathBytes
+            )
+        }
+        return currentCount + pathByteCount
     }
 
 #if os(Linux)
@@ -499,9 +559,17 @@ final class DiskScanner: Sendable {
         }
 
         var entries: [ScannedDirectoryEntry] = []
-        var opaqueEntries: [(nameBytes: [UInt8], metadata: FileSystemMetadata?)] = []
-        var representedNames: Set<String> = []
+        var opaqueEntries: [(nameBytes: [UInt8], metadata: FileSystemMetadata?, errorDescription: String?)] = []
         var observedDirectoryIdentities: Set<String> = []
+        var retainedPathByteCount = 0
+
+        func accountForRetainedPath(_ url: URL) throws {
+            retainedPathByteCount = try validatedDirectoryPathByteCount(
+                retainedPathByteCount,
+                adding: url.path.utf8.count,
+                directoryPath: work.record.url.path
+            )
+        }
 
         while true {
             try Task.checkCancellation()
@@ -543,37 +611,53 @@ final class DiskScanner: Sendable {
                     AT_SYMLINK_NOFOLLOW
                 )
             }
+            let metadataError = statusResult == 0
+                ? nil
+                : POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO).localizedDescription
             let childMetadata = statusResult == 0 ? linuxMetadata(from: childStatus) : nil
             if let directoryIdentity = childMetadata?.directoryIdentity {
                 observedDirectoryIdentities.insert(directoryIdentity)
             }
 
             guard let name = String(bytes: nameBytes, encoding: .utf8) else {
-                opaqueEntries.append((nameBytes: nameBytes, metadata: childMetadata))
+                opaqueEntries.append((
+                    nameBytes: nameBytes,
+                    metadata: childMetadata,
+                    errorDescription: metadataError
+                ))
                 continue
             }
 
-            representedNames.insert(name)
             let childURL = appendingFileName(name, to: work.record.url)
+            try accountForRetainedPath(childURL)
             entries.append(ScannedDirectoryEntry(
                 url: childURL,
-                metadata: childMetadata
+                metadata: childMetadata,
+                errorDescription: metadataError
             ))
         }
 
-        for opaqueEntry in opaqueEntries {
-            let encodedName = linuxOpaqueName(
-                for: opaqueEntry.nameBytes,
-                avoiding: &representedNames
-            )
-            let childURL = appendingFileName(encodedName, to: work.record.url)
-            entries.append(ScannedDirectoryEntry(
-                url: childURL,
-                metadata: opaqueEntry.metadata,
-                id: linuxChildIdentity(nameBytes: opaqueEntry.nameBytes, in: work.record.url),
-                name: encodedName,
-                errorDescription: "The file name is not valid UTF-8, so this entry could not be traversed or exported."
-            ))
+        if !opaqueEntries.isEmpty {
+            var representedNames = Set(entries.map { $0.url.lastPathComponent })
+            for opaqueEntry in opaqueEntries {
+                let encodedName = linuxOpaqueName(
+                    for: opaqueEntry.nameBytes,
+                    avoiding: &representedNames
+                )
+                let childURL = appendingFileName(encodedName, to: work.record.url)
+                try accountForRetainedPath(childURL)
+                let encodingError = "The file name is not valid UTF-8, so this entry could not be traversed or exported."
+                let errorDescription = opaqueEntry.errorDescription.map {
+                    "\(encodingError) Metadata error: \($0)"
+                } ?? encodingError
+                entries.append(ScannedDirectoryEntry(
+                    url: childURL,
+                    metadata: opaqueEntry.metadata,
+                    id: linuxChildIdentity(nameBytes: opaqueEntry.nameBytes, in: work.record.url),
+                    name: encodedName,
+                    errorDescription: errorDescription
+                ))
+            }
         }
 
         var verificationStatus = stat()
@@ -614,6 +698,17 @@ final class DiskScanner: Sendable {
         return linuxMetadata(from: status)
     }
 
+    private static func validateLinuxPathLimits(_ url: URL) throws {
+        let path = url.path
+        guard path.utf8.count <= maximumLinuxPathBytes else {
+            throw ScanError.pathByteLimitExceeded(path, maximumLinuxPathBytes)
+        }
+        let depth = path.split(separator: "/", omittingEmptySubsequences: true).count
+        guard depth <= maximumLinuxPathDepth else {
+            throw ScanError.pathDepthLimitExceeded(path, maximumLinuxPathDepth)
+        }
+    }
+
     private static func linuxLexicallyStandardizedURL(_ url: URL) -> URL? {
         var components: [Substring] = []
         for component in url.path.split(separator: "/", omittingEmptySubsequences: true) {
@@ -638,6 +733,7 @@ final class DiskScanner: Sendable {
         }
 
         for (index, component) in components.enumerated() {
+            try Task.checkCancellation()
             let isFinalComponent = index == components.count - 1
             let flags = isFinalComponent
                 ? O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
@@ -990,6 +1086,7 @@ private struct DirectoryOutput: Sendable {
     let children: [ChildRecord]
     let skippedDirectories: Int
     let observedDirectoryIdentities: Set<String>
+    let pathByteCount: Int
 }
 
 private struct NodeRecord: Sendable {
@@ -1053,6 +1150,7 @@ private actor ScanWorkQueue {
     private var knownDirectoryIdentities: Set<String>
     private var ownerByFileIdentity: [String: (id: String, generation: String?)] = [:]
     private var examinedEntryCount = 1
+    private var pathByteCount: Int
     private var fileCount = 0
     private var directoryCount = 0
     private var diagnostics = ScanDiagnostics.empty
@@ -1065,6 +1163,7 @@ private actor ScanWorkQueue {
         visitedDirectoryPaths = [root.canonicalDirectoryPath]
         knownDirectoryIdentities = rootDirectoryIdentity.map { Set([$0]) } ?? []
         currentPath = root.record.url.path
+        pathByteCount = root.record.url.path.utf8.count
     }
 
     func next() async -> WorkItem? {
@@ -1090,7 +1189,11 @@ private actor ScanWorkQueue {
         guard newEntryCount <= maximumScanEntries - examinedEntryCount else {
             throw DiskScanner.ScanError.scanEntryLimitExceeded(maximumScanEntries)
         }
+        guard output.pathByteCount <= maximumScanPathBytes - pathByteCount else {
+            throw DiskScanner.ScanError.scanPathByteLimitExceeded(maximumScanPathBytes)
+        }
         examinedEntryCount += newEntryCount
+        pathByteCount += output.pathByteCount
 
         records[output.directory.id] = output.directory
         directoryCount = saturatingAdd(directoryCount, 1)

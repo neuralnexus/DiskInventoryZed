@@ -1,0 +1,36 @@
+Disk Inventory Zed Third-Party Notices
+======================================
+
+The portable Linux executable statically links the components listed below.
+The complete license and notice texts are distributed in the adjacent
+licenses directory. Exact source revisions and verified source archive hashes
+are recorded in source-components.json and in the corresponding-source release
+asset named by SOURCE-ACCESS.txt.
+
+Component                    Revision / version                                License files
+---------------------------  ------------------------------------------------  ---------------------------------------------
+Swift runtime                064859e41d68596f486c5d724401cb370f260409          Swift-Apache-2.0-runtime-exception.txt
+                                                                                 Swift-Unicode-DFS-2015.txt
+Swift Foundation             dbacc67779dc0a41ddc9493acbaa332d76c9fb03          Swift-Apache-2.0-runtime-exception.txt
+                                                                                 Foundation-NOTICE.txt
+                                                                                 Foundation-UUID-source.txt
+Swift Foundation ICU         e29ee41079d35eae68d98a7479864a19f2928d84          Swift-Apache-2.0-runtime-exception.txt
+                                                                                 ICU-76104.3-LICENSE.txt
+Swift Corelibs Foundation    6da8413b9a088eb59badcf0665aa73116db51edf          Swift-Apache-2.0-runtime-exception.txt
+                                                                                 Foundation-UUID-source.txt
+Swift Corelibs Dispatch      ffcd1b88af2f923501b16d9718c53275408e0dbf          Swift-Apache-2.0-runtime-exception.txt
+Swift Collections 1.1.6     c11818f3cae0780656baa430b49e7f163f08dffd          Swift-Apache-2.0-runtime-exception.txt
+LLVM runtimes                82cdc19fa54d566969527b56f587ea8ea30bef51          LLVM-compiler-rt-LICENSE.txt
+                                                                                 LLVM-libcxx-LICENSE.txt
+                                                                                 LLVM-libcxxabi-LICENSE.txt
+                                                                                 LLVM-libunwind-LICENSE.txt
+musl 1.2.5                   0784374d561435f7c787a555aeab8ede699ed298          musl-COPYRIGHT.txt
+Vendored musl fts 1.2.7      tree 088b85e6aa0a045ee95ba0d2e75c22e9ea65dc7a     musl-fts-BSD-3-Clause.txt
+mimalloc 2.2.4               fbd8b99c2b828428947d70fdc046bb55609be93e          mimalloc-MIT.txt
+Apple ICU 76.1 / CLDR 46     71e88350afd8f8bcbb8a387edafd090de9ff7cca          ICU-76104.3-LICENSE.txt
+
+Disk Inventory Zed itself is Copyright (C) 2026 Matt Ivan and is distributed
+under GPL-3.0-or-later. See PROJECT-NOTICE.txt and the complete LICENSE file.
+
+This notice inventory documents the release payload; it does not alter any
+license terms or replace the complete texts supplied by the copyright holders.

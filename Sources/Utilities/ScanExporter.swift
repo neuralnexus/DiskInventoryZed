@@ -343,12 +343,15 @@ enum ScanExporter {
         }
 
         var stagingDescriptor: Int32 = -1
+        var stagingExists = true
         defer {
             if stagingDescriptor >= 0 {
                 close(stagingDescriptor)
             }
-            _ = stagingName.withCString { name in
-                unlinkat(destination.parentDescriptor, name, AT_REMOVEDIR)
+            if stagingExists {
+                _ = stagingName.withCString { name in
+                    unlinkat(destination.parentDescriptor, name, AT_REMOVEDIR)
+                }
             }
         }
 
@@ -452,6 +455,7 @@ enum ScanExporter {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
 
+        try Task.checkCancellation()
         let linkResult = temporaryName.withCString { temporaryPath in
             destination.name.withCString { destinationPath in
                 linkat(
@@ -469,15 +473,6 @@ enum ScanExporter {
             }
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        var publicationCommitted = false
-        defer {
-            if !publicationCommitted {
-                removePublishedFileIfUnchanged(
-                    destination: destination,
-                    expectedStatus: temporaryStatus
-                )
-            }
-        }
 
         do {
             try validateDestinationParent(
@@ -485,23 +480,41 @@ enum ScanExporter {
                 excludes: destination.excludedDirectoryIdentities,
                 displayPath: destination.displayPath
             )
+            try synchronizeDirectory(destination.parentDescriptor)
         } catch {
-            removePublishedFileIfUnchanged(
-                destination: destination,
-                expectedStatus: temporaryStatus
+            throw ScanExportError.publishedFileUncertain(
+                destination.displayPath,
+                error.localizedDescription
             )
-            throw error
         }
 
-        _ = fsync(destination.parentDescriptor)
         let unlinkResult = temporaryName.withCString { name in
             unlinkat(stagingDescriptor, name, 0)
         }
-        if unlinkResult == 0 {
-            temporaryExists = false
+        guard unlinkResult == 0 else {
+            throw ScanExportError.publishedFileUncertain(
+                destination.displayPath,
+                POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO).localizedDescription
+            )
         }
-        try Task.checkCancellation()
-        publicationCommitted = true
+        temporaryExists = false
+
+        do {
+            try synchronizeDirectory(stagingDescriptor)
+            let removeStagingResult = stagingName.withCString { name in
+                unlinkat(destination.parentDescriptor, name, AT_REMOVEDIR)
+            }
+            guard removeStagingResult == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            stagingExists = false
+            try synchronizeDirectory(destination.parentDescriptor)
+        } catch {
+            throw ScanExportError.publishedFileUncertain(
+                destination.displayPath,
+                error.localizedDescription
+            )
+        }
     }
 
     private static func writeUnnamedTemporary(
@@ -548,6 +561,7 @@ enum ScanExporter {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
 
+        try Task.checkCancellation()
         let descriptorPath = "/proc/self/fd/\(descriptor)"
         let linkResult = descriptorPath.withCString { sourcePath in
             destination.name.withCString { destinationPath in
@@ -569,15 +583,6 @@ enum ScanExporter {
             }
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        var publicationCommitted = false
-        defer {
-            if !publicationCommitted {
-                removePublishedFileIfUnchanged(
-                    destination: destination,
-                    expectedStatus: temporaryStatus
-                )
-            }
-        }
 
         do {
             try validateDestinationParent(
@@ -585,36 +590,22 @@ enum ScanExporter {
                 excludes: destination.excludedDirectoryIdentities,
                 displayPath: destination.displayPath
             )
+            try synchronizeDirectory(destination.parentDescriptor)
         } catch {
-            removePublishedFileIfUnchanged(
-                destination: destination,
-                expectedStatus: temporaryStatus
+            throw ScanExportError.publishedFileUncertain(
+                destination.displayPath,
+                error.localizedDescription
             )
-            throw error
         }
-        _ = fsync(destination.parentDescriptor)
-        try Task.checkCancellation()
-        publicationCommitted = true
     }
 
-    private static func removePublishedFileIfUnchanged(
-        destination: LinuxExportDestination,
-        expectedStatus: stat
-    ) {
-        var publishedStatus = stat()
-        let publishedResult = destination.name.withCString { name in
-            fstatat(
-                destination.parentDescriptor,
-                name,
-                &publishedStatus,
-                AT_SYMLINK_NOFOLLOW
-            )
-        }
-        if publishedResult == 0,
-           publishedStatus.st_dev == expectedStatus.st_dev,
-           publishedStatus.st_ino == expectedStatus.st_ino {
-            _ = destination.name.withCString { name in
-                unlinkat(destination.parentDescriptor, name, 0)
+    private static func synchronizeDirectory(_ descriptor: Int32) throws {
+        while true {
+            if fsync(descriptor) == 0 {
+                return
+            }
+            if errno != EINTR {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
         }
     }
@@ -892,6 +883,7 @@ enum ScanExportError: LocalizedError {
     case invalidTemporaryFile
     case outputInsideScan(String)
     case untrustedDestinationParent(String)
+    case publishedFileUncertain(String, String)
 
     var errorDescription: String? {
         switch self {
@@ -907,6 +899,8 @@ enum ScanExportError: LocalizedError {
             return "Export output must be outside the scanned directory: \(path)"
         case .untrustedDestinationParent(let path):
             return "Export destination ancestry is writable by an untrusted user: \(path)"
+        case .publishedFileUncertain(let path, let reason):
+            return "Export was published at \(path), but its final safety or durability could not be confirmed: \(reason)"
         }
     }
 }

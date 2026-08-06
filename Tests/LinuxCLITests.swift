@@ -11,7 +11,6 @@ import XCTest
 final class LinuxCLITests: XCTestCase {
     func testParserBuildsSafeScanConfiguration() throws {
         let result = try LinuxCLIParser.parse(arguments: [
-            "--show-hidden",
             "--skip-developer-folders",
             "--json", "scan.json",
             "/home/user"
@@ -24,6 +23,19 @@ final class LinuxCLITests: XCTestCase {
             showHiddenFiles: true,
             skipDeveloperFolders: true
         )))
+    }
+
+    func testParserCanExplicitlyExcludeHiddenEntries() throws {
+        let result = try LinuxCLIParser.parse(arguments: ["--exclude-hidden", "/home/user"])
+
+        guard case .run(let configuration) = result else {
+            return XCTFail("Expected a runnable configuration")
+        }
+        XCTAssertFalse(configuration.showHiddenFiles)
+    }
+
+    func testParserRecognizesVersion() throws {
+        XCTAssertEqual(try LinuxCLIParser.parse(arguments: ["--version"]), .version)
     }
 
     func testParserSupportsPathBeginningWithDashAfterSeparator() throws {
@@ -64,6 +76,9 @@ final class LinuxCLITests: XCTestCase {
         XCTAssertThrowsError(try LinuxCLIParser.parse(arguments: [
             "--json", "--follow-symlinks", "/tmp"
         ]))
+        XCTAssertThrowsError(try LinuxCLIParser.parse(arguments: [""]))
+        XCTAssertThrowsError(try LinuxCLIParser.parse(arguments: ["--json", "", "/tmp"]))
+        XCTAssertThrowsError(try LinuxCLIParser.parse(arguments: ["--csv", "", "/tmp"]))
     }
 
     func testCLIRejectsOutputInsideScannedDirectory() async throws {
@@ -143,7 +158,6 @@ final class LinuxCLITests: XCTestCase {
         let output = workspace.appendingPathComponent("scan.json")
 
         let exitCode = await DiskInventoryZedCLI.execute(arguments: [
-            "--show-hidden",
             "--skip-developer-folders",
             "--json", output.path,
             source.path
@@ -192,14 +206,19 @@ final class LinuxCLITests: XCTestCase {
     }
 
     func testTerminalOutputEscapesControlsAndBidirectionalOverrides() {
-        let unsafe = "safe\u{001B}[31m\nname\u{202E}txt"
+        let unsafe = "safe\u{001B}[31m\nname\u{2028}line\u{2029}paragraph\u{202E}txt"
 
         let escaped = DiskInventoryZedCLI.terminalSafe(unsafe)
 
-        XCTAssertEqual(escaped, "safe\\u{001B}[31m\\u{000A}name\\u{202E}txt")
+        XCTAssertEqual(
+            escaped,
+            "safe\\u{001B}[31m\\u{000A}name\\u{2028}line\\u{2029}paragraph\\u{202E}txt"
+        )
         XCTAssertFalse(escaped.contains("\u{001B}"))
         XCTAssertFalse(escaped.contains("\n"))
         XCTAssertFalse(escaped.contains("\u{202E}"))
+        XCTAssertFalse(escaped.contains("\u{2028}"))
+        XCTAssertFalse(escaped.contains("\u{2029}"))
     }
 
     private func makeTemporaryDirectory() throws -> URL {

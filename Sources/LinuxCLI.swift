@@ -55,6 +55,7 @@ struct LinuxCLIConfiguration: Equatable {
 
 enum LinuxCLIParseResult: Equatable {
     case help
+    case version
     case run(LinuxCLIConfiguration)
 }
 
@@ -62,7 +63,7 @@ enum LinuxCLIParser {
     static func parse(arguments: [String]) throws -> LinuxCLIParseResult {
         var jsonOutput: String?
         var csvOutput: String?
-        var showHiddenFiles = false
+        var showHiddenFiles = true
         var skipDeveloperFolders = false
         var paths: [String] = []
         var parsesOptions = true
@@ -74,14 +75,16 @@ enum LinuxCLIParser {
                 parsesOptions = false
             } else if parsesOptions && (argument == "--help" || argument == "-h") {
                 return .help
+            } else if parsesOptions && argument == "--version" {
+                return .version
             } else if parsesOptions && argument == "--json" {
                 guard jsonOutput == nil else { throw LinuxCLIError.duplicateOption(argument) }
                 jsonOutput = try value(after: argument, at: &index, in: arguments)
             } else if parsesOptions && argument == "--csv" {
                 guard csvOutput == nil else { throw LinuxCLIError.duplicateOption(argument) }
                 csvOutput = try value(after: argument, at: &index, in: arguments)
-            } else if parsesOptions && argument == "--show-hidden" {
-                showHiddenFiles = true
+            } else if parsesOptions && argument == "--exclude-hidden" {
+                showHiddenFiles = false
             } else if parsesOptions && argument == "--skip-developer-folders" {
                 skipDeveloperFolders = true
             } else if parsesOptions && argument.hasPrefix("-") {
@@ -92,7 +95,7 @@ enum LinuxCLIParser {
             index += 1
         }
 
-        guard let path = paths.first else {
+        guard let path = paths.first, !path.isEmpty else {
             throw LinuxCLIError.missingPath
         }
         guard paths.count == 1 else {
@@ -121,7 +124,7 @@ enum LinuxCLIParser {
             throw LinuxCLIError.missingValue(option)
         }
         let value = arguments[index]
-        guard !value.hasPrefix("-") else {
+        guard !value.isEmpty, !value.hasPrefix("-") else {
             throw LinuxCLIError.missingValue(option)
         }
         return value
@@ -189,6 +192,8 @@ private enum PreparedLinuxExport {
 
 @main
 struct DiskInventoryZedCLI {
+    static let version = "1.2"
+
     private static let usage = """
     Usage: DiskInventoryZed [options] PATH
 
@@ -198,12 +203,16 @@ struct DiskInventoryZedCLI {
     Options:
       --json OUTPUT              Export a versioned JSON snapshot
       --csv OUTPUT               Export all entries as CSV
-      --show-hidden              Include hidden files and directories
+      --exclude-hidden           Exclude hidden files and directories
       --skip-developer-folders   Skip .git, node_modules, .build, and similar folders
+      --version                  Show the installed version
       -h, --help                 Show this help
 
     Symlinks are listed but never followed. Use one export option per scan;
     the output must be outside PATH and must not already exist.
+
+    Copyright (C) 2026 Matt Ivan. GPL-3.0-or-later; absolutely no warranty.
+    License: https://github.com/neuralnexus/DiskInventoryZed/blob/v\(version)/LICENSE
     """
 
     static func main() async {
@@ -245,6 +254,13 @@ struct DiskInventoryZedCLI {
         signalState.register(commandTask)
         let commandExitCode = await commandTask.value
         signalSource.cancel()
+        let signalBeforeFinish = diz_received_signal()
+        if signalBeforeFinish != 0, commandExitCode == 0 {
+            try? write(
+                "error: Operation was interrupted after completion; verify whether the requested export was published.\n",
+                to: .standardError
+            )
+        }
         let receivedSignal = diz_finish_signal_pipe()
         let exitCode = receivedSignal == 0 ? commandExitCode : 128 + receivedSignal
         if exitCode != 0 {
@@ -264,15 +280,27 @@ struct DiskInventoryZedCLI {
             return 2
         }
 
-        guard case .run(let configuration) = parseResult else {
+        switch parseResult {
+        case .help:
             do {
                 try write(usage + "\n", to: .standardOutput)
                 return 0
             } catch {
                 return 1
             }
+        case .version:
+            do {
+                try write("DiskInventoryZed \(version)\n", to: .standardOutput)
+                return 0
+            } catch {
+                return 1
+            }
+        case .run(let configuration):
+            return await run(configuration)
         }
+    }
 
+    private static func run(_ configuration: LinuxCLIConfiguration) async -> Int32 {
         let displaysProgress = isatty(STDERR_FILENO) == 1
         do {
             let sourceURL = fileURL(for: configuration.path)
@@ -316,6 +344,16 @@ struct DiskInventoryZedCLI {
                     excludingDirectoryIdentities: result.scannedDirectoryIdentities
                 )
             }
+            if displaysProgress, let preparedExport {
+                let format: String
+                switch preparedExport {
+                case .json:
+                    format = "JSON"
+                case .csv:
+                    format = "CSV"
+                }
+                try write("Exporting \(format)...\n", to: .standardError)
+            }
             switch preparedExport {
             case .json(_, let destination):
                 try ScanExporter.exportJSON(
@@ -350,7 +388,7 @@ struct DiskInventoryZedCLI {
             if displaysProgress {
                 try? write("\n", to: .standardError)
             }
-            try? write("error: Scan cancelled.\n", to: .standardError)
+            try? write("error: Operation cancelled.\n", to: .standardError)
             return 130
         } catch {
             if displaysProgress {
@@ -379,9 +417,22 @@ struct DiskInventoryZedCLI {
         try write(summary + "\n", to: .standardOutput)
 
         if !diagnostics.firstUnreadablePaths.isEmpty {
+            var unreadableReasons: [Data: String] = [:]
+            let wantedPaths = Set(diagnostics.firstUnreadablePaths.map { Data($0.utf8) })
+            var stack = [result.root]
+            while let node = stack.popLast(), unreadableReasons.count < wantedPaths.count {
+                let pathKey = Data(node.path.utf8)
+                if wantedPaths.contains(pathKey), let reason = node.errorDescription {
+                    unreadableReasons[pathKey] = reason
+                }
+                stack.append(contentsOf: node.children)
+            }
             try write("First unreadable paths:\n", to: .standardOutput)
             for path in diagnostics.firstUnreadablePaths {
-                try write("  \(terminalSafe(path))\n", to: .standardOutput)
+                let reason = unreadableReasons[Data(path.utf8)].map {
+                    ": \(terminalSafe($0))"
+                } ?? ""
+                try write("  \(terminalSafe(path))\(reason)\n", to: .standardOutput)
             }
         }
     }
@@ -462,10 +513,8 @@ struct DiskInventoryZedCLI {
         var result = ""
         result.reserveCapacity(text.utf8.count)
         for scalar in text.unicodeScalars {
-            switch scalar.value {
-            case 0x00...0x1F, 0x7F...0x9F,
-                 0x061C, 0x200E, 0x200F,
-                 0x202A...0x202E, 0x2066...0x2069:
+            switch scalar.properties.generalCategory {
+            case .control, .format, .lineSeparator, .paragraphSeparator:
                 result += String(format: "\\u{%04X}", scalar.value)
             default:
                 result.unicodeScalars.append(scalar)
