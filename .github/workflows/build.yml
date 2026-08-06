@@ -253,11 +253,11 @@ jobs:
           done
           smoke_binary \
             linux/arm64 \
-            'ubuntu:22.04@sha256:3b06811b2afd352be909dd088a004166d665dc76d38b13eada33522a9d915c6f' \
+            'ubuntu:22.04@sha256:a8cdd2158a73d7e5c02aa351fe269f48f57cf710a241db86e9ede371fc150149' \
             dist/smoke/aarch64/DiskInventoryZed
           smoke_binary \
             linux/arm64 \
-            'alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40' \
+            'alpine:3.23@sha256:d858bb5442632a31bd4bca6c5e601dbe6b536fd7942092ea6a08a0a95805693c' \
             dist/smoke/aarch64/DiskInventoryZed
 
       - name: Verify portable signal cancellation
