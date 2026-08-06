@@ -8,6 +8,10 @@ namespace DiskInventoryZed.Windows.Controls;
 
 public sealed class TreemapControl : FileVisualizationControl
 {
+    private static readonly SolidColorBrush BackgroundBrush = FrozenBrush(Color.FromRgb(10, 14, 19));
+    private static readonly SolidColorBrush AggregateBrush = FrozenBrush(Color.FromRgb(91, 105, 119));
+    private static readonly Pen DirectoryBorder = FrozenPen(Color.FromArgb(130, 255, 255, 255), 1.2);
+    private static readonly Pen FileBorder = FrozenPen(Color.FromArgb(55, 255, 255, 255), 0.5);
     private IReadOnlyList<TreemapItem> _items = [];
     private FileNode? _layoutNode;
     private long _layoutMinimumSize = -1;
@@ -16,21 +20,22 @@ public sealed class TreemapControl : FileVisualizationControl
     protected override void OnRender(DrawingContext drawingContext)
     {
         base.OnRender(drawingContext);
-        drawingContext.DrawRectangle(new SolidColorBrush(Color.FromRgb(10, 14, 19)), null, new Rect(RenderSize));
+        drawingContext.DrawRectangle(BackgroundBrush, null, new Rect(RenderSize));
         EnsureLayout();
         var pixelsPerDip = VisualTreeHelper.GetDpi(this).PixelsPerDip;
         foreach (var item in _items)
         {
+            var node = (item.Content as LayoutContent.Node)?.Value;
             var rectangle = new Rect(
                 item.Rectangle.X,
                 item.Rectangle.Y,
                 item.Rectangle.Width,
                 item.Rectangle.Height);
-            var opacity = IsDimmed(item.Node) ? (item.Node.IsDirectory ? 0.3 : 0.12) : (item.Node.IsDirectory ? 0.72 : 1);
-            var brush = FileTypePalette.BrushFor(item.Node, opacity);
-            var border = new Pen(new SolidColorBrush(Color.FromArgb(item.Node.IsDirectory ? (byte)130 : (byte)55, 255, 255, 255)),
-                item.Node.IsDirectory ? 1.2 : 0.5);
-            border.Freeze();
+            var opacity = node is null
+                ? 1
+                : IsDimmed(node) ? (node.IsDirectory ? 0.3 : 0.12) : (node.IsDirectory ? 0.72 : 1);
+            var brush = node is null ? AggregateBrush : FileTypePalette.BrushFor(node, opacity);
+            var border = node?.IsDirectory == true ? DirectoryBorder : FileBorder;
             drawingContext.DrawRectangle(brush, border, rectangle);
 
             if (rectangle.Width <= 72 || rectangle.Height <= 25 || opacity < 0.2)
@@ -39,7 +44,7 @@ public sealed class TreemapControl : FileVisualizationControl
             }
 
             var text = new FormattedText(
-                item.Node.DisplayName,
+                node?.DisplayName ?? $"Other ({((LayoutContent.Aggregate)item.Content).ItemCount:N0} items)",
                 CultureInfo.CurrentUICulture,
                 System.Windows.FlowDirection.LeftToRight,
                 new Typeface("Segoe UI Semibold"),
@@ -62,7 +67,7 @@ public sealed class TreemapControl : FileVisualizationControl
         {
             if (_items[index].Rectangle.Contains(point.X, point.Y))
             {
-                return _items[index].Node;
+                return (_items[index].Content as LayoutContent.Node)?.Value;
             }
         }
 
@@ -80,6 +85,9 @@ public sealed class TreemapControl : FileVisualizationControl
         if (Node is null || ActualWidth <= 1 || ActualHeight <= 1)
         {
             _items = [];
+            _layoutNode = null;
+            _layoutMinimumSize = -1;
+            _layoutSize = default;
             return;
         }
 
@@ -92,6 +100,21 @@ public sealed class TreemapControl : FileVisualizationControl
         _layoutNode = Node;
         _layoutMinimumSize = MinimumSize;
         _layoutSize = size;
-        _items = TreemapLayout.Calculate(Node, ActualWidth, ActualHeight, MinimumSize);
+        var budget = VisualizationRenderBudget.ForTreemap(ActualWidth, ActualHeight);
+        _items = TreemapLayout.Calculate(Node, ActualWidth, ActualHeight, MinimumSize, budget);
+    }
+
+    private static SolidColorBrush FrozenBrush(Color color)
+    {
+        var brush = new SolidColorBrush(color);
+        brush.Freeze();
+        return brush;
+    }
+
+    private static Pen FrozenPen(Color color, double thickness)
+    {
+        var pen = new Pen(FrozenBrush(color), thickness);
+        pen.Freeze();
+        return pen;
     }
 }

@@ -15,10 +15,16 @@ public readonly record struct RectD(double X, double Y, double Width, double Hei
         Math.Max(0, Height - amount * 2));
 }
 
-public sealed record TreemapItem(FileNode Node, RectD Rectangle, int Depth);
+public abstract record LayoutContent(long AllocatedSize)
+{
+    public sealed record Node(FileNode Value) : LayoutContent(Value.AllocatedSize);
+    public sealed record Aggregate(long Size, int ItemCount) : LayoutContent(Size);
+}
+
+public sealed record TreemapItem(LayoutContent Content, RectD Rectangle, int Depth);
 
 public sealed record SunburstSlice(
-    FileNode Node,
+    LayoutContent Content,
     double StartAngle,
     double EndAngle,
     double InnerRadius,

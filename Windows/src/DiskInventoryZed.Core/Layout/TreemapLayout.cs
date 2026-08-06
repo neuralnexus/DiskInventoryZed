@@ -4,7 +4,6 @@ namespace DiskInventoryZed.Core.Layout;
 
 public static class TreemapLayout
 {
-    private const int MaximumRectangles = 60_000;
     private const int MaximumDepth = 64;
     private const double MinimumExpandableArea = 120;
 
@@ -12,15 +11,19 @@ public static class TreemapLayout
         FileNode root,
         double width,
         double height,
-        long minimumSize = 0)
+        long minimumSize = 0,
+        int maximumItems = 2048)
     {
-        if (width <= 1 || height <= 1)
+        if (width <= 1 || height <= 1 ||
+            !double.IsFinite(width) || !double.IsFinite(height) ||
+            !double.IsFinite(width * height) ||
+            maximumItems <= 0)
         {
             return [];
         }
 
-        var result = new List<TreemapItem>(Math.Min(4096, MaximumRectangles));
-        AppendChildren(root, new RectD(0, 0, width, height), 0, minimumSize, result);
+        var result = new List<TreemapItem>(Math.Min(maximumItems, 512));
+        AppendChildren(root, new RectD(0, 0, width, height), 0, minimumSize, maximumItems, result);
         return result;
     }
 
@@ -29,38 +32,42 @@ public static class TreemapLayout
         RectD parentRectangle,
         int depth,
         long minimumSize,
+        int maximumItems,
         List<TreemapItem> result)
     {
-        if (depth >= MaximumDepth || result.Count >= MaximumRectangles)
+        if (depth >= MaximumDepth || result.Count >= maximumItems)
         {
             return;
         }
 
-        var available = MaximumRectangles - result.Count;
-        var children = parent.Children
-            .Where(child => child.AllocatedSize > 0 && (minimumSize == 0 || child.AllocatedSize >= minimumSize))
-            .Take(available)
-            .ToArray();
-        if (children.Length == 0)
+        var content = LayoutSelection.Select(
+            parent.Children,
+            minimumSize,
+            maximumItems - result.Count,
+            (child, totalSize) => child.AllocatedSize / (double)totalSize * parentRectangle.Area >= 1);
+        if (content.Count == 0)
         {
             return;
         }
 
-        foreach (var layout in Squarify(children, parentRectangle))
+        var layouts = Squarify(content, parentRectangle);
+        var added = new List<NodeLayout>(layouts.Count);
+        foreach (var layout in layouts)
         {
-            if (result.Count >= MaximumRectangles)
+            if (result.Count >= maximumItems)
             {
                 break;
             }
+            result.Add(new TreemapItem(layout.Content, layout.Rectangle, depth));
+            added.Add(layout);
+        }
 
-            if (layout.Rectangle.Width < 0.5 || layout.Rectangle.Height < 0.5)
-            {
-                continue;
-            }
-
-            result.Add(new TreemapItem(layout.Node, layout.Rectangle, depth));
-            if (!layout.Node.IsContainer || layout.Node.Children.Count == 0 ||
-                layout.Rectangle.Area < MinimumExpandableArea || result.Count >= MaximumRectangles)
+        foreach (var layout in added)
+        {
+            if (result.Count >= maximumItems ||
+                layout.Content is not LayoutContent.Node { Value: { IsContainer: true } node } ||
+                node.Children.Count == 0 ||
+                layout.Rectangle.Area < MinimumExpandableArea)
             {
                 continue;
             }
@@ -75,31 +82,46 @@ public static class TreemapLayout
                     Height = Math.Max(0, childRectangle.Height - 12)
                 };
             }
-
             if (childRectangle.Width > 2 && childRectangle.Height > 2)
             {
-                AppendChildren(layout.Node, childRectangle, depth + 1, minimumSize, result);
+                AppendChildren(node, childRectangle, depth + 1, minimumSize, maximumItems, result);
             }
         }
     }
 
-    private static IReadOnlyList<NodeLayout> Squarify(IReadOnlyList<FileNode> children, RectD rectangle)
+    private static IReadOnlyList<NodeLayout> Squarify(IReadOnlyList<LayoutContent> content, RectD rectangle)
     {
-        var sorted = children.Where(child => child.AllocatedSize > 0)
-            .OrderByDescending(child => child.AllocatedSize)
+        var sorted = content.Where(item => item.AllocatedSize > 0)
+            .OrderByDescending(item => item.AllocatedSize)
+            .ThenBy(ContentOrderKey, StringComparer.Ordinal)
             .ToArray();
-        var totalSize = sorted.Aggregate(0d, (sum, child) => sum + child.AllocatedSize);
-        if (totalSize <= 0 || rectangle.Width <= 0 || rectangle.Height <= 0)
+        var totalSize = sorted.Sum(item => (decimal)item.AllocatedSize);
+        if (totalSize <= 0 || rectangle.Width <= 0 || rectangle.Height <= 0 ||
+            !double.IsFinite(rectangle.Area))
         {
             return [];
         }
 
-        var scale = rectangle.Area / totalSize;
-        var items = sorted.Select(child => new WeightedNode(child, child.AllocatedSize * scale)).ToArray();
+        var items = new WeightedNode[sorted.Length];
+        var remainingSize = totalSize;
+        var remainingArea = rectangle.Area;
+        for (var index = 0; index < sorted.Length; index++)
+        {
+            var area = index == sorted.Length - 1
+                ? remainingArea
+                : remainingArea * (double)((decimal)sorted[index].AllocatedSize / remainingSize);
+            if (index < sorted.Length - 1 && area >= remainingArea)
+            {
+                area = Math.Max(0, Math.BitDecrement(remainingArea));
+            }
+            area = Math.Clamp(area, 0, remainingArea);
+            items[index] = new WeightedNode(sorted[index], area);
+            remainingArea = Math.Max(0, remainingArea - area);
+            remainingSize -= sorted[index].AllocatedSize;
+        }
         var itemIndex = 0;
         var remaining = rectangle;
         var layouts = new List<NodeLayout>(items.Length);
-
         while (itemIndex < items.Length && remaining.Width > 0 && remaining.Height > 0)
         {
             var row = new List<WeightedNode>();
@@ -120,18 +142,38 @@ public static class TreemapLayout
                     break;
                 }
             }
-
-            var (rowLayouts, remainder) = LayoutRow(row, remaining);
-            layouts.AddRange(rowLayouts);
+            var (rowLayouts, remainder) = LayoutRow(
+                row,
+                remaining,
+                reserveRemainder: itemIndex < items.Length);
+            if (rowLayouts.Count == 0)
+            {
+                layouts.AddRange(row.Select(item => new NodeLayout(
+                    item.Content,
+                    new RectD(remaining.X, remaining.Y, 0, 0))));
+            }
+            else
+            {
+                layouts.AddRange(rowLayouts);
+            }
             remaining = remainder;
         }
-
+        while (itemIndex < items.Length)
+        {
+            layouts.Add(new NodeLayout(
+                items[itemIndex++].Content,
+                new RectD(remaining.X, remaining.Y, 0, 0)));
+        }
         return layouts;
     }
 
+    private static string ContentOrderKey(LayoutContent content) =>
+        content is LayoutContent.Node node ? node.Value.FullPath : "\uffff";
+
     private static (IReadOnlyList<NodeLayout> Layouts, RectD Remainder) LayoutRow(
         IReadOnlyList<WeightedNode> row,
-        RectD rectangle)
+        RectD rectangle,
+        bool reserveRemainder)
     {
         if (row.Count == 0)
         {
@@ -143,19 +185,25 @@ public static class TreemapLayout
         if (rectangle.Width >= rectangle.Height)
         {
             var columnWidth = Math.Min(rectangle.Width, rowArea / rectangle.Height);
+            if (reserveRemainder && columnWidth >= rectangle.Width)
+            {
+                var reservedWidth = Math.BitDecrement(rectangle.Width);
+                if (reservedWidth > 0)
+                {
+                    columnWidth = reservedWidth;
+                }
+            }
             if (columnWidth <= 0)
             {
                 return ([], rectangle);
             }
-
             var y = rectangle.Y;
             for (var index = 0; index < row.Count; index++)
             {
                 var height = index == row.Count - 1 ? Math.Max(0, rectangle.Bottom - y) : row[index].Area / columnWidth;
-                layouts.Add(new NodeLayout(row[index].Node, new RectD(rectangle.X, y, columnWidth, height)));
+                layouts.Add(new NodeLayout(row[index].Content, new RectD(rectangle.X, y, columnWidth, height)));
                 y += height;
             }
-
             return (layouts, new RectD(
                 rectangle.X + columnWidth,
                 rectangle.Y,
@@ -164,19 +212,25 @@ public static class TreemapLayout
         }
 
         var rowHeight = Math.Min(rectangle.Height, rowArea / rectangle.Width);
+        if (reserveRemainder && rowHeight >= rectangle.Height)
+        {
+            var reservedHeight = Math.BitDecrement(rectangle.Height);
+            if (reservedHeight > 0)
+            {
+                rowHeight = reservedHeight;
+            }
+        }
         if (rowHeight <= 0)
         {
             return ([], rectangle);
         }
-
         var x = rectangle.X;
         for (var index = 0; index < row.Count; index++)
         {
             var width = index == row.Count - 1 ? Math.Max(0, rectangle.Right - x) : row[index].Area / rowHeight;
-            layouts.Add(new NodeLayout(row[index].Node, new RectD(x, rectangle.Y, width, rowHeight)));
+            layouts.Add(new NodeLayout(row[index].Content, new RectD(x, rectangle.Y, width, rowHeight)));
             x += width;
         }
-
         return (layouts, new RectD(
             rectangle.X,
             rectangle.Y + rowHeight,
@@ -184,13 +238,12 @@ public static class TreemapLayout
             Math.Max(0, rectangle.Height - rowHeight)));
     }
 
-    private sealed record WeightedNode(FileNode Node, double Area);
-    private sealed record NodeLayout(FileNode Node, RectD Rectangle);
+    private sealed record WeightedNode(LayoutContent Content, double Area);
+    private sealed record NodeLayout(LayoutContent Content, RectD Rectangle);
 
     private readonly record struct RowMetrics(double Sum, double Minimum, double Maximum)
     {
         public static readonly RowMetrics Empty = new(0, double.PositiveInfinity, 0);
-
         public RowMetrics Add(double area) => new(Sum + area, Math.Min(Minimum, area), Math.Max(Maximum, area));
 
         public double WorstRatio(double shortSide)
@@ -199,10 +252,12 @@ public static class TreemapLayout
             {
                 return double.PositiveInfinity;
             }
-
-            var sideSquared = shortSide * shortSide;
-            var sumSquared = Sum * Sum;
-            return Math.Max(sideSquared * Maximum / sumSquared, sumSquared / (sideSquared * Minimum));
+            var sideToSum = shortSide / Sum;
+            var sumToSide = Sum / shortSide;
+            var result = Math.Max(
+                sideToSum * sideToSum * Maximum,
+                sumToSide * sumToSide / Minimum);
+            return double.IsNaN(result) ? double.PositiveInfinity : result;
         }
     }
 }

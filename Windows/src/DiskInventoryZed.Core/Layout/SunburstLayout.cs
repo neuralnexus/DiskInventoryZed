@@ -4,15 +4,16 @@ namespace DiskInventoryZed.Core.Layout;
 
 public static class SunburstLayout
 {
-    private const double MinimumVisibleAngle = Math.PI / 360; // 0.5 degrees
+    private const double MinimumVisibleAngle = Math.PI / 360;
 
     public static IReadOnlyList<SunburstSlice> Calculate(
         FileNode root,
         double outerRadius,
         long minimumSize = 0,
-        int maximumDepth = 6)
+        int maximumDepth = 6,
+        int maximumItems = 2048)
     {
-        if (outerRadius <= 10 || maximumDepth <= 0)
+        if (outerRadius <= 10 || maximumDepth <= 0 || maximumItems <= 0)
         {
             return [];
         }
@@ -29,8 +30,18 @@ public static class SunburstLayout
             ringWidth = (outerRadius - innerRadius) / maximumDepth;
         }
 
-        var slices = new List<SunburstSlice>();
-        AppendChildren(root, 0, 0, Math.PI * 2, innerRadius, ringWidth, minimumSize, maximumDepth, slices);
+        var slices = new List<SunburstSlice>(Math.Min(maximumItems, 512));
+        AppendChildren(
+            root,
+            0,
+            0,
+            Math.PI * 2,
+            innerRadius,
+            ringWidth,
+            minimumSize,
+            maximumDepth,
+            maximumItems,
+            slices);
         return slices;
     }
 
@@ -43,55 +54,58 @@ public static class SunburstLayout
         double ringWidth,
         long minimumSize,
         int maximumDepth,
+        int maximumItems,
         List<SunburstSlice> slices)
     {
-        if (depth >= maximumDepth)
+        if (depth >= maximumDepth || slices.Count >= maximumItems)
         {
             return;
         }
 
-        var children = parent.Children
-            .Where(child => child.AllocatedSize > 0 && (minimumSize == 0 || child.AllocatedSize >= minimumSize))
-            .ToArray();
-        var totalSize = children.Aggregate(0d, (sum, child) => sum + child.AllocatedSize);
-        if (totalSize <= 0)
-        {
-            return;
-        }
-
-        var currentAngle = startAngle;
         var totalSpan = endAngle - startAngle;
+        var available = maximumItems - slices.Count;
+        var content = LayoutSelection.Select(
+            parent.Children,
+            minimumSize,
+            available,
+            (child, totalSize) => child.AllocatedSize / (double)totalSize * totalSpan >= MinimumVisibleAngle);
+        if (content.Count == 0)
+        {
+            return;
+        }
+
+        var totalSize = content.Sum(item => (double)item.AllocatedSize);
+        var currentAngle = startAngle;
         var innerRadius = baseRadius + depth * ringWidth;
         var outerRadius = innerRadius + Math.Max(2, ringWidth - 3);
-        foreach (var child in children)
+        var descendants = new List<(FileNode Node, double StartAngle, double EndAngle)>();
+        for (var index = 0; index < content.Count; index++)
         {
-            var span = child.AllocatedSize / totalSize * totalSpan;
-            var nextAngle = currentAngle + span;
-            if (span >= MinimumVisibleAngle)
+            var item = content[index];
+            var nextAngle = index == content.Count - 1
+                ? endAngle
+                : currentAngle + item.AllocatedSize / totalSize * totalSpan;
+            slices.Add(new SunburstSlice(item, currentAngle, nextAngle, innerRadius, outerRadius, depth));
+            if (item is LayoutContent.Node { Value.IsContainer: true } node)
             {
-                slices.Add(new SunburstSlice(
-                    child,
-                    currentAngle,
-                    nextAngle,
-                    innerRadius,
-                    outerRadius,
-                    depth));
-                if (child.IsContainer)
-                {
-                    AppendChildren(
-                        child,
-                        depth + 1,
-                        currentAngle,
-                        nextAngle,
-                        baseRadius,
-                        ringWidth,
-                        minimumSize,
-                        maximumDepth,
-                        slices);
-                }
+                descendants.Add((node.Value, currentAngle, nextAngle));
             }
-
             currentAngle = nextAngle;
+        }
+
+        foreach (var descendant in descendants)
+        {
+            AppendChildren(
+                descendant.Node,
+                depth + 1,
+                descendant.StartAngle,
+                descendant.EndAngle,
+                baseRadius,
+                ringWidth,
+                minimumSize,
+                maximumDepth,
+                maximumItems,
+                slices);
         }
     }
 }

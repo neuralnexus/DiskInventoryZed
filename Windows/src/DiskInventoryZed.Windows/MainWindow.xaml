@@ -229,8 +229,8 @@
             <!-- Visualization workspace. Sunburst is deliberately first/default. -->
             <Grid Grid.Column="2" Background="#0A0E13">
                 <TabControl x:Name="VisualizationTabs" SelectedIndex="0" Margin="7" IsEnabled="{Binding CanUseSnapshot}">
-                    <TabItem Header="SUNBURST  Ctrl+1"
-                             AutomationProperties.HelpText="Visual overview. Use the List tab for keyboard and screen-reader access to scanned items.">
+                     <TabItem Header="SUNBURST  Ctrl+1"
+                               AutomationProperties.HelpText="Visual summary; small items may be grouped as Other. Use the List tab and search for keyboard and screen-reader access to individual items.">
                         <controls:SunburstControl Node="{Binding CurrentNode}"
                                                   AutomationProperties.Name="Interactive disk usage sunburst"
                                                   Focusable="False"
@@ -248,8 +248,8 @@
                             </controls:SunburstControl.ContextMenu>
                         </controls:SunburstControl>
                     </TabItem>
-                    <TabItem Header="HEATMAP  Ctrl+2"
-                             AutomationProperties.HelpText="Visual overview. Use the List tab for keyboard and screen-reader access to scanned items.">
+                     <TabItem Header="HEATMAP  Ctrl+2"
+                               AutomationProperties.HelpText="Visual summary; small items may be grouped as Other. Use the List tab and search for keyboard and screen-reader access to individual items.">
                         <controls:TreemapControl Node="{Binding CurrentNode}"
                                                  AutomationProperties.Name="Interactive disk usage heatmap"
                                                  Focusable="False"

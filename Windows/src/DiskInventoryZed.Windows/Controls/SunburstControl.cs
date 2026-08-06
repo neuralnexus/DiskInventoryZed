@@ -8,6 +8,12 @@ namespace DiskInventoryZed.Windows.Controls;
 
 public sealed class SunburstControl : FileVisualizationControl
 {
+    private static readonly SolidColorBrush BackgroundBrush = FrozenBrush(Color.FromRgb(10, 14, 19));
+    private static readonly SolidColorBrush AggregateBrush = FrozenBrush(Color.FromRgb(91, 105, 119));
+    private static readonly SolidColorBrush CenterBrush = FrozenBrush(Color.FromRgb(23, 31, 41));
+    private static readonly SolidColorBrush SecondaryTextBrush = FrozenBrush(Color.FromRgb(149, 163, 179));
+    private static readonly Pen SliceBorder = FrozenPen(Color.FromArgb(70, 5, 8, 12), 0.65);
+    private static readonly Pen CenterBorder = FrozenPen(Color.FromRgb(49, 63, 77), 1);
     private IReadOnlyList<SunburstSlice> _slices = [];
     private FileNode? _layoutNode;
     private long _layoutMinimumSize = -1;
@@ -17,7 +23,7 @@ public sealed class SunburstControl : FileVisualizationControl
     protected override void OnRender(DrawingContext drawingContext)
     {
         base.OnRender(drawingContext);
-        drawingContext.DrawRectangle(new SolidColorBrush(Color.FromRgb(10, 14, 19)), null, new Rect(RenderSize));
+        drawingContext.DrawRectangle(BackgroundBrush, null, new Rect(RenderSize));
         EnsureLayout();
         if (Node is null)
         {
@@ -26,17 +32,17 @@ public sealed class SunburstControl : FileVisualizationControl
 
         foreach (var slice in _slices)
         {
-            var opacity = IsDimmed(slice.Node) ? 0.12 : 1;
+            var node = (slice.Content as LayoutContent.Node)?.Value;
+            var opacity = node is not null && IsDimmed(node) ? 0.12 : 1;
             var geometry = CreateSliceGeometry(_center, slice);
-            var border = new Pen(new SolidColorBrush(Color.FromArgb(70, 5, 8, 12)), 0.65);
-            border.Freeze();
-            drawingContext.DrawGeometry(FileTypePalette.BrushFor(slice.Node, opacity), border, geometry);
+            var brush = node is null ? AggregateBrush : FileTypePalette.BrushFor(node, opacity);
+            drawingContext.DrawGeometry(brush, SliceBorder, geometry);
         }
 
         var centerRadius = _slices.Count == 0 ? 48 : _slices.Min(slice => slice.InnerRadius) - 4;
         drawingContext.DrawEllipse(
-            new SolidColorBrush(Color.FromRgb(23, 31, 41)),
-            new Pen(new SolidColorBrush(Color.FromRgb(49, 63, 77)), 1),
+            CenterBrush,
+            CenterBorder,
             _center,
             centerRadius,
             centerRadius);
@@ -62,7 +68,7 @@ public sealed class SunburstControl : FileVisualizationControl
             if (distance >= slice.InnerRadius && distance <= slice.OuterRadius &&
                 angle >= slice.StartAngle && angle <= slice.EndAngle)
             {
-                return slice.Node;
+                return (slice.Content as LayoutContent.Node)?.Value;
             }
         }
 
@@ -81,6 +87,9 @@ public sealed class SunburstControl : FileVisualizationControl
         if (Node is null || ActualWidth <= 1 || ActualHeight <= 1)
         {
             _slices = [];
+            _layoutNode = null;
+            _layoutMinimumSize = -1;
+            _layoutSize = default;
             return;
         }
 
@@ -95,7 +104,8 @@ public sealed class SunburstControl : FileVisualizationControl
         _layoutSize = size;
         var radius = Math.Max(10, Math.Min(ActualWidth, ActualHeight) / 2 - 22);
         var depth = radius > 330 ? 7 : radius > 230 ? 6 : 5;
-        _slices = SunburstLayout.Calculate(Node, radius, MinimumSize, depth);
+        var budget = VisualizationRenderBudget.ForSunburst(radius, depth);
+        _slices = SunburstLayout.Calculate(Node, radius, MinimumSize, depth, budget);
     }
 
     private static Geometry CreateSliceGeometry(Point center, SunburstSlice slice)
@@ -152,7 +162,7 @@ public sealed class SunburstControl : FileVisualizationControl
             System.Windows.FlowDirection.LeftToRight,
             new Typeface("Segoe UI"),
             9,
-            new SolidColorBrush(Color.FromRgb(149, 163, 179)),
+            SecondaryTextBrush,
             pixelsPerDip);
         drawingContext.DrawText(size, new Point(_center.X - size.Width / 2, _center.Y + 14));
     }
@@ -162,17 +172,18 @@ public sealed class SunburstControl : FileVisualizationControl
         var pixelsPerDip = VisualTreeHelper.GetDpi(this).PixelsPerDip;
         foreach (var slice in _slices)
         {
+            var node = (slice.Content as LayoutContent.Node)?.Value;
             var span = slice.EndAngle - slice.StartAngle;
             var middleRadius = (slice.InnerRadius + slice.OuterRadius) / 2;
             var arcLength = span * middleRadius;
-            if (arcLength < 55 || slice.OuterRadius - slice.InnerRadius < 18 || IsDimmed(slice.Node))
+            if (arcLength < 55 || slice.OuterRadius - slice.InnerRadius < 18 || node is not null && IsDimmed(node))
             {
                 continue;
             }
 
             var position = PolarPoint(_center, middleRadius, (slice.StartAngle + slice.EndAngle) / 2);
             var text = new FormattedText(
-                slice.Node.DisplayName,
+                node?.DisplayName ?? $"Other ({((LayoutContent.Aggregate)slice.Content).ItemCount:N0} items)",
                 CultureInfo.CurrentUICulture,
                 System.Windows.FlowDirection.LeftToRight,
                 new Typeface("Segoe UI Semibold"),
@@ -190,4 +201,18 @@ public sealed class SunburstControl : FileVisualizationControl
 
     private static Point PolarPoint(Point center, double radius, double angle) =>
         new(center.X + Math.Cos(angle) * radius, center.Y + Math.Sin(angle) * radius);
+
+    private static SolidColorBrush FrozenBrush(Color color)
+    {
+        var brush = new SolidColorBrush(color);
+        brush.Freeze();
+        return brush;
+    }
+
+    private static Pen FrozenPen(Color color, double thickness)
+    {
+        var pen = new Pen(FrozenBrush(color), thickness);
+        pen.Freeze();
+        return pen;
+    }
 }
