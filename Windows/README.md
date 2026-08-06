@@ -149,6 +149,8 @@ production certificate, and an HTTPS RFC 3161 timestamp service.
   verification opens one no-recall read handle and skips offline, partial, or indeterminate placeholders.
 - JSON and CSV exports preserve whether an issue is a non-fatal estimate or an unreadable entry; the
   CSV field is appended so existing column positions remain stable.
+- Atomic Windows exports require the destination filesystem to enforce private ACLs and expose stable
+  file identity. Export fails closed on filesystems or providers that cannot protect the staging data.
 - Reparse points that cannot be classified safely are shown but not traversed.
 - A selected root that is a link or junction is rejected unless **Follow links and junctions** is
   enabled; a root whose reparse type or target identity is unknown is rejected.
@@ -178,9 +180,10 @@ Before creating a `v*` tag:
 5. Confirm the Windows publisher subject, certificate thumbprint, and HTTPS timestamp URL environment variables match the production certificate.
 
 Signed artifacts are built before publication approval. After approval, one job verifies immutable-release
-configuration, creates and verifies the draft, and publishes it immediately to minimize the mutable-draft
-window. Separate GitHub API calls are not transactional, so protected tags and restricted repository write
-access remain required.
+configuration and artifact provenance, creates and verifies a fresh draft by numeric release ID, and
+publishes it immediately to minimize the mutable-draft window. The job never reuses or clobbers a draft;
+delete a draft left by a failed run before retrying. Separate GitHub API calls are not transactional, so
+protected tags and restricted repository write access remain required.
 
 ## Project Layout
 
