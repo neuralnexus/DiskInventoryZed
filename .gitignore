@@ -6,3 +6,10 @@ DiskInventoryZed.app/
 xcuserdata/
 DerivedData/
 *.moved-aside
+Windows/**/bin/
+Windows/**/obj/
+Windows/**/TestResults/
+Windows/.vs/
+artifacts/
+__pycache__/
+*.pyc

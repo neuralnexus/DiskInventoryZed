@@ -137,7 +137,15 @@ enum ScanExporter {
     }
 
     private static func csvField(_ value: String) -> String {
-        "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
+        let leading = value.prefix { $0.isWhitespace || $0 == "\u{FEFF}" }
+        let hasHazardousLeadingControl = leading.contains {
+            $0 == "\t" || $0 == "\r" || $0 == "\n" || $0 == "\u{FEFF}"
+        }
+        let firstMeaningful = value.first { !$0.isWhitespace && $0 != "\u{FEFF}" }
+        let safeValue = hasHazardousLeadingControl || firstMeaningful.map({ "=+-@".contains($0) }) == true
+            ? "'" + value
+            : value
+        return "\"\(safeValue.replacingOccurrences(of: "\"", with: "\"\""))\""
     }
 
     private static func jsonString(_ value: String) -> String {

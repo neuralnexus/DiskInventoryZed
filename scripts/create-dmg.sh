@@ -5,6 +5,12 @@ readonly APP_NAME="DiskInventoryZed"
 readonly DMG_NAME="DiskInventoryZed"
 readonly VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
 readonly OUTPUT_DMG="${DMG_NAME}-${VERSION}.dmg"
+
+if ! grep -Fq "TERMS AND CONDITIONS" LICENSE; then
+    echo "LICENSE does not contain the full GPL terms" >&2
+    exit 1
+fi
+
 readonly WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/DiskInventoryZed-dmg.XXXXXX")"
 readonly DMG_CONTENTS="${WORK_DIR}/contents"
 readonly WRITABLE_DMG="${WORK_DIR}/writable.dmg"
@@ -25,15 +31,10 @@ mkdir -p "$DMG_CONTENTS"
 
 # Copy the app
 cp -R "${APP_NAME}.app" "$DMG_CONTENTS/"
+install -m 644 LICENSE "$DMG_CONTENTS/LICENSE.txt"
 
 # Create Applications symlink
 ln -s /Applications "$DMG_CONTENTS/Applications"
-
-# Create First-Run-Helper app from AppleScript
-if [ -f "scripts/First-Run-Helper.applescript" ]; then
-    echo "Creating First-Run-Helper app..."
-    osacompile -o "$DMG_CONTENTS/First-Run-Helper.app" "scripts/First-Run-Helper.applescript"
-fi
 
 # Create a README with instructions
 cat > "$DMG_CONTENTS/README.txt" << 'EOF'
@@ -56,13 +57,6 @@ METHOD 2: Use System Settings
 3. Scroll down to the Security section
 4. Click "Open Anyway" next to DiskInventoryZed
 5. Click "Open" in the confirmation dialog
-
-METHOD 3: Use the First-Run-Helper
------------------------------------
-1. Double-click "First-Run-Helper.app" in this window
-2. Click "Open Security Settings" in the dialog
-3. System Settings will open to the Security pane
-4. Click "Open Anyway" next to DiskInventoryZed
 
 Note: You only need to do this once. After the first launch, 
 the app will open normally.
@@ -107,8 +101,6 @@ Disk Inventory Zed
 
 Drag DiskInventoryZed.app to Applications
 
-First time? Double-click First-Run-Helper for help
-
 See README.txt for detailed instructions
 EOF
 
@@ -135,14 +127,14 @@ tell application "Finder"
         -- Position the Applications symlink
         set position of item "Applications" to {450, 200}
         
-        -- Position First-Run-Helper if it exists
-        try
-            set position of item "First-Run-Helper.app" to {150, 350}
-        end try
-        
         -- Position README
         try
-            set position of item "README.txt" to {450, 350}
+            set position of item "README.txt" to {150, 350}
+        end try
+
+        -- Position the license
+        try
+            set position of item "LICENSE.txt" to {450, 350}
         end try
         
         -- Set background color

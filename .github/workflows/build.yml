@@ -13,129 +13,1191 @@ permissions:
 
 concurrency:
   group: disk-inventory-zed-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      deployments: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+
+    steps:
+      - name: Checkout release metadata
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Test release integrity tooling
+        run: python3 -m unittest discover -s scripts/tests -p 'test_release_integrity.py'
+
+      - name: Validate tagged release source
+        id: release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="$(python3 - <<'PY'
+          import os
+          import plistlib
+          import re
+          import xml.etree.ElementTree as ET
+
+          with open("Resources/Info.plist", "rb") as source:
+              mac_version = plistlib.load(source)["CFBundleShortVersionString"]
+          windows_properties = ET.parse("Windows/Directory.Build.props")
+          windows_version = windows_properties.findtext(".//Version")
+          assembly_version = windows_properties.findtext(".//AssemblyVersion")
+          file_version = windows_properties.findtext(".//FileVersion")
+          windows_manifest = ET.parse(
+              "Windows/src/DiskInventoryZed.Windows/app.manifest"
+          ).getroot()
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", mac_version):
+              raise SystemExit(f"Invalid application version: {mac_version!r}")
+          if windows_version != mac_version:
+              raise SystemExit(
+                  f"Version mismatch: macOS={mac_version!r}, Windows={windows_version!r}"
+              )
+          if assembly_version != "$(Version).0" or file_version != "$(Version).0":
+              raise SystemExit(
+                  "Windows assembly and file versions must derive from the product version"
+              )
+          manifest_identity = next(
+              element for element in windows_manifest
+              if element.tag.endswith("assemblyIdentity")
+          )
+          if manifest_identity.get("version") != f"{mac_version}.0":
+              raise SystemExit("Windows manifest and product versions do not match")
+          expected_tag = f"v{mac_version}"
+          if os.environ["GITHUB_REF_NAME"] != expected_tag:
+              raise SystemExit(
+                  f"Release tag {os.environ['GITHUB_REF_NAME']!r} must equal {expected_tag!r}"
+              )
+          print(mac_version)
+          PY
+          )"
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main || {
+            echo "Release tag $GITHUB_REF_NAME is not on origin/main." >&2
+            exit 1
+          }
+          for environment in release-signing release-publish; do
+            ENVIRONMENT_JSON="$RUNNER_TEMP/$environment.json"
+            POLICIES_JSON="$RUNNER_TEMP/$environment-policies.json"
+            gh api "repos/$GITHUB_REPOSITORY/environments/$environment" > "$ENVIRONMENT_JSON" || {
+              echo "The protected $environment environment must exist before creating a production tag." >&2
+              exit 1
+            }
+            gh api "repos/$GITHUB_REPOSITORY/environments/$environment/deployment-branch-policies?per_page=100" > "$POLICIES_JSON"
+            python3 - "$ENVIRONMENT_JSON" "$POLICIES_JSON" "$environment" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              environment = json.load(source)
+          with open(sys.argv[2], encoding="utf-8") as source:
+              policies = json.load(source)
+          reviewer_rules = [
+              rule for rule in environment.get("protection_rules", [])
+              if rule.get("type") == "required_reviewers" and rule.get("reviewers")
+          ]
+          if not reviewer_rules:
+              raise SystemExit(
+                  f"The {sys.argv[3]} environment must require at least one reviewer."
+              )
+          if not any(rule.get("prevent_self_review") is True for rule in reviewer_rules):
+              raise SystemExit(
+                  f"The {sys.argv[3]} environment must prevent self-review."
+              )
+          if environment.get("can_admins_bypass") is not False:
+              raise SystemExit(
+                  f"The {sys.argv[3]} environment must disable administrator bypass."
+              )
+          branch_policy = environment.get("deployment_branch_policy") or {}
+          if (branch_policy.get("protected_branches") is not False or
+                  branch_policy.get("custom_branch_policies") is not True):
+              raise SystemExit(
+                  f"The {sys.argv[3]} environment must use custom deployment policies."
+              )
+          tag_policies = {
+              (policy.get("name"), policy.get("type"))
+              for policy in policies.get("branch_policies", [])
+          }
+          if tag_policies != {("v*", "tag")}:
+              raise SystemExit(
+                  f"The {sys.argv[3]} environment must have exactly one v* tag policy."
+              )
+          PY
+          done
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+
   build:
-    runs-on: macos-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    needs: validate
+    runs-on: macos-15
     
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-      
-      - name: Cache Swift packages
-        uses: actions/cache@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: .build
-          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.swift') }}
-          restore-keys: |
-            ${{ runner.os }}-spm-
+          persist-credentials: false
 
       - name: Run unit tests
         run: swift test
 
       - name: Build debug with concurrency diagnostics
         run: swift build -Xswiftc -strict-concurrency=complete
-      
+
       - name: Build universal binary
         run: |
           swift build -c release --arch arm64 --arch x86_64
-      
+
       - name: Package and verify app bundle
-        env:
-          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        run: ./scripts/package-app.sh
-      
+        run: SIGNING_IDENTITY="-" ./scripts/package-app.sh
+
       - name: Create DMG
         run: |
           ./scripts/create-dmg.sh
 
-      - name: Notarize tagged release when credentials are configured
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-        run: |
-          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_TEAM_ID" ] && [ -n "$APPLE_APP_PASSWORD" ]; then
-            ./scripts/notarize.sh DiskInventoryZed-*.dmg
-          else
-            echo "Notarization credentials are not configured; publishing an unnotarized build."
-          fi
+      - name: Archive app bundle artifact
+        run: ditto -c -k --sequesterRsrc --keepParent DiskInventoryZed.app DiskInventoryZed.app.zip
 
       - name: Generate release checksums
         run: shasum -a 256 DiskInventoryZed-*.dmg > DiskInventoryZed-checksums.txt
 
       - name: Upload DMG artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: DiskInventoryZed-DMG-CI
+          path: |
+            DiskInventoryZed-*.dmg
+            DiskInventoryZed-checksums.txt
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Upload app bundle artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: DiskInventoryZed-App-CI
+          path: DiskInventoryZed.app.zip
+          if-no-files-found: error
+          overwrite: true
+
+  macos-signing:
+    needs: [validate, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-15
+    timeout-minutes: 30
+    environment: release-signing
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout trusted release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate Apple signing configuration
+        env:
+          SIGNING_CERTIFICATE: ${{ secrets.APPLE_SIGNING_CERTIFICATE_BASE64 }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          for value in \
+            "$SIGNING_CERTIFICATE" \
+            "$SIGNING_CERTIFICATE_PASSWORD" \
+            "$KEYCHAIN_PASSWORD" \
+            "$SIGNING_IDENTITY" \
+            "$APPLE_ID" \
+            "$APPLE_TEAM_ID" \
+            "$APPLE_APP_PASSWORD"; do
+            if [ -z "$value" ]; then
+              echo "Tagged releases require complete Apple signing and notarization credentials." >&2
+              exit 1
+            fi
+          done
+
+      - name: Build universal release binary
+        run: swift build -c release --arch arm64 --arch x86_64
+
+      - name: Install Apple signing certificate
+        env:
+          SIGNING_CERTIFICATE: ${{ secrets.APPLE_SIGNING_CERTIFICATE_BASE64 }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/DiskInventoryZed-signing.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/DiskInventoryZed-signing.keychain-db"
+          printf '%s' "$SIGNING_CERTIFICATE" | base64 -D > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" \
+            -P "$SIGNING_CERTIFICATE_PASSWORD" \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -F "$SIGNING_IDENTITY"
+
+      - name: Sign and verify app bundle
+        env:
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          EXPECTED_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          ./scripts/package-app.sh
+          codesign --verify --deep --strict --verbose=4 DiskInventoryZed.app
+          SIGNING_DETAILS="$(codesign -dv --verbose=4 DiskInventoryZed.app 2>&1)"
+          grep -F "Authority=$SIGNING_IDENTITY" <<< "$SIGNING_DETAILS"
+          grep -F "TeamIdentifier=$EXPECTED_TEAM_ID" <<< "$SIGNING_DETAILS"
+
+      - name: Create, notarize, and assess DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          ./scripts/create-dmg.sh
+          ./scripts/notarize.sh DiskInventoryZed-*.dmg
+          hdiutil verify DiskInventoryZed-*.dmg
+          spctl --assess --type open --context context:primary-signature --verbose=4 DiskInventoryZed-*.dmg
+
+      - name: Generate signed release checksum
+        run: shasum -a 256 DiskInventoryZed-*.dmg > DiskInventoryZed-checksums.txt
+
+      - name: Attest signed DMG provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-checksums: DiskInventoryZed-checksums.txt
+
+      - name: Upload signed DMG artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: DiskInventoryZed-DMG
           path: |
             DiskInventoryZed-*.dmg
             DiskInventoryZed-checksums.txt
           if-no-files-found: error
-      
-      - name: Upload app bundle artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: DiskInventoryZed-App
-          path: DiskInventoryZed.app
-          if-no-files-found: error
+          overwrite: false
 
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    permissions:
-      contents: write
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-    
+      - name: Remove Apple signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/DiskInventoryZed-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/DiskInventoryZed-signing.p12"
+
+  windows:
+    needs: validate
+    runs-on: windows-2025
+    timeout-minutes: 30
+
     steps:
-      - name: Checkout release metadata
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Resolve release version
-        id: version
-        shell: bash
+      - name: Install pinned .NET SDK
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      - name: Restore Windows solution
+        shell: pwsh
+        run: dotnet restore Windows/DiskInventoryZed.Windows.sln --locked-mode
+
+      - name: Run Windows reliability tests with coverage
+        shell: pwsh
         run: |
-          VERSION="$(python3 - <<'PY'
-          import plistlib
-          with open("Resources/Info.plist", "rb") as source:
-              print(plistlib.load(source)["CFBundleShortVersionString"])
-          PY
-          )"
-          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          $projects = @(
+            @{
+              Name = "Core"
+              Path = "Windows/tests/DiskInventoryZed.Core.Tests/DiskInventoryZed.Core.Tests.csproj"
+            },
+            @{
+              Name = "Windows"
+              Path = "Windows/tests/DiskInventoryZed.Windows.Tests/DiskInventoryZed.Windows.Tests.csproj"
+            }
+          )
+          foreach ($project in $projects) {
+            dotnet test $project.Path `
+              -c Release `
+              --no-restore `
+              --settings Windows/coverage.runsettings `
+              --collect "Code Coverage" `
+              --blame-hang-timeout 2m `
+              --logger "trx;LogFileName=$($project.Name).trx" `
+              --results-directory "artifacts/test-results/$($project.Name)"
+            if ($LASTEXITCODE -ne 0) {
+              throw "$($project.Name) tests failed."
+            }
+          }
 
-      - name: Check whether release exists
-        id: existing
+      - name: Validate Windows test and coverage reports
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          foreach ($suite in @("Core", "Windows")) {
+            $resultRoot = "artifacts/test-results/$suite"
+            $trxReport = Get-ChildItem $resultRoot -Recurse -Filter "$suite.trx" |
+                Select-Object -First 1
+            if ($null -eq $trxReport) {
+              throw "$suite did not produce a TRX report."
+            }
+
+            [xml]$testResults = Get-Content $trxReport.FullName -Raw
+            $counters = $testResults.TestRun.ResultSummary.Counters
+            if ($null -eq $counters -or
+                [int]$counters.total -le 0 -or
+                [int]$counters.failed -ne 0 -or
+                [int]$counters.executed -ne [int]$counters.total -or
+                [int]$counters.passed -ne [int]$counters.total) {
+              throw "$suite has failed, skipped, or not-executed tests."
+            }
+
+            $coverageReport = Get-ChildItem $resultRoot -Recurse -Filter *.cobertura.xml |
+                Select-Object -First 1
+            if ($null -eq $coverageReport) {
+              throw "$suite did not produce a Cobertura report."
+            }
+
+            [xml]$coverage = Get-Content $coverageReport.FullName -Raw
+            $linesValid = [int]$coverage.coverage.GetAttribute("lines-valid")
+            if ($linesValid -eq 0) {
+              throw "$suite coverage contains no owned production lines."
+            }
+            $unexpectedPackages = @(
+              $coverage.coverage.packages.package |
+                  ForEach-Object { $_.GetAttribute("name") } |
+                  Where-Object { $_ -notin @("DiskInventoryZed", "DiskInventoryZed.Core", "DiskInventoryZed.Windows") }
+            )
+            if ($unexpectedPackages.Count -ne 0) {
+              throw "$suite coverage contains unexpected packages: $($unexpectedPackages -join ', ')"
+            }
+            $requiredPackage = if ($suite -eq "Core") { "DiskInventoryZed.Core" } else { "DiskInventoryZed" }
+            $requiredPackageNode = $coverage.coverage.packages.package |
+                Where-Object { $_.GetAttribute("name") -eq $requiredPackage } |
+                Select-Object -First 1
+            if ($null -eq $requiredPackageNode) {
+              throw "$suite coverage does not contain required package $requiredPackage."
+            }
+
+            $rawLineRate = [double]$requiredPackageNode.GetAttribute("line-rate")
+            $rawBranchRate = [double]$requiredPackageNode.GetAttribute("branch-rate")
+            if ([double]::IsNaN($rawLineRate) -or [double]::IsInfinity($rawLineRate) -or
+                [double]::IsNaN($rawBranchRate) -or [double]::IsInfinity($rawBranchRate) -or
+                $rawLineRate -lt 0 -or $rawLineRate -gt 1 -or
+                $rawBranchRate -lt 0 -or $rawBranchRate -gt 1) {
+              throw "$suite coverage contains invalid rates for $requiredPackage."
+            }
+            $lineRate = [math]::Round(100 * $rawLineRate, 1)
+            $branchRate = [math]::Round(100 * $rawBranchRate, 1)
+            if ($suite -eq "Core" -and ($rawLineRate -lt 0.65 -or $rawBranchRate -lt 0.60)) {
+              throw "Core coverage regressed below 65% line / 60% branch: $lineRate% / $branchRate%."
+            }
+            if ($suite -eq "Windows" -and ($rawLineRate -lt 0.10 -or $rawBranchRate -lt 0.05)) {
+              throw "Windows coverage regressed below 10% line / 5% branch: $lineRate% / $branchRate%."
+            }
+            $skipped = [int]$counters.total - [int]$counters.passed - [int]$counters.failed
+            @(
+              "### $suite tests ($env:RUNNER_ARCH)"
+              ""
+              "| Total | Passed | Failed | Skipped/not executed | Line coverage | Branch coverage |"
+              "| ---: | ---: | ---: | ---: | ---: | ---: |"
+              "| $($counters.total) | $($counters.passed) | $($counters.failed) | $skipped | $lineRate% | $branchRate% |"
+              ""
+            ) | Add-Content $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Upload Windows test reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: DiskInventoryZed-Windows-TestReports-${{ runner.arch }}
+          path: artifacts/test-results/
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+      - name: Build Windows desktop application
+        shell: pwsh
+        run: dotnet build Windows/src/DiskInventoryZed.Windows/DiskInventoryZed.Windows.csproj -c Release --no-restore
+
+      - name: Create ephemeral CI code-signing certificate
+        id: ci-signing
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          $subject = "CN=Disk Inventory Zed CI"
+          $certificateDirectory = Join-Path $env:RUNNER_TEMP "DiskInventoryZed-ci-signing"
+          $keyPath = Join-Path $certificateDirectory "signing.key"
+          $certificateFilePath = Join-Path $certificateDirectory "signing.cer"
+          $pfxPath = Join-Path $certificateDirectory "signing.pfx"
+          $passwordBytes = [byte[]]::new(32)
+          [Security.Cryptography.RandomNumberGenerator]::Fill($passwordBytes)
+          $password = [Convert]::ToBase64String($passwordBytes)
+          $certificate = $null
+          $publicCertificate = $null
+          $installationComplete = $false
+          New-Item $certificateDirectory -ItemType Directory -Force | Out-Null
+          try {
+            $openssl = (Get-Command openssl.exe -ErrorAction Stop).Source
+            Write-Host "Generating the ephemeral CI signing key."
+            & $openssl req -x509 -newkey rsa:2048 -sha256 `
+              -keyout $keyPath `
+              -out $certificateFilePath `
+              -days 2 `
+              -subj "/CN=Disk Inventory Zed CI" `
+              -passout "pass:$password" `
+              -addext "basicConstraints=critical,CA:FALSE" `
+              -addext "keyUsage=critical,digitalSignature" `
+              -addext "extendedKeyUsage=codeSigning"
+            if ($LASTEXITCODE -ne 0) {
+              throw "OpenSSL failed to create the CI signing certificate."
+            }
+
+            & $openssl pkcs12 -export `
+              -inkey $keyPath `
+              -in $certificateFilePath `
+              -out $pfxPath `
+              -name "Disk Inventory Zed CI" `
+              -passin "pass:$password" `
+              -passout "pass:$password"
+            if ($LASTEXITCODE -ne 0) {
+              throw "OpenSSL failed to package the CI signing certificate."
+            }
+
+            Write-Host "Loading the ephemeral key into the user certificate store."
+            $keyStorageFlags = (
+              [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::UserKeySet -bor
+              [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::PersistKeySet
+            )
+            $certificate = [Security.Cryptography.X509Certificates.X509CertificateLoader]::LoadPkcs12(
+              [IO.File]::ReadAllBytes($pfxPath),
+              $password,
+              $keyStorageFlags,
+              $null)
+            if (-not $certificate.HasPrivateKey -or $certificate.Subject -cne $subject) {
+              throw "The generated CI signing certificate is invalid."
+            }
+            $publicCertificate = [Security.Cryptography.X509Certificates.X509CertificateLoader]::LoadCertificate(
+              $certificate.RawData)
+
+            foreach ($storeName in @(
+              [Security.Cryptography.X509Certificates.StoreName]::My,
+              [Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher
+            )) {
+              Write-Host "Adding the ephemeral certificate to CurrentUser/$storeName."
+              $store = [Security.Cryptography.X509Certificates.X509Store]::new(
+                $storeName,
+                [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+              $storeCertificate = $publicCertificate
+              if ($storeName -eq [Security.Cryptography.X509Certificates.StoreName]::My) {
+                $storeCertificate = $certificate
+              }
+              try {
+                $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                $store.Add($storeCertificate)
+              }
+              finally {
+                $store.Dispose()
+              }
+            }
+
+            Write-Host "Adding the ephemeral certificate to LocalMachine/Root."
+            & certutil.exe -f -addstore Root $certificateFilePath | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "CertUtil failed to trust the CI signing certificate."
+            }
+
+            $store = [Security.Cryptography.X509Certificates.X509Store]::new(
+              [Security.Cryptography.X509Certificates.StoreName]::My,
+              [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+            try {
+              $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+              $storedCertificates = $store.Certificates.Find(
+                [Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
+                $certificate.Thumbprint,
+                $false)
+              if ($storedCertificates.Count -ne 1 -or -not $storedCertificates[0].HasPrivateKey) {
+                throw "The CI signing key was not persisted in the user certificate store."
+              }
+            }
+            finally {
+              $store.Dispose()
+            }
+
+            "thumbprint=$($certificate.Thumbprint)" >> $env:GITHUB_OUTPUT
+            "subject=$($certificate.Subject)" >> $env:GITHUB_OUTPUT
+            $installationComplete = $true
+          }
+          finally {
+            if (-not $installationComplete -and $null -ne $certificate) {
+              if ($null -ne $publicCertificate) {
+                foreach ($storeName in @(
+                  [Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher
+                )) {
+                  $store = [Security.Cryptography.X509Certificates.X509Store]::new(
+                    $storeName,
+                    [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+                  try {
+                    $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                    $store.Remove($publicCertificate)
+                  }
+                  catch {
+                    Write-Warning "Could not roll back CurrentUser/${storeName}: $($_.Exception.Message)"
+                  }
+                  finally {
+                    $store.Dispose()
+                  }
+                }
+                & certutil.exe -f -delstore Root $certificate.Thumbprint | Out-Null
+              }
+              $myCertificatePath = "Cert:/CurrentUser/My/$($certificate.Thumbprint)"
+              $privateKeyDeleted = $false
+              try {
+                if (Test-Path -LiteralPath $myCertificatePath) {
+                  Remove-Item -LiteralPath $myCertificatePath -DeleteKey -Force -ErrorAction Stop
+                  $privateKeyDeleted = $true
+                }
+              }
+              catch {
+                Write-Warning "Could not roll back the CI signing key: $($_.Exception.Message)"
+              }
+              if (-not $privateKeyDeleted) {
+                $privateKey = $null
+                try {
+                  $privateKey = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey(
+                    $certificate)
+                  if ($privateKey -is [Security.Cryptography.RSACng]) {
+                    $privateKey.Key.Delete()
+                  }
+                  elseif ($privateKey -is [Security.Cryptography.RSACryptoServiceProvider]) {
+                    $privateKey.PersistKeyInCsp = $false
+                    $privateKey.Clear()
+                  }
+                  else {
+                    Write-Warning "The persisted CI signing key uses an unknown RSA provider."
+                  }
+                }
+                catch {
+                  Write-Warning "Could not delete the persisted CI signing key: $($_.Exception.Message)"
+                }
+                finally {
+                  if ($null -ne $privateKey) {
+                    $privateKey.Dispose()
+                  }
+                }
+              }
+            }
+            if ($null -ne $publicCertificate) {
+              $publicCertificate.Dispose()
+            }
+            if ($null -ne $certificate) {
+              $certificate.Dispose()
+            }
+            [Array]::Clear($passwordBytes, 0, $passwordBytes.Length)
+            Remove-Item $certificateDirectory -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Test-sign and package x64 and ARM64 applications
+        shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ steps.version.outputs.tag }}
+          SIGNING_THUMBPRINT: ${{ steps.ci-signing.outputs.thumbprint }}
+          SIGNING_PUBLISHER: ${{ steps.ci-signing.outputs.subject }}
         run: |
-          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
+          $signing = @{
+            SignaturePolicy = "Test"
+            CertificateThumbprint = $env:SIGNING_THUMBPRINT
+            ExpectedPublisherSubject = $env:SIGNING_PUBLISHER
+          }
+          ./Windows/scripts/package.ps1 -Runtime win-x64 @signing
+          ./Windows/scripts/package.ps1 -Runtime win-arm64 @signing
+          $archives = @(Get-ChildItem artifacts/windows/*.zip)
+          if ($archives.Count -ne 2) {
+            throw "Expected exactly two Windows archives, found $($archives.Count)."
+          }
+          $archives | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content artifacts/windows/DiskInventoryZed-Windows-checksums.txt
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: DiskInventoryZed-Windows-CI
+          path: |
+            artifacts/windows/*.zip
+            artifacts/windows/DiskInventoryZed-Windows-checksums.txt
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Remove ephemeral CI code-signing certificate
+        if: always() && steps.ci-signing.outputs.thumbprint != ''
+        shell: pwsh
+        run: |
+          $thumbprint = "${{ steps.ci-signing.outputs.thumbprint }}"
+          $cleanupErrors = [System.Collections.Generic.List[string]]::new()
+          $certificatePaths = @(
+            "Cert:/LocalMachine/Root/$thumbprint",
+            "Cert:/CurrentUser/TrustedPublisher/$thumbprint"
+          )
+          foreach ($path in $certificatePaths) {
+            try {
+              if (Test-Path -LiteralPath $path) {
+                Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+              }
+            }
+            catch {
+              [void]$cleanupErrors.Add("${path}: $($_.Exception.Message)")
+            }
+          }
+          $myCertificatePath = "Cert:/CurrentUser/My/$thumbprint"
+          try {
+            if (Test-Path -LiteralPath $myCertificatePath) {
+              Remove-Item -LiteralPath $myCertificatePath -DeleteKey -Force -ErrorAction Stop
+            }
+          }
+          catch {
+            [void]$cleanupErrors.Add("${myCertificatePath}: $($_.Exception.Message)")
+          }
+          foreach ($path in $certificatePaths + $myCertificatePath) {
+            if (Test-Path -LiteralPath $path) {
+              [void]$cleanupErrors.Add("Certificate remains in $path.")
+            }
+          }
+          if ($cleanupErrors.Count -ne 0) {
+            throw "Ephemeral certificate cleanup failed: $($cleanupErrors -join '; ')"
+          }
+
+  windows-signing:
+    needs: [validate, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-2025
+    timeout-minutes: 30
+    environment: release-signing
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout trusted release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install pinned .NET SDK
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      - name: Import production Authenticode certificate
+        id: production-signing
+        shell: powershell
+        timeout-minutes: 2
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+          EXPECTED_THUMBPRINT: ${{ vars.WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT }}
+          EXPECTED_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER_SUBJECT }}
+          TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: |
+          foreach ($value in @(
+            $env:CERTIFICATE_BASE64,
+            $env:CERTIFICATE_PASSWORD,
+            $env:EXPECTED_THUMBPRINT,
+            $env:EXPECTED_PUBLISHER,
+            $env:TIMESTAMP_URL
+          )) {
+            if ([string]::IsNullOrWhiteSpace($value)) {
+              throw "Tagged Windows releases require complete protected signing configuration."
+            }
+          }
+          $expectedThumbprint = $env:EXPECTED_THUMBPRINT.Replace(" ", "").ToUpperInvariant()
+          if ($expectedThumbprint -notmatch '^[0-9A-F]{40,64}$') {
+            throw "The expected Windows signing certificate thumbprint is invalid."
+          }
+          $expectedPublisher = $env:EXPECTED_PUBLISHER
+          if ($expectedPublisher.Length -gt 1024 -or
+              $expectedPublisher -cne $expectedPublisher.Trim() -or
+              $expectedPublisher -match '[\x00-\x1F\x7F]') {
+            throw "The expected Windows signing publisher subject is invalid."
+          }
+
+          try {
+            $bytes = [Convert]::FromBase64String($env:CERTIFICATE_BASE64)
+          }
+          catch [FormatException] {
+            throw "The Windows signing certificate is not valid Base64."
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP "DiskInventoryZed-signing.pfx"
+          [IO.File]::WriteAllBytes($certificatePath, $bytes)
+          $existingThumbprints = @{}
+          $store = [Security.Cryptography.X509Certificates.X509Store]::new(
+            [Security.Cryptography.X509Certificates.StoreName]::My,
+            [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+          try {
+            $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+            foreach ($existingCertificate in $store.Certificates) {
+              $existingThumbprints[$existingCertificate.Thumbprint] = $true
+            }
+          }
+          finally {
+            $store.Dispose()
+          }
+
+          $importComplete = $false
+          try {
+            $password = ConvertTo-SecureString $env:CERTIFICATE_PASSWORD -AsPlainText -Force
+            $certificates = @(Import-PfxCertificate `
+              -FilePath $certificatePath `
+              -CertStoreLocation Cert:/CurrentUser/My `
+              -Password $password `
+              -Exportable:$false |
+                Where-Object HasPrivateKey)
+            if ($certificates.Count -ne 1) {
+              throw "The Windows signing bundle must contain exactly one private code-signing certificate."
+            }
+
+            $certificate = $certificates[0]
+            if ($certificate.Thumbprint -cne $expectedThumbprint) {
+              throw "The imported Windows signing certificate thumbprint is not allowlisted."
+            }
+            if ($certificate.Subject -cne $expectedPublisher) {
+              throw "The imported Windows signing certificate publisher is not allowlisted."
+            }
+            "thumbprint=$($certificate.Thumbprint)" |
+              Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            $importComplete = $true
+          }
+          finally {
+            if (-not $importComplete) {
+              $store = [Security.Cryptography.X509Certificates.X509Store]::new(
+                [Security.Cryptography.X509Certificates.StoreName]::My,
+                [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+              try {
+                $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+                $newThumbprints = @(
+                  $store.Certificates |
+                    Where-Object { -not $existingThumbprints.ContainsKey($_.Thumbprint) } |
+                    ForEach-Object Thumbprint)
+              }
+              finally {
+                $store.Dispose()
+              }
+              foreach ($newThumbprint in $newThumbprints) {
+                $importedCertificatePath = "Cert:/CurrentUser/My/$newThumbprint"
+                if (Test-Path -LiteralPath $importedCertificatePath) {
+                  Remove-Item `
+                    -LiteralPath $importedCertificatePath `
+                    -DeleteKey `
+                    -Force `
+                    -ErrorAction Stop
+                }
+              }
+            }
+          }
+
+      - name: Sign, timestamp, and package Windows releases
+        shell: pwsh
+        env:
+          TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+          EXPECTED_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER_SUBJECT }}
+        run: |
+          $signing = @{
+            SignaturePolicy = "Release"
+            CertificateThumbprint = "${{ steps.production-signing.outputs.thumbprint }}"
+            ExpectedPublisherSubject = $env:EXPECTED_PUBLISHER
+            TimestampUrl = $env:TIMESTAMP_URL
+          }
+          ./Windows/scripts/package.ps1 -Runtime win-x64 @signing
+          ./Windows/scripts/package.ps1 -Runtime win-arm64 @signing
+          $archives = @(Get-ChildItem artifacts/windows/*.zip)
+          if ($archives.Count -ne 2) {
+            throw "Expected exactly two signed Windows archives, found $($archives.Count)."
+          }
+          $archives | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content artifacts/windows/DiskInventoryZed-Windows-checksums.txt
+
+      - name: Attest signed Windows provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-checksums: artifacts/windows/DiskInventoryZed-Windows-checksums.txt
+
+      - name: Upload signed Windows artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: DiskInventoryZed-Windows
+          path: |
+            artifacts/windows/*.zip
+            artifacts/windows/DiskInventoryZed-Windows-checksums.txt
+          if-no-files-found: error
+          overwrite: false
+
+      - name: Remove production signing material
+        if: always()
+        shell: pwsh
+        run: |
+          $thumbprint = "${{ steps.production-signing.outputs.thumbprint }}"
+          try {
+            if (-not [string]::IsNullOrWhiteSpace($thumbprint)) {
+              $thumbprint = $thumbprint.Replace(" ", "").ToUpperInvariant()
+              if ($thumbprint -notmatch '^[0-9A-F]{40,64}$') {
+                throw "The production signing certificate thumbprint is invalid."
+              }
+              $certificatePath = "Cert:/CurrentUser/My/$thumbprint"
+              if (Test-Path -LiteralPath $certificatePath) {
+                Remove-Item -LiteralPath $certificatePath -DeleteKey -Force -ErrorAction Stop
+              }
+              if (Test-Path -LiteralPath $certificatePath) {
+                throw "Production signing certificate cleanup failed."
+              }
+            }
+          }
+          finally {
+            Remove-Item (Join-Path $env:RUNNER_TEMP "DiskInventoryZed-signing.pfx") `
+              -Force `
+              -ErrorAction SilentlyContinue
+          }
+
+  publish-release:
+    needs: [validate, build, windows, macos-signing, windows-signing]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release-publish
+    if: >-
+      ${{ always() && startsWith(github.ref, 'refs/tags/v') &&
+          needs.validate.result == 'success' &&
+          needs.build.result == 'success' &&
+          needs.windows.result == 'success' &&
+          needs.macos-signing.result == 'success' &&
+          needs.windows-signing.result == 'success' }}
+    permissions:
+      attestations: read
+      contents: write
+
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify immutable releases are enforced
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SETTINGS_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "release-publish requires a repository-scoped Administration read token." >&2
+            exit 1
+          fi
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" != "true" ]; then
+            echo "Immutable GitHub releases must be enabled before publication." >&2
+            exit 1
+          fi
+          RULESETS_JSON="$RUNNER_TEMP/tag-rulesets.json"
+          gh api "repos/$GITHUB_REPOSITORY/rulesets?includes_parents=true&targets=tag&per_page=100" > "$RULESETS_JSON"
+          PROTECTED_TAGS=false
+          while IFS= read -r RULESET_ID; do
+            [ -n "$RULESET_ID" ] || continue
+            RULESET_JSON="$RUNNER_TEMP/tag-ruleset-$RULESET_ID.json"
+            gh api "repos/$GITHUB_REPOSITORY/rulesets/$RULESET_ID?includes_parents=true" > "$RULESET_JSON"
+            if python3 - "$RULESET_JSON" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              ruleset = json.load(source)
+          conditions = ruleset.get("conditions", {}).get("ref_name", {})
+          rule_types = {rule.get("type") for rule in ruleset.get("rules", [])}
+          valid = (
+              ruleset.get("target") == "tag" and
+              ruleset.get("enforcement") == "active" and
+              conditions.get("include") == ["refs/tags/v*"] and
+              conditions.get("exclude") == [] and
+              {"update", "deletion"} <= rule_types and
+              ruleset.get("bypass_actors") == []
+          )
+          raise SystemExit(0 if valid else 1)
+          PY
+            then
+              PROTECTED_TAGS=true
+              break
+            fi
+          done < <(jq -r '.[] | select(.target == "tag" and .enforcement == "active") | .id' "$RULESETS_JSON")
+          if [ "$PROTECTED_TAGS" != "true" ]; then
+            echo "An active, non-bypassable v* tag update/deletion ruleset is required." >&2
+            exit 1
           fi
 
       - name: Download artifacts
-        if: steps.existing.outputs.publish == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: DiskInventoryZed-DMG
-      
-      - name: Create Release
-        if: steps.existing.outputs.publish == 'true'
-        uses: softprops/action-gh-release@v2
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          files: |
-            DiskInventoryZed-*.dmg
-            DiskInventoryZed-checksums.txt
-          generate_release_notes: true
+          name: DiskInventoryZed-Windows
+          path: windows-release
+
+      - name: Verify release artifacts and provenance
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          python3 scripts/release_integrity.py verify-local --version "$VERSION"
+          sha256sum --check --strict DiskInventoryZed-checksums.txt
+          (cd windows-release && sha256sum --check --strict DiskInventoryZed-Windows-checksums.txt)
+
+          EXPECTED_SOURCE_REF="refs/tags/$TAG_NAME"
+          EXPECTED_WORKFLOW_REF="$GITHUB_REPOSITORY/.github/workflows/build.yml@$EXPECTED_SOURCE_REF"
+          if [ "$GITHUB_SERVER_URL" != "https://github.com" ] || \
+             [ "$GITHUB_REF" != "$EXPECTED_SOURCE_REF" ] || \
+             [ "$GITHUB_WORKFLOW_REF" != "$EXPECTED_WORKFLOW_REF" ] || \
+             [ -z "$GITHUB_SHA" ] || \
+             [ -z "$GITHUB_WORKFLOW_SHA" ]; then
+            echo "The attestation verification identity is incomplete or unexpected." >&2
+            exit 1
+          fi
+
+          ATTESTATION_POLICY=(
+            --repo "$GITHUB_REPOSITORY"
+            --cert-identity "$GITHUB_SERVER_URL/$EXPECTED_WORKFLOW_REF"
+            --cert-oidc-issuer "https://token.actions.githubusercontent.com"
+            --source-ref "$EXPECTED_SOURCE_REF"
+            --source-digest "$GITHUB_SHA"
+            --signer-digest "$GITHUB_WORKFLOW_SHA"
+            --deny-self-hosted-runners
+            --digest-alg sha256
+            --predicate-type "https://slsa.dev/provenance/v1"
+          )
+          RELEASE_ARTIFACTS=(
+            "DiskInventoryZed-$VERSION.dmg"
+            "windows-release/DiskInventoryZed-Windows-v$VERSION-win-x64.zip"
+            "windows-release/DiskInventoryZed-Windows-v$VERSION-win-arm64.zip"
+          )
+          for artifact in "${RELEASE_ARTIFACTS[@]}"; do
+            gh attestation verify "$artifact" "${ATTESTATION_POLICY[@]}"
+          done
+
+      - name: Create and verify draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          resolve_tag_commit() {
+            local object_type object_sha
+            read -r object_type object_sha <<< "$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG_NAME" \
+              --jq '.object.type + " " + .object.sha')"
+            for _ in {1..5}; do
+              if [ "$object_type" = "commit" ]; then
+                printf '%s\n' "$object_sha"
+                return 0
+              fi
+              if [ "$object_type" != "tag" ]; then
+                echo "Unsupported release tag target type: $object_type" >&2
+                return 1
+              fi
+              read -r object_type object_sha <<< "$(gh api \
+                "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
+                --jq '.object.type + " " + .object.sha')"
+            done
+            echo "Release tag nesting exceeds the supported depth." >&2
+            return 1
+          }
+          TAG_COMMIT="$(resolve_tag_commit)"
+          if [ "$TAG_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "Release tag moved from validated commit $GITHUB_SHA to $TAG_COMMIT." >&2
+            exit 1
+          fi
+          MARKER="<!-- disk-inventory-zed-workflow-run:$GITHUB_RUN_ID -->"
+          RELEASES_BEFORE_CREATE="$RUNNER_TEMP/disk-inventory-zed-releases-before-create.json"
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RELEASES_BEFORE_CREATE"
+          python3 scripts/release_integrity.py require-release-missing \
+            --json "$RELEASES_BEFORE_CREATE" \
+            --tag "$TAG_NAME"
+          ASSETS=(
+            "DiskInventoryZed-$VERSION.dmg"
+            DiskInventoryZed-checksums.txt
+            "windows-release/DiskInventoryZed-Windows-v$VERSION-win-x64.zip"
+            "windows-release/DiskInventoryZed-Windows-v$VERSION-win-arm64.zip"
+            windows-release/DiskInventoryZed-Windows-checksums.txt
+          )
+          CREATED_RELEASE="$RUNNER_TEMP/disk-inventory-zed-created-release.json"
+          CREATED_RELEASE_STATE="$RUNNER_TEMP/disk-inventory-zed-created-release-state.json"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+            -f tag_name="$TAG_NAME" \
+            -f name="Disk Inventory Zed $VERSION" \
+            -f body="$MARKER" \
+            -F draft=true \
+            -F prerelease=false \
+            -F generate_release_notes=true > "$CREATED_RELEASE"
+          RELEASE_ID="$(python3 scripts/release_integrity.py created-draft-id \
+            --json "$CREATED_RELEASE" \
+            --version "$VERSION" \
+            --tag "$TAG_NAME" \
+            --marker "$MARKER" \
+            --state-out "$CREATED_RELEASE_STATE")"
+          test "$RELEASE_ID" -gt 0
+
+          RELEASES_AFTER_CREATE="$RUNNER_TEMP/disk-inventory-zed-releases-after-create.json"
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RELEASES_AFTER_CREATE"
+          python3 scripts/release_integrity.py require-unique-release \
+            --json "$RELEASES_AFTER_CREATE" \
+            --tag "$TAG_NAME" \
+            --id "$RELEASE_ID"
+
+          UPLOAD_URL="https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets"
+          for asset in "${ASSETS[@]}"; do
+            ASSET_NAME="${asset##*/}"
+            if [[ ! "$ASSET_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "Unsafe release asset name: $ASSET_NAME" >&2
+              exit 1
+            fi
+            gh api --method POST \
+              -H "Content-Type: application/octet-stream" \
+              --input "$asset" \
+              "$UPLOAD_URL?name=$ASSET_NAME" > "$RUNNER_TEMP/uploaded-$ASSET_NAME.json"
+          done
+
+          RELEASE_BEFORE_DOWNLOAD="$RUNNER_TEMP/disk-inventory-zed-release-before-download.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RELEASE_BEFORE_DOWNLOAD"
+          mkdir release-download
+          DOWNLOAD_PLAN="$RUNNER_TEMP/disk-inventory-zed-download-plan.txt"
+          python3 scripts/release_integrity.py download-plan \
+            --json "$RELEASE_BEFORE_DOWNLOAD" \
+            --version "$VERSION" \
+            --tag "$TAG_NAME" \
+            --marker "$MARKER" \
+            --id "$RELEASE_ID" \
+            --created-state "$CREATED_RELEASE_STATE" > "$DOWNLOAD_PLAN"
+          mapfile -t DOWNLOADS < "$DOWNLOAD_PLAN"
+          if [ "${#DOWNLOADS[@]}" -ne "${#ASSETS[@]}" ]; then
+            echo "The validated release download plan is incomplete." >&2
+            exit 1
+          fi
+          for download in "${DOWNLOADS[@]}"; do
+            IFS=$'\t' read -r ASSET_ID ASSET_NAME EXTRA <<< "$download"
+            if [[ ! "$ASSET_ID" =~ ^[1-9][0-9]*$ ||
+                  ! "$ASSET_NAME" =~ ^[A-Za-z0-9._-]+$ ||
+                  -n "$EXTRA" ]]; then
+              echo "Invalid validated release download entry." >&2
+              exit 1
+            fi
+            gh api -H "Accept: application/octet-stream" \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID" > "release-download/$ASSET_NAME"
+          done
+          RELEASE_AFTER_DOWNLOAD="$RUNNER_TEMP/disk-inventory-zed-release-after-download.json"
+          VERIFIED_RELEASE_STATE="$RUNNER_TEMP/disk-inventory-zed-verified-release-state.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RELEASE_AFTER_DOWNLOAD"
+          python3 scripts/release_integrity.py verify-download \
+            --version "$VERSION" \
+            --download-dir release-download \
+            --before-json "$RELEASE_BEFORE_DOWNLOAD" \
+            --after-json "$RELEASE_AFTER_DOWNLOAD" \
+            --tag "$TAG_NAME" \
+            --marker "$MARKER" \
+            --state-out "$VERIFIED_RELEASE_STATE"
+          (cd release-download && sha256sum --check --strict DiskInventoryZed-checksums.txt)
+          (cd release-download && sha256sum --check --strict DiskInventoryZed-Windows-checksums.txt)
+
+      - name: Publish verified release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          resolve_tag_commit() {
+            local object_type object_sha
+            read -r object_type object_sha <<< "$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG_NAME" \
+              --jq '.object.type + " " + .object.sha')"
+            for _ in {1..5}; do
+              if [ "$object_type" = "commit" ]; then
+                printf '%s\n' "$object_sha"
+                return 0
+              fi
+              if [ "$object_type" != "tag" ]; then
+                echo "Unsupported release tag target type: $object_type" >&2
+                return 1
+              fi
+              read -r object_type object_sha <<< "$(gh api \
+                "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
+                --jq '.object.type + " " + .object.sha')"
+            done
+            echo "Release tag nesting exceeds the supported depth." >&2
+            return 1
+          }
+          TAG_COMMIT="$(resolve_tag_commit)"
+          if [ "$TAG_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "Release tag moved from validated commit $GITHUB_SHA to $TAG_COMMIT." >&2
+            exit 1
+          fi
+          MARKER="<!-- disk-inventory-zed-workflow-run:$GITHUB_RUN_ID -->"
+          RELEASE_JSON="$RUNNER_TEMP/disk-inventory-zed-release-before-publish.json"
+          VERIFIED_RELEASE_STATE="$RUNNER_TEMP/disk-inventory-zed-verified-release-state.json"
+          RELEASE_ID="$(jq -r '.id' "$VERIFIED_RELEASE_STATE")"
+          test "$RELEASE_ID" -gt 0
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RELEASE_JSON"
+          python3 scripts/release_integrity.py verify-draft \
+            --json "$RELEASE_JSON" \
+            --state "$VERIFIED_RELEASE_STATE" \
+            --version "$VERSION" \
+            --tag "$TAG_NAME" \
+            --marker "$MARKER"
+          RELEASES_BEFORE_PUBLISH="$RUNNER_TEMP/disk-inventory-zed-releases-before-publish.json"
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RELEASES_BEFORE_PUBLISH"
+          python3 scripts/release_integrity.py require-unique-release \
+            --json "$RELEASES_BEFORE_PUBLISH" \
+            --tag "$TAG_NAME" \
+            --id "$RELEASE_ID"
+          TAG_COMMIT="$(resolve_tag_commit)"
+          if [ "$TAG_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "Release tag moved immediately before publication." >&2
+            exit 1
+          fi
+          PUBLISHED_RELEASE="$RUNNER_TEMP/disk-inventory-zed-published-release.json"
+          gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false \
+            -F prerelease=false \
+            -f make_latest=legacy > "$PUBLISHED_RELEASE"
+          python3 scripts/release_integrity.py verify-published \
+            --json "$PUBLISHED_RELEASE" \
+            --state "$VERIFIED_RELEASE_STATE" \
+            --version "$VERSION" \
+            --tag "$TAG_NAME" \
+            --marker "$MARKER"
+          PUBLISHED_TAG_COMMIT="$(resolve_tag_commit)"
+          if [ "$PUBLISHED_TAG_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "The immutable release locked an unexpected tag target." >&2
+            exit 1
+          fi
