@@ -10,6 +10,7 @@ License is GPL.
 
 Disk Inventory Zed is a native macOS application that visualizes disk usage with beautiful, interactive treemaps and detailed file listings. Built with SwiftUI and modern macOS APIs, it supports both Intel and Apple Silicon Macs.
 
+<img width="1840" height="1191" alt="DiskInventoryZed Screenshot 2026-08-07 at 9 55 01 PM" src="https://github.com/user-attachments/assets/7df2c971-0144-4223-9e08-66f59bb4d437" />
 <img width="1510" height="912" alt="Screenshot 2026-05-28 at 12 38 48 PM" src="https://github.com/user-attachments/assets/ab03ce74-0768-4226-ac5c-2bf87c44e8be" />
 
 
